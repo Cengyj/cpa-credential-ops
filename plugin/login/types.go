@@ -243,11 +243,16 @@ func SafeCode(err error) string {
 		return ""
 	}
 	s := err.Error()
+	var preparation interface{ LoginErrorCode() string }
+	if errors.As(err, &preparation) {
+		s = preparation.LoginErrorCode()
+	}
 	if strings.HasPrefix(s, "conversion_") && runtimeDiagnostic(s, []string{"conversion_invalid_json", "conversion_unsupported_version", "conversion_unsupported_format", "conversion_account_limit", "conversion_unsupported_provider", "conversion_unsupported_type", "conversion_missing_access_token", "conversion_missing_account_id", "conversion_invalid_token", "conversion_invalid_expiry", "conversion_expired_without_refresh", "conversion_previous_upload_changed"}) {
 		return s
 	}
 	switch s {
-	case "cpa_credential_missing", "cpa_credential_unavailable":
+	case "cpa_credential_missing", "cpa_credential_unavailable", "quality_reconciliation_pending",
+		"retained_quality_pause", "credential_handling_pending", "quality_credential_restricted":
 		return s
 	case "credential_login_pending":
 		return "login_commit_pending"

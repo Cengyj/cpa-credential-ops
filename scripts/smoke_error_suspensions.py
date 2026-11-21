@@ -1,4 +1,4 @@
-"""Verify terminal error suspensions across all scopes and through a restart."""
+"""Verify current-state error suspensions across all scopes and through a restart."""
 
 import json
 import subprocess
@@ -67,18 +67,27 @@ def verify_manual_readmission(prefix, request, restart, root, target, recorded_c
     assert mutation_log() == [('PATCH', '/v8/management/credentials/status')]
     res = request('/v8/management/credentials/status', {'name': auth_id, 'auth_index': index, 'disabled': False}, 'PATCH')
     assert res['disabled'] is False
-    await_value(current, lambda t: t is not None and not t['manual_disabled'] and t['runtime_status'] == 'active' and model in t['models'])
+    # The submission itself reads CPA; no acknowledgement or polling unlock is required.
     after = completed(manual('readmission-after-enable'))
     assert len(recorded_calls()) == 2 and all(not c['disabled'] for c in recorded_calls())
-    skipped = run_rule()
-    assert skipped['count'] == skipped['skipped'] == 0 and not skipped.get('scope_batch_id'), skipped
+    enabled_target = current()
+    assert not enabled_target['manual_disabled'] and not enabled_target.get('error_policy_block')
     assert request(prefix + '/runs?rule_id=' + rule['id'])['total'] == 1 and len(recorded_calls()) == 2
     saved = next(r for r in request(prefix + '/rules')['items'] if r['id'] == rule['id'])
-    handling, = saved['handling']
-    assert saved['enabled'] and handling['state'] == 'disabled' and handling['auth_id'] == auth_id
+    assert saved['enabled'] and not saved.get('handling'), saved
     assert mutation_log() == [('PATCH', '/v8/management/credentials/status')] * 2
+    # A fresh round may act again, while the original catalog evidence never replays itself.
+    readmitted = run_rule()
+    assert readmitted['count'] == 1 and readmitted['skipped'] == 0 and readmitted['scope_batch_id'] != batch, readmitted
+    new_rows = await_value(lambda: request(prefix + '/runs?scope_batch_id=' + readmitted['scope_batch_id'])['items'],
+                          lambda items: len(items) == 1 and items[0]['action_status'] == 'credential_suspended')
+    assert new_rows[0]['id'] != rows[0]['id'] and not new_rows[0]['samples']
+    saved = next(r for r in request(prefix + '/rules')['items'] if r['id'] == rule['id'])
+    handling, = saved['handling']
+    assert saved['enabled'] and handling['state'] == 'disabled'
+    assert mutation_log() == [('PATCH', '/v8/management/credentials/status')] * 3
     plugin_writes = [json.loads(line) for line in (root / 'writes.jsonl').read_text().splitlines()]
-    assert len(plugin_writes) == 1 and plugin_writes[0]['disabled'] and plugin_writes[0]['cpa_status'] == 200, plugin_writes
+    assert len(plugin_writes) == 2 and all(w['disabled'] and w['cpa_status'] == 200 for w in plugin_writes), plugin_writes
     deleted = request(prefix + '/rules', {'id': saved['id'], 'revision': saved['revision']}, 'DELETE')
     assert deleted['ok'], deleted
     restart()
@@ -91,24 +100,32 @@ def verify_manual_readmission(prefix, request, restart, root, target, recorded_c
             if time.monotonic() >= deadline:
                 raise
             time.sleep(.2)
-    assert not listing['items'] and not listing.get('detached_handling')
-    assert request(prefix + '/runs?rule_id=' + saved['id'])['total'] == 0
+    assert not listing['items']
+    retained = request(prefix + '/runs?rule_id=' + saved['id'])
+    assert retained['total'] == 1 and retained['items'][0]['id'] == new_rows[0]['id'], retained
     assert request(prefix + '/runs/detail?id=' + rows[0]['id'], allowed=(404,))
-    enabled_after_delete = await_value(current, lambda t: t is not None and not t['manual_disabled'] and model in t['models'])
-    assert not enabled_after_delete.get('credential_handling') and not enabled_after_delete.get('error_policy_block')
+    assert request(prefix + '/runs/detail?id=' + new_rows[0]['id'])['action_status'] == 'credential_suspended'
+    disabled_after_delete = current()
+    assert disabled_after_delete['manual_disabled'] and disabled_after_delete.get('error_policy_block'), disabled_after_delete
     replacement = request(prefix + '/rules', {'name': 'Synthetic peer after delete', 'target_scope': 'all_enabled',
                                                'models': [model], 'samples': 1, 'question_id': 'logic-boxes', 'enabled': True})
     peer = request(prefix + '/rules/scope-preview', replacement)
-    assert peer['count'] == 1 and peer['skipped'] == 0
-    assert mutation_log() == [('PATCH', '/v8/management/credentials/status')] * 2 and len(recorded_calls()) == 2
+    assert peer['count'] == 0 and peer['skipped'] == 0, peer
+    assert mutation_log() == [('PATCH', '/v8/management/credentials/status')] * 3 and len(recorded_calls()) == 2
+    request('/v8/management/credentials/status', {'name': auth_id, 'auth_index': index, 'disabled': False}, 'PATCH')
+    peer_enabled = request(prefix + '/rules/scope-preview', replacement)
+    assert peer_enabled['count'] == 1 and peer_enabled['skipped'] == 0, peer_enabled
+    enabled_after_delete = current()
+    assert not enabled_after_delete['manual_disabled'] and not enabled_after_delete.get('error_policy_block')
+    assert mutation_log() == [('PATCH', '/v8/management/credentials/status')] * 4 and len(recorded_calls()) == 2
     return {'model': model, 'missing_rule_model': missing, 'manual_before_suspension': baseline,
             'blocked_while_disabled': blocked, 'manual_after_cpa_enablement': after,
-            'original_error_run': rows[0]['id'], 'rule_after_enablement': skipped,
-            'retained_disposition': handling['state'], 'original_rule_enabled': saved['enabled'],
-            'deleted_owner_verified_after_restart': True, 'original_records_removed': True,
-            'peer_rule_preview_after_delete': peer, 'credential_mutations_for_deletion': 0,
+            'original_error_run': rows[0]['id'], 'rule_after_enablement': readmitted,
+            'fresh_error_run': new_rows[0]['id'], 'retained_disposition': handling['state'], 'original_rule_enabled': saved['enabled'],
+            'deleted_owner_error_source_retained_after_restart': True, 'superseded_record_removed': True, 'active_source_evidence_retained': True,
+            'peer_rule_preview_after_delete': peer, 'peer_rule_preview_after_external_enable': peer_enabled, 'credential_mutations_for_deletion': 0,
             'fake_model_calls': len(recorded_calls()), 'calls_while_disabled': 0,
-            'plugin_disable_writes': 1, 'explicit_external_enable_writes': 1}
+            'plugin_disable_writes': 2, 'explicit_external_enable_writes': 2}
 
 
 def verify_error_suspensions(prefix, request, restart, root, targets, recorded_calls, mutation_log, *, clear_history=False):
@@ -188,7 +205,7 @@ def verify_error_suspensions(prefix, request, restart, root, targets, recorded_c
         else:
             raise AssertionError((label, 'batch did not finish', batch))
         by_name = {row['config']['auth_id'].removesuffix('.json'): row for row in rows}
-        assert set(by_name) == (set(ACCOUNTS) if first else {'healthy'}), (label, {name: row['status'] for name, row in by_name.items()})
+        assert set(by_name) == (set(ACCOUNTS) if first else {'healthy'} | externally_enabled), (label, {name: row['status'] for name, row in by_name.items()})
         assert len(rows) == len(by_name), (label, 'duplicate activity for a credential', len(rows), by_name.keys())
         assert all(row['config']['rule_id'] == selected['id'] and bool(row['config'].get('scheduled_dispatch')) == scheduled for row in rows)
         seen = recorded_calls()[start:]
@@ -196,6 +213,8 @@ def verify_error_suspensions(prefix, request, restart, root, targets, recorded_c
         expected = Counter({'healthy': 4})
         if first:
             expected.update(FAULTS.keys())
+        else:
+            expected.update({name: 4 for name in externally_enabled})
         if counts != expected or any(call['disabled'] for call in seen):
             raise AssertionError({
                 'phase': label, 'actual_calls': dict(counts), 'expected_calls': dict(expected),
@@ -207,8 +226,10 @@ def verify_error_suspensions(prefix, request, restart, root, targets, recorded_c
         if first:
             read_cutoffs.update(dict.fromkeys(SUSPENDED, len(monitored)))
         for name, cutoff in read_cutoffs.items():
+            if name in externally_enabled:
+                continue
             extra = [entry for entry in monitored[cutoff:]
-                     if entry.get('auth_index') in monitored_indices[name] or entry.get('name') == name + '.json']
+                     if entry.get('operation') == 'probe' and entry.get('auth_index') in monitored_indices[name]]
             assert not extra, (label, name, extra)
         actions = writes()
         expect_methods = dict.fromkeys(SUSPENDED, 'PATCH')
@@ -236,9 +257,9 @@ def verify_error_suspensions(prefix, request, restart, root, targets, recorded_c
         summary = dispatched['last_scope_dispatch']
         assert dispatched['last_scope_batch'] == batch and summary['matched'] == len(rows) and summary['skipped'] == 0 and not summary.get('details'), (label, summary)
         held = {item['auth_id'].removesuffix('.json'): item['action_id'] for item in saved['handling'] if item['state'] == 'disabled'}
-        assert set(held) == SUSPENDED and all(held.values())
+        assert set(held) == SUSPENDED - externally_enabled and all(held.values())
         if phases:
-            assert held == phases[0]['owned_actions']
+            assert held == {name: action for name, action in phases[0]['owned_actions'].items() if name not in externally_enabled}
         phases.append({'phase': label, 'rule_id': selected['id'], 'target_scope': selected['target_scope'], 'scope_batch_id': batch, 'scheduled': scheduled, 'calls_by_account': dict(counts),
                        'matched': summary['matched'], 'skipped': summary['skipped'], 'healthy_sample_count': len(by_name['healthy']['samples']), 'credential_status_writes_total': len(actions),
                        'owned_actions': held, 'error_credentials': evidence})
@@ -289,10 +310,16 @@ def verify_error_suspensions(prefix, request, restart, root, targets, recorded_c
     history = request(prefix + '/runs?source=scheduled_probe&limit=100')['items']
     originals = phases[0]['error_credentials']
     diagnostic_history = {name: [row['id'] for row in history if row['config']['auth_id'] == name + '.json'] for name in originals}
-    assert all(ids == [originals[name]['run_id']] for name, ids in diagnostic_history.items()), diagnostic_history
+    assert all(ids == [originals[name]['run_id']] for name, ids in diagnostic_history.items() if name not in externally_enabled), diagnostic_history
+    for name in externally_enabled:
+        assert originals[name]['run_id'] in diagnostic_history[name] and len(diagnostic_history[name]) > 1
+        later = [row for row in history if row['config']['auth_id'] == name + '.json' and row['id'] != originals[name]['run_id']]
+        assert all(row['action_status'] not in ('credential_suspended', 'credential_restored') and
+                   len(row['samples']) == 4 and all(sample['quality_verdict'] == 'correct' for sample in row['samples']) for row in later)
     return {'scope': 'all_credentials', 'fixed_receipts': fixed_receipts,
             'retained_original_rows': diagnostic_history, 'operator_enabled': sorted(externally_enabled),
-            'later_management_probes_or_downloads': dict.fromkeys(sorted(originals), 0),
+            'later_upstream_probes_while_suspended': dict.fromkeys(sorted(SUSPENDED - externally_enabled), 0),
+            'state_reads_are_allowed': True,
             'auto_restore': True, 'models': models, 'samples_per_model': 2,
             'rounds': phases, 'cpa_writes': writes(), 'total_fake_model_calls': len(recorded_calls())}
 

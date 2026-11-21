@@ -33,7 +33,7 @@ func TestConversionRefusesExistingFilesAndChangedPolicy(t *testing.T) {
 			opts := offlineOptions(t)
 			opts.Call = h.call
 			var s *Service
-			opts.Prepare = func(context.Context, string, string) error {
+			opts.Prepare = func(context.Context, string, string, string) error {
 				if mode == "prepare" {
 					return errors.New("policy_changed")
 				}

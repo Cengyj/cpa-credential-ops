@@ -20,7 +20,9 @@ For store installation, enable the plugin system and add `https://raw.githubuser
 1. Download the package and checksums from [the release page](https://github.com/Cengyj/cpa-credential-ops/releases/tag/v0.29.37).
 2. Back up the existing plugin and persistent data while CPA is stopped.
 3. For a fresh manual installation, extract `model-quality.so` to the configured plugin directory and enable it. For a manual upgrade, use the plugin's `path` from `GET /v8/management/plugins` to locate the current library. If it has a versioned filename, use the store update so CPA also updates the configured version. Restart CPA after a manual installation.
-4. Refresh the authenticated management panel and open **Credential Ops**. Opening the panel reestablishes the in-memory management session needed for scheduled credential operations.
+4. Refresh the authenticated management panel and open **Credential Ops**.
+
+The 0.31.0 source build verifies the CPA management key once, saves it in the plugin’s private data volume and restores access on startup. Browser logout ends that browser’s access. [Connection lifecycle](docs/BACKGROUND_CONNECTION_CN.md)
 
 The display name and repository have changed. The native plugin ID, library filename, configuration key, API paths, and data directory remain `model-quality` so existing installations retain their accounts, rules, and history. Do not install a second copy under a different library filename.
 

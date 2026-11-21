@@ -48,7 +48,17 @@ func compatibilityExecutor(name string) string {
 func configuredTarget(entry pluginapi.HostAuthModels, route providerRoute) Target {
 	t := Target{AuthID: entry.ID, AuthIndex: entry.AuthIndex, Provider: entry.Provider, Type: "config_api_key", IsProvider: true, ObjectType: "provider",
 		RuntimeStatus: "unknown", Models: []string{}, Reasons: []string{"provider_route_unverified"}, UnsupportedReason: "provider_observation_only"}
-	if route.family == "" || route.family != providerFamily(entry.ID, entry.Provider) || route.executor != entry.Provider {
+	if route.conflict || route.family != "" && (route.id != entry.ID || route.index != entry.AuthIndex || route.family != providerFamily(entry.ID, entry.Provider) || route.executor != entry.Provider) {
+		t.Reasons = []string{"identity_conflict"}
+		t.identityConflict = true
+		// Retain a matching configured group for ownership checks without
+		// borrowing names, models or capabilities from an ambiguous route.
+		if route.id == entry.ID && route.index == entry.AuthIndex && route.executor == entry.Provider {
+			t.ProviderGroupID = route.groupID
+		}
+		return t
+	}
+	if route.family == "" {
 		return t
 	}
 	t.ProviderName = route.name
@@ -61,15 +71,12 @@ func configuredTarget(entry pluginapi.HostAuthModels, route providerRoute) Targe
 			t.providerProbeModels[model] = route.wireModel(model) != ""
 		}
 	}
-	if route.conflict || route.id != entry.ID {
-		t.Reasons = []string{"identity_conflict"}
-		t.identityConflict = true
-		return t
-	}
 	t.identityVerified = true
 	t.ManualDisabled = route.disabled
-	t.catalogVerified = entry.Models != nil
-	t.Models = append(t.Models, entry.Models...)
+	t.catalogVerified = validCatalogModels(entry.Models)
+	if t.catalogVerified {
+		t.Models = append(t.Models, entry.Models...)
+	}
 	switch {
 	case t.ManualDisabled:
 		t.RuntimeStatus, t.Reasons = "disabled", []string{"operator_disabled"}
@@ -83,6 +90,7 @@ func configuredTarget(entry pluginapi.HostAuthModels, route providerRoute) Targe
 	default:
 		t.Reasons = []string{"provider_models_unavailable"}
 	}
+	addConfiguredReasoning(&t, route)
 	return t
 }
 

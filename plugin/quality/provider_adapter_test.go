@@ -262,7 +262,7 @@ func TestManualRegisteredProviderWithPersistedErrorSuspension(t *testing.T) {
 		return nil
 	}
 	run, err := en.Submit(ctx, config)
-	if err != nil || run.Config.SubjectIndex != selected.index || run.Config.ManualPolicyActionID != old.ActionID || run.Config.ManagedProbe != nil {
+	if err != nil || run.Config.SubjectIndex != selected.index || run.Config.ManualPolicyActionID != "" || run.Config.ManualAccountFingerprint == "" || run.Config.ManagedProbe != nil {
 		t.Fatal("manual admission did not freeze the selected registered route and disposition", run, err)
 	}
 	en.executeTask(en.nextRunnableLocked())
@@ -272,15 +272,30 @@ func TestManualRegisteredProviderWithPersistedErrorSuspension(t *testing.T) {
 		t.Fatal("manual test did not complete through the selected native route", stored, err, len(nativeCalls))
 	}
 	batch, err := en.dispatchRule(ctx, rule.ID, rule.Revision, false)
-	if err != nil || batch.Count != 0 || batch.Skipped != 0 || en.managed[selected.id] != old {
-		t.Fatal("manual admission changed rule exclusion or the disposition", batch, err)
+	if err != nil || batch.Count != 1 || batch.Skipped != 0 || activeDisposition(en.managed[selected.id]) || en.managed[selected.id].ActionID != old.ActionID {
+		t.Fatal("manual admission failed to retire stale group exclusion", batch, err)
 	}
 
+	pending, err := en.Submit(ctx, config)
+	if err != nil {
+		t.Fatal(err)
+	}
 	f.mu.Lock()
 	group["headers"] = providerObject{"X-Route": "changed"}
 	f.mu.Unlock()
-	if _, err := en.Submit(ctx, config); err == nil || len(nativeCalls) != 1 || f.attempts != 0 || f.calls != 0 {
-		t.Fatal("changed provider identity was accepted or bypassed the CPA native route", err, len(nativeCalls), f.attempts, f.calls)
+	en.execute(pending.ID)
+	stale, err := en.Run(pending.ID)
+	if err != nil || stale.Status != "blocked" || len(nativeCalls) != 1 || f.attempts != 0 || f.calls != 0 {
+		t.Fatal("changed in-flight provider configuration used an old frozen request", stale, err)
+	}
+	current, err := en.Submit(ctx, config)
+	if err != nil {
+		t.Fatal("a new manual test could not bind the current enabled configuration", err)
+	}
+	en.execute(current.ID)
+	fresh, err := en.Run(current.ID)
+	if err != nil || fresh.Status != "completed" || len(nativeCalls) != 2 || f.attempts != 0 || f.calls != 0 {
+		t.Fatal("current configuration did not use its native route without management writes", fresh, err)
 	}
 }
 

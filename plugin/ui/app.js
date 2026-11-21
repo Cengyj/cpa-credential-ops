@@ -18,11 +18,15 @@ import {
   ruleModelShortcuts,
   splitRuleModels,
   safePreview,
+  previewSource,
+  isPartialAnswer,
   targetID,
   providerTargetName,
-  frozenProviderLabel,
+  frozenRunIdentity,
+  qualityIdentityLabel,
   providerRouteReady,
   ruleObjectTypes,
+  resolveRuleBinding,
   ruleScopeDescription,
   ruleTargetType,
   renderRunEvidence,
@@ -31,11 +35,13 @@ import {
   renderSampleEvidence,
   renderRuleRows,
   renderRuleActivityContext,
+  renderOrphanedHandling,
   renderScopeDispatch,
   dynamicScopeLabel,
   renderQualityRuns,
   renderQualityEmpty,
   ruleState,
+  ruleScheduleEnabled,
   renderReleasePreview,
   questionTitle,
   questionTestSelection,
@@ -43,14 +49,17 @@ import {
 
 const $ = (id) => document.getElementById(id);
 let ruleGroupGrants = new Set();
-const manualTargetDraft = { kind: '', group: '', groupName: '', targetIDs: new Map(), models: new Map() };
+const manualTargetDraft = { id: '', provider: '', authIndex: '', isProvider: false, label: '', models: new Map() };
+let manualReasoning = '';
 const state = {
   connected: false,
+  backend: null,
   targetsFresh: false,
   providerDirectoryVerified: true,
   targets: [],
   questions: [],
   rules: [],
+  orphanedHandling: [],
   actions: [],
   metrics: null,
   runs: [],
@@ -72,7 +81,7 @@ const state = {
   releaseBlocked: true,
   releaseAction: null,
   compareRun: null,
-  reads: { run: 0, history: 0, activity: 0, operations: 0, settings: 0, refresh: 0, preview: 0, editor: 0 },
+  reads: { questions: 0, run: 0, history: 0, activity: 0, operations: 0, targets: 0, settings: 0, refresh: 0, preview: 0, editor: 0 },
   busy: new Set(),
   editor: null,
   resourceStatus: {},
@@ -84,6 +93,9 @@ const findTarget = (id) => state.targets.find((target) => targetID(target) === i
 const ruleHeld = (rule) => holdsPause(rule, state.targets);
 const managementPrefix = '/v0/management/plugins/model-quality';
 const managementKeyStorage = `model-quality:management-key:${managementPrefix}`;
+const migrationStorage = `model-quality:connection-migration:${managementPrefix}`;
+const connectionRevisionStorage = `model-quality:connection-revision:${managementPrefix}`;
+const workspaceStorage = `model-quality:workspace:${managementPrefix}`;
 const manualReceiptStorage = `model-quality:manual-receipt:${managementPrefix}`;
 let manualReceiptKey = '';
 try { manualReceiptKey = sessionStorage.getItem(manualReceiptStorage) || ''; } catch { /* Use page memory when storage is unavailable. */ }
@@ -98,11 +110,13 @@ function rememberManualReceipt(key) {
 
 const shortcutStorage = `model-quality:rule-model-shortcuts:${managementPrefix}`;
 let selectedRuleModels = [], customShortcuts = [], shortcutsLoaded = false, shortcutStorageNote = '';
-const client = new ManagementClient(managementPrefix, (key) =>
-  disconnect('管理鉴权已失效，请重新连接。', true, { expectedKey: key }),
-);
-const api = async (path, method = 'GET', body) => {
-  try { return await client.request(path, method, body); }
+const client = new ManagementClient(managementPrefix, key => {
+  const saved = savedBrowserKey();
+  if (pageAccess && saved !== null && saved !== pageAccess.expectedStorage) return syncStoredAccess();
+  disconnect('当前浏览器的管理鉴权已失效，请输入有效密钥。后台授权状态需在登录后核对。', true, { expectedKey: key });
+});
+const api = async (path, method = 'GET', body, options) => {
+  try { return await client.request(path, method, body, options); }
   catch (error) {
     if (error.detail?.startsWith('blocked: provider ')) error.message = reasonLabel(error.detail);
     throw error;
@@ -111,6 +125,7 @@ const api = async (path, method = 'GET', body) => {
 const loginWorkbench = createLoginWorkbench({
   request: (path, method = 'GET', body, idempotencyKey) => client.requestHostLogin(path, method, body, idempotencyKey),
   connected: () => state.connected,
+  visible: () => pageDisplayed(),
   onCommitted: () => refresh(),
 });
 
@@ -156,7 +171,7 @@ function initializeTheme() {
 }
 
 let noticeTimer;
-const feedbackScope = () => `${state.page}:${state.page === 'manual' ? state.manualView : ''}`;
+const feedbackScope = () => `${client.epoch}:${state.page}:${state.page === 'manual' ? state.manualView : ''}`;
 function clearNotice() {
   clearTimeout(noticeTimer);
   delete $('notice').dataset.ruleDeleteReceipt;
@@ -232,9 +247,11 @@ function protectEditor(action) {
   actionDialog({ title: '放弃未保存的更改？', description: '当前编辑尚未保存。放弃后将关闭这些更改，已保存的规则和预算不受影响。', confirm: '放弃更改', danger: true, submit: action });
 }
 
+const uncertainRuleSaveMessage = '保存结果未确认，草稿已保留，已禁止重复保存。请关闭草稿并核对规则列表；列表暂时没有此规则不代表保存失败。';
 async function saveEditor(action) {
   const editor = state.editor;
   if (!editor || editor.saving) return;
+  if (editor.saveUncertain) throw new Error(uncertainRuleSaveMessage);
   editor.saving = true;
   const controls = [...$(editor.id).querySelectorAll('input,select,textarea,button')].map((node) => [node, node.disabled]);
   controls.forEach(([node]) => { node.disabled = true; });
@@ -244,7 +261,11 @@ async function saveEditor(action) {
   finally {
     editor.saving = false;
     controls.forEach(([node, disabled]) => { node.disabled = disabled; });
-    if (state.editor === editor && failedField) $(failedField).focus();
+    if (state.editor === editor) {
+      renderRuleTargetSelectors();
+      updateRuleFields();
+      if (failedField) $(failedField).focus();
+    }
     renderAdmission();
   }
 }
@@ -336,79 +357,277 @@ function forgetManagementKey(expectedKey) {
   }
 }
 
-function restoreManagementConnection() {
-  let key;
-  try {
-    key = localStorage.getItem(managementKeyStorage)?.trim();
-  } catch {
-    notice('浏览器未允许本地存储，请输入管理密钥连接。当前连接仍可正常使用。');
-    return;
-  }
-  if (key) void connectManagement(key, { restoring: true });
+const backendLabels = {
+  unconfigured: '后台未配置', waiting: '后台等待 CPA 就绪', ready: '后台管理授权已验证',
+  invalid: '后台管理授权需要更新', restricted: '后台访问受限', rate_limited: '后台请求受限流',
+  error: '后台配置异常', closing: '后台正在关闭',
+};
+
+let pageAccess = null, connectionTimer = null, candidateClient = null;
+let statusSequence = 0, statusNextRead = 0, statusError = '', statusFailures = 0;
+let editorRevision = null, backendWritePending = false, pageSuspended = false;
+
+function savedBrowserKey() {
+  try { return localStorage.getItem(managementKeyStorage)?.trim() || ''; }
+  catch { return null; }
 }
 
-async function connectManagement(key, { restoring = false } = {}) {
+let localSetupIntent = null;
+function setupIntent() {
+  try {
+    const value = localStorage.getItem(migrationStorage);
+    return value ? JSON.parse(value) : localSetupIntent;
+  } catch { return localSetupIntent; }
+}
+
+function rememberSetup(intent) {
+  localSetupIntent = intent;
+  try { localStorage.setItem(migrationStorage, JSON.stringify(intent)); } catch { /* A blocked browser store still permits an in-page retry. */ }
+}
+
+function initialSetup(access, backend, first) {
+  const previous = setupIntent();
+  if (previous?.retryAt && previous.revision === backend.revision && (backend.can_migrate || backend.state === 'invalid')) {
+    if (Date.now() >= previous.retryAt) return previous;
+    statusNextRead = Math.min(statusNextRead, previous.retryAt);
+    return null;
+  }
+  if (!first) return null;
+  if (!access.restoring && (backend.can_migrate || backend.state === 'invalid')) return { revision: backend.revision, mode: 'configure' };
+  if (access.restoring && backend.can_migrate && !previous) return { revision: backend.revision, mode: 'migrate' };
+  return null;
+}
+
+function validBackend(data) {
+  if (!data || !Number.isSafeInteger(data.revision) || data.revision < 0 ||
+      !Object.hasOwn(backendLabels, data.state) || typeof data.configured !== 'boolean') {
+    throw new Error('后台连接状态格式无效，请刷新核对插件版本。');
+  }
+  return data;
+}
+
+function renderConnection() {
+  const backend = state.backend;
+  const label = backendWritePending ? '正在核实后台配置' : backend ? backendLabels[backend.state] : '后台状态待读取';
+  const browser = state.connected ? '当前浏览器已通过 CPA 鉴权。' : '当前浏览器尚未验证。';
+  const source = backend?.source === 'deployment' ? '（部署 Secret）' : '';
+  const diagnostic = backend?.code && backend.state === 'error' ? `（${backend.code}）` : '';
+  $('connection-status').textContent = [browser, backend && label + source + diagnostic + '。', pageAccess?.readError, statusError].filter(Boolean).join(' ');
+  $('connection-state').textContent = pageAccess?.readError ? '页面数据暂不可达' : !backendWritePending && backend?.state === 'ready' ? '已连接' : label;
+  $('connection-state').parentElement.dataset.backend = pageAccess?.readError ? 'stale' : backend?.state || '';
+  $('connection-submit').textContent = state.connected ? (backend?.configured ? '更新后台密钥' : '保存后台连接') : '连接';
+  $('connection-clear').hidden = !state.connected || !backend || (backend.state === 'unconfigured' && !backend.can_migrate);
+  $('connection-clear').disabled = backendWritePending || !Number.isSafeInteger(editorRevision);
+  $('management-key').required = !state.connected;
+  $('management-key').placeholder = state.connected ? '留空使用当前浏览器的密钥' : '输入管理密钥';
+}
+
+function showConnectionDialog() {
+  editorRevision = state.backend?.revision ?? null;
+  renderConnection();
+  $('connection-dialog').showModal();
+  if (pageAccess && !backendWritePending) void readConnection(pageAccess);
+}
+
+function publishRevision() {
+  try { localStorage.setItem(connectionRevisionStorage, String(state.backend.revision)); } catch { /* GET still returns the durable revision. */ }
+}
+
+function scheduleConnectionRead() {
+  clearTimeout(connectionTimer);
+  if (!pageAccess || !pageDisplayed() || backendWritePending || pageAccess.reading) return;
+  connectionTimer = setTimeout(() => readConnection(pageAccess), Math.max(0, statusNextRead - Date.now()));
+}
+
+function restoreManagementConnection() {
+  const key = savedBrowserKey();
+  if (key) return connectManagement(key, { restoring: true });
+  document.body.removeAttribute('data-resuming');
+  if (key === null) notice('浏览器未允许本地存储，本次页面需输入管理密钥。');
+}
+
+function establishBrowserAccess(access) {
+  if (state.connected || pageAccess !== access) return;
+  state.connected = true;
+  document.body.classList.add('connected');
+  document.body.removeAttribute('data-resuming');
+  $('data-state').textContent = '正在读取页面数据…';
+  $('management-key').value = '';
+  $('connection-dialog').close();
+  rememberWorkspace();
+  renderAdmission();
+  renderHistory();
+  renderRules();
+  renderActivityState();
+  openCurrentWorkbench();
+  if (manualReceiptKey) void checkManualReceipt(manualSelection(), false);
+  else schedulePoll();
+}
+
+async function readConnection(access) {
+  if (!access || access !== pageAccess || backendWritePending) return;
+  if (access.reading) return access.reading;
+  const sequence = ++statusSequence;
+  access.reading = (async () => {
+    try {
+      const backend = validBackend(await api('/connection'));
+      if (pageAccess !== access || sequence !== statusSequence) return;
+      const saved = savedBrowserKey();
+      if (saved !== null && saved !== access.expectedStorage) return syncStoredAccess();
+      const first = !state.connected;
+      if (first && !access.restoring && saveManagementKey(access.key)) access.expectedStorage = access.key;
+      const previous = state.backend?.state;
+      state.backend = backend;
+      if (state.connected) {
+        if (previous !== backend.state) renderAdmission();
+        recoverVisibleData(previous !== backend.state);
+      }
+      if (editorRevision === null && $('connection-dialog').open) editorRevision = backend.revision;
+      statusFailures = 0;
+      if (access.readError && !state.connected) clearNotice();
+      access.readError = '';
+      statusNextRead = Date.now() + (backend.state === 'waiting' ? 5000 : 30000);
+      const setup = initialSetup(access, backend, first);
+      establishBrowserAccess(access);
+      if (setup) await changeBackend(access, 'PUT', backend.revision, setup.mode, '', setup);
+      if (first && !access.expectedStorage) notice('当前浏览器未能保存身份。重新打开页面时需要再次输入管理密钥。');
+    } catch (error) {
+      if (pageAccess !== access || sequence !== statusSequence || isDiscarded(error)) return;
+      access.readError = `页面数据暂不可达。${error.message}`;
+      statusFailures++;
+      const delay = Math.min(60000, 2000 * 2 ** Math.min(statusFailures - 1, 5));
+      statusNextRead = Date.now() + Math.max(error.retryAfterMs || 0, error.status === 403 ? 30000 : delay);
+      document.body.removeAttribute('data-resuming');
+      if (!state.connected) notice(access.readError + ' 将自动重试读取。', true);
+    } finally {
+      if (pageAccess === access) {
+        access.reading = null;
+        renderConnection();
+        scheduleConnectionRead();
+      }
+    }
+  })();
+  return access.reading;
+}
+
+function connectManagement(key, { restoring = false } = {}) {
   key = key.trim();
   if (!key) return;
-  if (!restoring) disconnect('', false, { forgetKey: false });
+  if (pageAccess?.key === key) return readConnection(pageAccess);
+  clearTimeout(connectionTimer);
   client.open(key);
-  const epoch = client.epoch;
-  $('data-state').textContent = restoring ? '正在读取数据…' : '正在连接管理接口…';
+  pageAccess = { key, restoring, reading: null, expectedStorage: savedBrowserKey() };
+  statusFailures = 0;
+  statusNextRead = 0;
+  statusError = '';
+  document.body.toggleAttribute('data-resuming', restoring);
+  return readConnection(pageAccess);
+}
+
+async function changeBackend(access, method, revision, mode, replacement = '', setup = null) {
+  if (pageAccess !== access || !Number.isSafeInteger(revision) || backendWritePending) return;
+  const saved = savedBrowserKey();
+  if (saved !== null && saved !== access.expectedStorage) return syncStoredAccess();
+  const switching = !!replacement && replacement !== access.key;
+  const transport = switching ? new ManagementClient(managementPrefix, () => {
+    throw Object.assign(new Error('输入的密钥未通过 CPA 鉴权。'), { status: 401 });
+  }) : client;
+  if (switching) { candidateClient = transport; transport.open(replacement); }
+  backendWritePending = true;
+  const sequence = ++statusSequence;
+  const current = () => pageAccess === access && statusSequence === sequence;
+  clearTimeout(connectionTimer);
+  renderConnection();
   try {
-    let initialAccounts;
-    if (state.page === 'login') {
-      // This quality request also restores CPA's in-memory authorization for scheduled operations.
-      const settingsRead = api('/settings').then(settings => {
-        if (!settings || typeof settings !== 'object' || Array.isArray(settings)) throw Error('管理接口返回了无效设置。');
-      });
-      if (restoring && loginWorkbench.readInitialAccounts) {
-        initialAccounts = loginWorkbench.readInitialAccounts();
-        // Either authenticated response can open the workspace. Reuse the list read on first render.
-        await Promise.any([initialAccounts, settingsRead]).catch(error => { throw error.errors[0]; });
-      } else {
-        await settingsRead;
-      }
-    } else {
-      await refresh();
+    // An interrupted page may only reconcile an attempted write with a read.
+    rememberSetup({ attempted: true });
+    const body = method === 'PUT' ? { revision, mode } : { revision };
+    const next = validBackend(await transport.request('/connection', method, body));
+    if (!current()) return;
+    if (savedBrowserKey() !== saved) return syncStoredAccess();
+    if (switching) {
+      const remembered = saveManagementKey(replacement);
+      client.open(replacement);
+      access.key = replacement;
+      access.expectedStorage = savedBrowserKey();
+      if (!remembered) notice('已更新后台授权，但浏览器未能保存新身份。', true);
     }
-    if (epoch !== client.epoch) return;
-    // Restoring an existing key must not overwrite another tab's save or disconnect.
-    const remembered = restoring || saveManagementKey(key);
-    state.connected = true;
-    $('connection-state').textContent = '已连接';
-    if (!state.resourceStatus.questions) {
-      $('data-state').textContent = '管理接口已连接';
-      $('data-state').classList.remove('stale');
-    }
-    document.body.classList.add('connected');
-    $('connection-dialog').close();
+    const backendChanged = next.state !== state.backend?.state;
+    state.backend = next;
+    if (switching && state.page === 'login') void loginWorkbench.refresh();
+    else if (switching && pageDisplayed()) void safely(refresh);
+    else if (backendChanged) recoverVisibleData(true);
     renderAdmission();
-    renderHistory();
-    renderRules();
-    renderActivityState();
-    openCurrentWorkbench(initialAccounts);
-    scheduleOperationsPoll();
-    if (manualReceiptKey) void checkManualReceipt(manualSelection(), false);
-    else schedulePoll();
-    if (!remembered) notice('已连接，但浏览器未能保存管理密钥。刷新后需要重新输入，请允许本站使用本地存储。');
+    if (statusError && $('notice').textContent === statusError) clearNotice();
+    access.readError = statusError = '';
+    editorRevision = next.revision;
+    statusNextRead = Date.now() + (next.state === 'waiting' ? 5000 : 30000);
+    $('management-key').value = '';
+    publishRevision();
+    if (mode === 'configure') $('connection-dialog').close();
+    if (method === 'DELETE') notice('已清除后台管理配置。当前浏览器仍可查询账号、规则和任务。');
   } catch (error) {
-    if (!isDiscarded(error) && epoch === client.epoch) {
-      disconnect(`连接未完成：${error.message}。已保存的密钥会保留，刷新页面可重试。`, true, { forgetKey: false });
+    if (!current() || isDiscarded(error)) return;
+    if (error.status === 409 || error.outcomeUnknown) editorRevision = null;
+    const note = error.outcomeUnknown ? '后台配置写入结果待核对。页面将只读取状态。' :
+      error.status === 409 ? '后台配置版本已变化，请核对最新状态后重新操作。' :
+      error.status === 507 ? '保存失败，后台重启恢复尚未配置成功。' : '后台连接未更新。';
+    const detail = { management_key_invalid: '提交的密钥未通过后台 CPA 鉴权。', management_restricted: 'CPA 限制回环访问。', management_temporarily_banned: 'CPA 暂时封禁了回环访问。', management_rate_limited: 'CPA 管理接口正在限流。', management_network: '后台暂时无法连接 CPA。', management_unavailable: 'CPA 管理接口暂未就绪。' }[error.code];
+    statusError = note + (detail || (error.status === 401 ? error.message : ''));
+    // CPA positively rejected this candidate before persistence. Retry only initial setup
+    // at the same revision. A lost or malformed receipt always goes through GET alone.
+    const prewrite = setup && !error.outcomeUnknown && error.source === 'backend_management' &&
+      ['management_network', 'management_unavailable', 'management_restricted', 'management_temporarily_banned', 'management_rate_limited'].includes(error.code);
+    if (prewrite) {
+      const attempts = Math.min((setup.attempts || 0) + 1, 6);
+      const minimum = ['management_restricted', 'management_temporarily_banned', 'management_rate_limited'].includes(error.code) ? 30000 : 2000;
+      const delay = Math.min(120000, minimum * 2 ** (attempts - 1)) * (1 + Math.random() * 0.25);
+      statusNextRead = Date.now() + Math.max(error.retryAfterMs || 0, delay);
+      rememberSetup({ revision, mode, attempts, retryAt: statusNextRead });
+      statusError += ' 页面将在 CPA 就绪后继续首次配置。';
+    } else statusNextRead = 0;
+    notice(statusError, true);
+  } finally {
+    if (switching) { transport.clear(); if (candidateClient === transport) candidateClient = null; }
+    if (current()) {
+      backendWritePending = false;
+      renderConnection();
+      scheduleConnectionRead();
     }
   }
+}
+
+function syncStoredAccess() {
+  const saved = savedBrowserKey();
+  if (saved === null || saved === (pageAccess?.expectedStorage || '')) return;
+  disconnect(saved ? '' : '已退出此浏览器。后台任务继续按原许可执行。', false, { forgetKey: false });
+  if (saved) void connectManagement(saved, { restoring: true });
 }
 
 function disconnect(
-  message = '已清除管理密钥与页面数据。后台任务继续执行，重新连接后可查询或取消。',
+  message = '已清除管理密钥与页面数据。后台任务继续按原许可执行，重新登录后可查询。',
   failed = false,
-  { forgetKey = true, expectedKey } = {},
+  { forgetKey = true, expectedKey = pageAccess?.key } = {},
 ) {
+  clearTimeout(connectionTimer);
+  pageAccess = null;
+  candidateClient?.clear();
+  candidateClient = null;
+  backendWritePending = false;
+  statusSequence++;
+  state.backend = null;
+  statusError = '';
+  editorRevision = null;
   const forgotten = !forgetKey || forgetManagementKey(expectedKey);
+  document.body.removeAttribute('data-resuming');
+  if (forgetKey && window.self !== window.top) {
+    try { sessionStorage.removeItem(workspaceStorage); } catch { /* Storage is optional. */ }
+  }
   client.clear();
   state.connected = false;
-  manualTargetDraft.kind = manualTargetDraft.group = manualTargetDraft.groupName = '';
-  manualTargetDraft.targetIDs.clear();
+  Object.assign(manualTargetDraft, { id: '', provider: '', authIndex: '', isProvider: false, label: '' });
   manualTargetDraft.models.clear();
+  manualReasoning = '';
   loginWorkbench.reset();
   state.targetsFresh = false;
   state.providerDirectoryVerified = true;
@@ -420,6 +639,7 @@ function disconnect(
     targets: [],
     questions: [],
     rules: [],
+    orphanedHandling: [],
     actions: [],
     metrics: null,
     runs: [],
@@ -481,6 +701,7 @@ function disconnect(
   renderMetrics();
   renderActivityState();
   renderAdmission();
+  renderConnection();
   if (!forgotten) notice('已断开当前连接，但浏览器未允许清除已保存的管理密钥。请清除此站点的本地存储。', true);
   else if (message) notice(message, failed);
   else clearNotice();
@@ -492,9 +713,20 @@ const workspaces = {
   operations: ['质量运维', '管理检测规则，查看模型质量与运行记录。'],
 };
 
-function openCurrentWorkbench(initialAccounts) {
+function initialWorkspace() {
+  const hash = location.hash.slice(1);
+  if (hash || window.self === window.top) return hash;
+  try { return sessionStorage.getItem(workspaceStorage); } catch { return ''; }
+}
+
+function rememberWorkspace() {
+  if (!state.connected || window.self === window.top) return;
+  try { sessionStorage.setItem(workspaceStorage, state.page); } catch { /* Navigation still works without storage. */ }
+}
+
+function openCurrentWorkbench() {
   if (state.page === 'login') {
-    loginWorkbench.open({ focus: false, initialAccounts });
+    loginWorkbench.open({ focus: false });
   } else {
     loginWorkbench.close({ focus: false });
     if (state.connected && !state.resourceStatus.questions) void safely(refresh);
@@ -517,6 +749,7 @@ function setPage(page) {
     button.setAttribute('aria-current', button.dataset.page === state.page ? 'page' : 'false');
   });
   history.replaceState(null, '', `#${state.page}`);
+  rememberWorkspace();
   scheduleWorkspaceLayout();
   if (previous !== state.page) syncOperationsVisibility();
 }
@@ -635,7 +868,7 @@ function targetOptions(targets = state.targets, forRule = false) {
     }
     const label = target.email || `${target.provider || 'unknown'} · ${target.auth_index || targetID(target)}`;
     const suffix = duplicates.has(target.email) ? ` · ${target.auth_index || targetID(target)}` : '';
-    const disabled = target.manual_disabled ? (target.error_policy_block ? ' · CPA 已停用' : ' · 人工禁用') : '';
+    const disabled = target.manual_disabled ? ' · CPA 已停用' : '';
     return `<option value="${escapeHTML(targetID(target))}">${escapeHTML(label + suffix)}${target.quality_paused ? ' · 质量暂停' : ''}${disabled}</option>`;
   }).join('');
 }
@@ -685,8 +918,16 @@ function ruleGroups(targets = state.targets) {
 const groupValue = id => `~group/${id}`;
 const routeValue = id => id?.startsWith('~') ? '~' + id : id || '';
 const selectedRuleGroup = () => $('rule-target').selectedOptions[0]?.dataset.group || '';
-const selectedRuleTarget = () => findTarget($('rule-target').selectedOptions[0]?.dataset.id);
-function renderRuleTargetSelectors(config) {
+function ruleOptionBinding(option) {
+  const { id, index, provider, kind } = option?.dataset || {};
+  return { auth_id: id, provider, target_auth_index: index, target_object_type: kind };
+}
+function selectedRuleTarget() {
+  const option = $('rule-target').selectedOptions[0];
+  return option?.disabled ? undefined : resolveRuleBinding(ruleOptionBinding(option), state.targets).target;
+}
+function renderRuleTargetSelectors(rule) {
+  if (state.editor?.saving) return;
   const kinds = selectedObjectTypes();
   const visible = state.targets.filter(target => kinds.includes(ruleTargetType(target)));
   const options = ['<option value="">选择对象</option>'];
@@ -710,17 +951,15 @@ function renderRuleTargetSelectors(config) {
     targetOption(target, [target.provider_name || target.provider, target.auth_index || targetID(target)].join(' · '))));
 
   const field = $('rule-target'), last = field.selectedOptions[0];
-  const group = config ? config.target_group : last?.dataset.group;
-  const authID = config ? config.auth_id : last?.dataset.id;
-  const index = config ? config.target_auth_index : last?.dataset.index;
-  const executor = config ? config.provider : last?.dataset.provider;
-  const current = visible.find(t => targetID(t) === authID);
-  let previous = group ? groupValue(group) : routeValue(authID);
-  if (previous && (group ? !groups.has(group) : !current || index && current.auth_index !== index || executor && current.provider !== executor)) {
+  const config = rule?.config || rule;
+  const group = rule ? rule.target_group : last?.dataset.group;
+  const binding = resolveRuleBinding(rule || ruleOptionBinding(last), visible);
+  let previous = group ? groupValue(group) : routeValue(binding.id);
+  if (previous && (group ? !groups.has(group) : !binding.target)) {
     // Preserve an existing binding when an inventory refresh loses it. An explicit type change clears incompatible choices.
     previous = '~saved/' + previous;
-    const kind = config ? ruleTargetType(findTarget(authID)) : last?.dataset.kind;
-    options.push(`<option value="${escapeHTML(previous)}" ${group ? `data-group="${escapeHTML(group)}"` : `data-id="${escapeHTML(authID)}" data-kind="${escapeHTML(kind)}" data-index="${escapeHTML(index)}" data-provider="${escapeHTML(executor)}"`} disabled>${escapeHTML([group || authID,index].filter(Boolean).join(' · '))} · 原绑定待核实</option>`);
+    const attributes = group ? `data-group="${escapeHTML(group)}"` : `data-id="${escapeHTML(binding.id)}" data-kind="${escapeHTML(binding.type)}" data-index="${escapeHTML(binding.index)}" data-provider="${escapeHTML(binding.provider)}"`;
+    options.push(`<option value="${escapeHTML(previous)}" ${attributes} disabled>${escapeHTML(group ? group + ' · 原绑定待核实' : binding.pendingLabel)}</option>`);
   }
   const html = options.join('');
   patchView(field, html);
@@ -754,56 +993,39 @@ function renderRuleGroupGrants() {
   for (const input of $('rule-group-options').querySelectorAll('input')) input.checked = ruleGroupGrants.has(input.dataset.groupGrant);
 }
 
-const providerGroupKey = target => JSON.stringify([target.provider || targetID(target), target.provider_name || '']);
-const manualTargetScope = () => manualTargetDraft.kind === 'provider' ? manualTargetDraft.group : 'credential';
-const manualModelKey = () => JSON.stringify([manualTargetScope(), value('target')]);
+const manualModelKey = () => manualTargetDraft.id;
+const manualTargetMatches = target => !!target && target.provider === manualTargetDraft.provider &&
+  !!target.is_provider === manualTargetDraft.isProvider && (target.auth_index || '') === manualTargetDraft.authIndex;
 function selectedManualTarget() {
-  const selected = findTarget(value('target'));
-  if (!selected) return null;
-  if (manualTargetDraft.kind === 'provider') return selected.is_provider && providerGroupKey(selected) === manualTargetDraft.group ? selected : null;
-  return selected.is_provider ? null : selected;
+  const option = $('target').selectedOptions[0], selected = findTarget(option?.dataset.id);
+  return !option?.disabled && manualTargetMatches(selected) ? selected : null;
 }
 
 function renderManualTargetSelectors(resetReasoning = false) {
-  const credentials = state.targets.filter(target => !target.is_provider);
-  const groups = new Map();
-  for (const target of state.targets.filter(target => target.is_provider)) {
-    const key = providerGroupKey(target);
-    if (!groups.has(key)) groups.set(key, { name: target.provider_name || target.provider || '未命名供应商', executor: target.provider, targets: [] });
-    groups.get(key).targets.push(target);
+  const labels = new Map(), counts = new Map();
+  for (const target of state.targets) {
+    const label = target.is_provider ? `${target.provider_name || target.provider} · ${target.auth_index || targetID(target)}` : target.email || targetID(target);
+    counts.set(label, (counts.get(label) || 0) + 1);
+    labels.set(targetID(target), label);
   }
-  if (!manualTargetDraft.kind && state.targetsFresh && state.targets.length) manualTargetDraft.kind = credentials.length ? 'credential' : 'provider';
-  const provider = manualTargetDraft.kind === 'provider', group = groups.get(manualTargetDraft.group);
-  $('manual-kind-credential').checked = !provider;
-  $('manual-kind-provider').checked = provider;
-  $('manual-provider-field').hidden = !provider;
-  $('manual-target-label').textContent = provider ? '密钥索引' : '测试凭证';
-  const picker = $('manual-provider');
-  const names = new Map();
-  for (const item of groups.values()) names.set(item.name, (names.get(item.name) || 0) + 1);
-  const groupOptions = [...groups].map(([key, item]) => {
-    const label = names.get(item.name) > 1 ? `${item.name} · ${item.executor}` : item.name;
-    return `<option value="${escapeHTML(key)}">${escapeHTML(label)}</option>`;
-  });
-  if (manualTargetDraft.group && !group) groupOptions.push(`<option value="${escapeHTML(manualTargetDraft.group)}" disabled>${escapeHTML(manualTargetDraft.groupName)}（已不可用）</option>`);
-  const groupPlaceholder = !state.targetsFresh && !groups.size ? '连接后选择供应商' : groups.size ? '选择供应商' : '暂无供应商';
-  picker.innerHTML = `<option value="">${groupPlaceholder}</option>` + groupOptions.join('');
-  picker.value = manualTargetDraft.group;
-  picker.disabled = !groups.size;
-  if (group) manualTargetDraft.groupName = group.name;
-
-  const targets = provider ? group?.targets || [] : credentials;
-  const scope = manualTargetScope();
-  if (provider && group?.targets.length === 1 && !manualTargetDraft.targetIDs.has(scope)) manualTargetDraft.targetIDs.set(scope, targetID(group.targets[0]));
-  const id = manualTargetDraft.targetIDs.get(scope) || '';
-  const missing = id && !targets.some(target => targetID(target) === id);
+  const options = [`<option value="">${state.targets.length ? '选择测试对象' : state.connected ? '暂无测试对象' : '连接后选择对象'}</option>`];
+  for (const [provider, label] of [[false, 'OAuth 账户'], [true, 'AI 提供商 · 单条路由']]) {
+    const targets = state.targets.filter(target => !!target.is_provider === provider);
+    if (!targets.length) continue;
+    options.push(`<optgroup label="${label}">${targets.map(target => {
+      const id = targetID(target), name = labels.get(id);
+      const identity = counts.get(name) > 1 ? `${name} · ${provider ? target.provider : target.auth_index || id}` : name;
+      const status = target.manual_disabled || target.runtime_status === 'disabled' ? ' · 已停用' : provider && !providerRouteReady(target) ? ' · 路由不可用' : '';
+      return `<option value="${escapeHTML(routeValue(id))}" data-id="${escapeHTML(id)}">${escapeHTML(identity + status)}</option>`;
+    }).join('')}</optgroup>`);
+  }
+  const id = manualTargetDraft.id, missing = id && !manualTargetMatches(findTarget(id));
+  const selected = missing ? `~saved/${routeValue(id)}` : routeValue(id);
+  if (missing) options.push(`<option value="${escapeHTML(selected)}" data-id="${escapeHTML(id)}" disabled>${escapeHTML(manualTargetDraft.label || id)} · 原绑定待核实</option>`);
   const field = $('target');
-  const keys = provider ? targets.map(target => `<option value="${escapeHTML(targetID(target))}">${escapeHTML(target.auth_index || targetID(target))}${providerRouteReady(target) ? '' : ' · 路由不可用'}</option>`).join('') : '';
-  field.innerHTML = (provider ? `<option value="">${group ? '选择密钥索引' : '先选择供应商'}</option>${keys}` : targetOptions(credentials)) +
-    (missing ? `<option value="${escapeHTML(id)}" disabled>${escapeHTML(id)}（已不可用）</option>` : '');
-  field.value = id;
-  field.disabled = !targets.length;
-  field.hidden = $('manual-target-label').hidden = provider && !manualTargetDraft.group;
+  patchView(field, options.join(''));
+  field.value = selected;
+  field.disabled = !state.targets.length;
   renderTarget(resetReasoning);
 }
 
@@ -835,36 +1057,53 @@ function renderQuestionSelectors() {
   }
 }
 
+const reasoningLabels = { none: '关闭思考', minimal: '最低', low: '低', medium: '中', high: '高', xhigh: '极高', max: '最高', auto: '自动' };
+const requestedReasoningLevels = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
+const unknownProviderReasoning = (target, model) => target?.is_provider && availableModels(target).includes(model) && !Object.hasOwn(target.reasoning || {}, model);
+function availableReasoningLevels(target, model, requested = '') {
+  const capability = availableModels(target).includes(model) ? target.reasoning?.[model] : null;
+  if (unknownProviderReasoning(target, model)) return new Set(['low', 'medium', 'high', 'xhigh', 'max', ...(['none', 'minimal', 'auto'].includes(requested) ? [requested] : [])]);
+  const levels = capability?.Levels ?? capability?.levels ?? [];
+  const supported = new Set(Array.isArray(levels) ? levels.filter((level) => Object.hasOwn(reasoningLabels, level)) : []);
+  if (!levels.length && Number(capability?.Max ?? capability?.max) > 0) requestedReasoningLevels.forEach(level => supported.add(level));
+  else if (capability && !levels.length) requestedReasoningLevels.filter(level => level !== 'minimal').forEach(level => supported.add(level));
+  if (capability?.ZeroAllowed ?? capability?.zero_allowed) supported.add('none');
+  if (capability?.DynamicAllowed ?? capability?.dynamic_allowed) supported.add('auto');
+  return supported;
+}
+
 function renderReasoning(resetInvalid = false) {
   const target = selectedManualTarget();
   const model = value('models');
   const validModel = availableModels(target).includes(model);
   const capability = validModel ? target.reasoning?.[model] : null;
-  const labels = { none: '关闭思考', minimal: '最低', low: '低', medium: '中', high: '高', xhigh: '极高', max: '最高', auto: '自动' };
-  const levels = capability?.Levels ?? capability?.levels ?? [];
-  const supported = new Set(Array.isArray(levels) ? levels.filter((level) => Object.hasOwn(labels, level)) : []);
-  if (capability?.ZeroAllowed ?? capability?.zero_allowed) supported.add('none');
-  if (capability?.DynamicAllowed ?? capability?.dynamic_allowed) supported.add('auto');
-  const previous = value('reasoning');
+  const previous = manualReasoning;
+  const supported = availableReasoningLevels(target, model, previous);
   const unavailable = !!previous && !supported.has(previous) && !resetInvalid;
-  const options = '<option value="">默认</option>' + (unavailable ? `<option value="${escapeHTML(previous)}" disabled>原设置 ${escapeHTML(previous)} 已不可用</option>` : '') + Object.entries(labels).filter(([level]) => supported.has(level)).map(([level, label]) => `<option value="${level}">${label}</option>`).join('');
+  manualReasoning = supported.has(previous) || unavailable ? previous : '';
+  const choices = [['', '默认'], ...Object.entries(reasoningLabels).filter(([level]) => supported.has(level))];
+  if (unavailable) choices.push([previous, `原设置 ${previous} 已不可用`]);
+  const options = choices.map(([level, label]) => `<option value="${escapeHTML(level)}"${unavailable && level === previous ? ' disabled=""' : ''}>${escapeHTML(label)}</option>`).join('');
   if ($('reasoning').innerHTML !== options) $('reasoning').innerHTML = options;
-  $('reasoning').value = supported.has(previous) || unavailable ? previous : '';
-  $('reasoning').disabled = !supported.size && !unavailable;
+  $('reasoning').value = manualReasoning;
+  $('reasoning').disabled = !validModel || (!supported.size && !unavailable);
   $('reasoning').dataset.unavailable = String(unavailable);
   const note = !validModel ? ''
     : unavailable ? '原思考强度已不在支持范围，请重新选择。'
-    : !capability ? '思考能力未知，使用模型默认设置。'
-    : !supported.size ? '未提供可选思考档位，使用模型默认设置。'
+    : unknownProviderReasoning(target, model) ? '未提供可核实的思考档位；按请求发送，实际支持取决于 CPA 转换和上游。'
+    : !capability ? Object.hasOwn(target.reasoning || {}, model) ? '此模型未提供思考参数，使用模型默认设置。' : '思考能力未知，使用模型默认设置。'
+    : !supported.size ? '目录未提供可识别的思考档位，使用模型默认设置。'
+    : !((capability.Levels ?? capability.levels)?.length) && Number(capability.Max ?? capability.max) > 0 ? '选择请求思考强度，CPA 将按模型支持的预算范围调整。'
+    : !((capability.Levels ?? capability.levels)?.length) ? '未声明思考档位或预算限制；按请求发送，实际支持取决于 CPA 转换和上游。'
     : '仅显示此模型支持的思考强度。';
   $('reasoning-note').textContent = note;
-  $('reasoning-note').hidden = !note || (validModel && !!supported.size && !unavailable);
+  $('reasoning-note').hidden = !note || note === '仅显示此模型支持的思考强度。';
   $('reasoning-note').classList.toggle('error-note', unavailable);
 }
 
 function renderTarget(selectModel = false) {
-  const target = selectedManualTarget(), id = value('target');
-  const provider = manualTargetDraft.kind === 'provider';
+  const target = selectedManualTarget(), id = manualTargetDraft.id;
+  const provider = manualTargetDraft.isProvider;
   const models = availableModels(target);
   const previous = manualTargetDraft.models.get(manualModelKey());
   const unavailable = !!previous && !models.includes(previous);
@@ -877,17 +1116,18 @@ function renderTarget(selectModel = false) {
   $('models').value = selected;
   $('models').disabled = !models.length || (provider && !providerRouteReady(target));
   $('models').title = selected;
-  $('model-note').textContent = unavailable ? '原模型已从目录移除，请重新选择模型。'
+  $('model-note').textContent = unavailable ? canRefreshManualState({ auth_id: id, models: [previous] })
+    ? '当前缓存未提供此模型，开始测试时将刷新核对。' : '原模型已从目录移除，请重新选择模型。'
     : target && !models.length && !provider ? '未发现已注册模型，请在 CPA 检查配置后刷新数据。' : '';
   $('model-note').classList.toggle('error-note', !!target && (!models.length || unavailable));
   if (!target) {
     $('target').removeAttribute('title');
     $('target-summary').classList.remove('field-state');
     const missing = provider ? '原选供应商或密钥索引已离开当前目录，请重新选择。' : '原选凭证已离开当前目录，请重新选择。';
-    const missingSelection = id || (provider && manualTargetDraft.group && $('manual-provider').selectedOptions[0]?.disabled);
-    const empty = provider ? 'CPA 当前没有可选择的供应商。' : '尚无普通凭证，请在 CPA 中添加凭证或选择供应商。';
+    const missingSelection = id;
+    const empty = 'CPA 当前没有可选择的测试对象。';
     $('target-summary').textContent = resourceMessage('targets', `测试${subject}`) ||
-      (missingSelection ? missing : state.targets.some(t => !!t.is_provider === provider) ? '' : empty);
+      (missingSelection ? missing : state.targets.length ? '' : empty);
   } else {
     const reason = !state.targetsFresh ? '凭证目录读取失败，当前状态未确认。请刷新重试。' : credentialBlock({ auth_id: targetID(target), models: selected ? [selected] : [] }, state.targets, { manual: true });
     $('target').title = target.is_provider ? providerTargetName(target) : target.email || targetID(target);
@@ -946,12 +1186,12 @@ function renderQuestion() {
 function manualRunConfig() {
   const target = selectedManualTarget();
   if (!target) {
-    if (manualTargetDraft.kind === 'provider' && !manualTargetDraft.group) fieldError('manual-provider', '请选择要测试的供应商。');
-    fieldError('target', manualTargetDraft.kind === 'provider' ? '请选择供应商当前的密钥索引。' : '请选择要测试的凭证。');
+    fieldError('target', '请选择当前目录中的测试对象。');
   }
   const model = value('models');
-  if (!model || !availableModels(target).includes(model)) fieldError('models', '请选择此凭证目录中的可用模型。');
-  if ($('reasoning').dataset.unavailable === 'true') fieldError('reasoning', '请重新选择可用的思考强度。');
+  const refreshable = canRefreshManualState({ auth_id: targetID(target), provider: target.provider, models: [model] });
+  if (!model || (!availableModels(target).includes(model) && !refreshable)) fieldError('models', '请选择此凭证目录中的可用模型。');
+  if ($('reasoning').dataset.unavailable === 'true' && !refreshable) fieldError('reasoning', '请重新选择可用的思考强度。');
   const samples = number('samples');
   if (!Number.isInteger(samples) || samples < 1 || samples > 8) fieldError('samples', '回答数量须为 1–8 的整数。');
   const question = state.questions.find((entry) => entry.id === value('question'));
@@ -959,11 +1199,12 @@ function manualRunConfig() {
   if (selection.question_id === 'custom') readCustomQuestionText('prompt');
   const config = {
     auth_id: targetID(target), provider: target.provider, models: [model], samples,
+    expected_object_type: manualTargetDraft.isProvider ? 'provider' : 'oauth', expected_auth_index: manualTargetDraft.authIndex || undefined,
     ...selection,
     parameters: { stream: true },
     judge: { mode: 'manual' },
   };
-  if (value('reasoning')) config.parameters.reasoning_effort = value('reasoning');
+  if (manualReasoning) config.parameters.reasoning_effort = manualReasoning;
   return config;
 }
 
@@ -973,6 +1214,9 @@ function runConfig(prefix = '') {
   const scope = draftRuleScope(), all = !!dynamicScopeLabel(scope.target_scope) || !!scope.target_group;
   if (!scope.object_types.length) fieldError('rule-object-oauth', '请至少选择一种检测对象。');
   if (!all && !scope.auth_id) fieldError('rule-target', '请选择要检测的对象。');
+  if (scope.expected_target_object_type && (!$('rule-target').selectedOptions[0]?.dataset.index || $('rule-target').selectedOptions[0].disabled)) {
+    fieldError('rule-target', '当前目录无法核实所选对象，请刷新后重新选择。');
+  }
   const models = draftRuleModels();
   const problem = ruleModelsProblem(models);
   if (problem) fieldError(`${prefix}models`, problem);
@@ -1022,23 +1266,51 @@ function blockedConfig(config, options) {
   return credentialBlock(config, state.targets, options);
 }
 
-function blockedManualConfig(config) {
-  if (config?.provider_name) {
-    const target = findTarget(config.auth_id);
-    if (!target?.is_provider || (config.provider && target.provider !== config.provider) ||
-      (config.subject_auth_index && target.auth_index !== config.subject_auth_index)) return '历史记录中的供应商或密钥索引已不可用，请重新选择测试目标。';
-    if (config.models?.some(model => !availableModels(target).includes(model))) return '此供应商已不再注册原模型，请重新选择测试模型。';
+function manualBindingProblem(config, target) {
+  const provider = config.provider_name || config.provider_observation || config.expected_object_type === 'provider';
+  const index = config.subject_auth_index || config.expected_auth_index;
+  if (!provider && !config.expected_object_type && !index) return '';
+  if (!target || (config.provider && target.provider !== config.provider) || (index && target.auth_index !== index) ||
+    (provider && !target.is_provider) || (config.expected_object_type === 'oauth' && target.is_provider)) {
+    return provider ? '原绑定的供应商或密钥索引已不可用，请重新选择测试目标。' : '原绑定的凭证或索引已不可用，请重新选择测试目标。';
   }
-  return blockedConfig(config, { manual: true }) || resourceMessage('questions', '题库');
+  return '';
+}
+
+function blockedManualConfig(config) {
+  const target = findTarget(config.auth_id);
+  if (target?.is_provider && state.backend?.state !== 'ready') return (backendLabels[state.backend?.state] || '后台状态待读取') + '，暂不能核实供应商配置。';
+  const binding = manualBindingProblem(config, target);
+  if (binding) return binding;
+  if ((config.provider_name || config.provider_observation || config.expected_object_type === 'provider') &&
+    config.models?.some(model => !availableModels(target).includes(model))) return '此供应商已不再注册原模型，请重新选择测试模型。';
+  const blocked = blockedConfig(config, { manual: true }) || resourceMessage('questions', '题库');
+  if (blocked) return blocked;
+  if (config.auth_id && config.models?.some(model => !availableModels(findTarget(config.auth_id)).includes(model))) return '当前目录没有所选模型，请重新选择测试模型。';
+  if (config.parameters?.reasoning_effort && config.models?.some(model => !availableReasoningLevels(findTarget(config.auth_id), model, config.parameters.reasoning_effort).has(config.parameters.reasoning_effort))) return '所选思考强度已不在当前模型支持范围，请重新选择。';
+  return '';
+}
+
+function canRefreshManualState(config) {
+  const target = findTarget(config.auth_id);
+  if (target?.is_provider && state.backend?.state !== 'ready') return false;
+  if (!state.connected || !state.targetsFresh || state.resourceStatus.questions !== 'ready' || !target ||
+    target.quality_paused || target.retained_pause || target.handling_state_reason ||
+    target.credential_handling && !['disabled', 'restored', 'acknowledged', 'externally_enabled'].includes(target.credential_handling)) return false;
+  if (!(target.manual_disabled || target.runtime_status === 'disabled')) return false;
+  if (manualBindingProblem(config, target) || config.provider && config.provider !== target.provider) return false;
+  return config.models?.length > 0 && config.models.every(model => availableModels(target).includes(model) ||
+    manualTargetDraft.models.get(targetID(target)) === model);
 }
 
 function renderAdmission() {
   const config = {
-    auth_id: value('target'),
+    auth_id: selectedManualTarget() ? manualTargetDraft.id : '',
     models: value('models') ? [value('models')] : [],
     judge: { mode: 'manual' },
   };
   const blocked = blockedManualConfig(config) || (config.auth_id && !availableModels(selectedManualTarget()).includes(value('models')) ? '请先选择可用的测试目标和模型。' : '') || ($('reasoning').dataset.unavailable === 'true' ? '请重新选择可用的思考强度。' : '');
+  const refreshable = canRefreshManualState(config);
   const testing = state.connected && (!!state.pendingManual || state.busy.has('submit-run'));
   const phase = state.pendingManual?.status;
   const retrySubmission = state.connected && !testing && !!manualReceiptKey;
@@ -1049,9 +1321,12 @@ function renderAdmission() {
   if (!state.run) $('run-empty-title').textContent = testing ? '等待测试结果' : '暂无回答';
   if (!testing) $('run-submit-label').textContent = retrySubmission ? '重新提交' : '开始测试';
   $('run-submit').setAttribute('aria-busy', String(testing));
-  $('run-submit').disabled = testing || !config.auth_id || !!blocked || !$('prompt').validity.valid;
-  $('run-submit').title = state.connected ? blocked || $('prompt').validationMessage : '';
+  $('run-submit').disabled = testing || !config.auth_id || (!!blocked && !refreshable) || !$('prompt').validity.valid;
+  $('run-submit').title = state.connected ? refreshable ? '提交时读取 CPA 当前状态；仍停用时不会调用模型。' : blocked || $('prompt').validationMessage : '';
   $('release-confirm').disabled = state.releaseBlocked || state.busy.has('release') || !state.connected;
+  const ruleSave = $('rule-form').querySelector('button[type="submit"]');
+  ruleSave.disabled = !state.connected || !!state.editor?.saving || !!state.editor?.saveUncertain;
+  ruleSave.title = state.editor?.saveUncertain ? '保存结果未确认，请先关闭草稿并核对规则列表。' : '';
   for (const id of [
     'ops-all-rules',
     'run-export',
@@ -1061,8 +1336,9 @@ function renderAdmission() {
     $(id).disabled = !state.connected || $(id).getAttribute('aria-busy') === 'true';
   if (state.run) {
     const reason = blockedManualConfig(state.run.config || {});
-    $('run-rerun').disabled = !!reason || testing;
-    $('run-rerun').title = reason;
+    const refreshableRun = canRefreshManualState(state.run.config || {});
+    $('run-rerun').disabled = (!!reason && !refreshableRun) || testing;
+    $('run-rerun').title = refreshableRun ? '提交时读取 CPA 当前状态；仍停用时不会调用模型。' : reason;
   }
 }
 
@@ -1122,12 +1398,21 @@ async function checkManualReceipt(selection, focus) {
   }
 }
 
-async function submitRun(config) {
+async function submitRun(config, binding = config) {
   if (state.pendingManual) return;
-  const selection = manualSelection();
+  const selection = manualSelection(), epoch = client.epoch;
   const retry = !!manualReceiptKey;
   if (retry && await checkManualReceipt(selection, true) !== 'missing') return;
-  const blocked = blockedManualConfig(config);
+  let targetRead = loadTargets({ fresh: true });
+  for (;;) {
+    try { await targetRead; }
+    catch (error) { if (epoch !== client.epoch || targetRead === latestTargetsRead) throw error; }
+    if (epoch !== client.epoch) return;
+    if (targetRead === latestTargetsRead) break;
+    targetRead = latestTargetsRead;
+  }
+  if (epoch !== client.epoch) return;
+  const blocked = blockedManualConfig(binding);
   if (blocked) throw new Error(blocked);
   const key = manualReceiptKey || newKey();
   rememberManualReceipt(key);
@@ -1195,7 +1480,7 @@ async function loadRun(id, show = true, historyOrigin = null) {
 function schedulePoll(delay = Math.min(10000, 1200 * 2 ** state.pollFailures)) {
   clearTimeout(state.poll);
   state.poll = null;
-  if (!state.connected) return;
+  if (!state.connected || !pageDisplayed()) return;
   const pending = state.pendingManual;
   if (pending?.status === 'checking_receipt') {
     state.poll = setTimeout(() => {
@@ -1278,7 +1563,7 @@ async function readQualityDetail(detail) {
     const reply = await api(`/runs/detail?id=${encodeURIComponent(detail.id)}`);
     if (!current()) return;
     const run = reply.run || reply;
-    patchView($('quality-detail-content'), renderQualityDetail(run, state.rules, credentialName));
+    patchView($('quality-detail-content'), renderQualityDetail(run, state.rules));
     detail.run = run;
     $('quality-detail-message').textContent = '';
     $('quality-detail-retry').hidden = true;
@@ -1288,7 +1573,7 @@ async function readQualityDetail(detail) {
     const row = state.activityRows?.findIndex(item => (item.id || item.run_id) === detail.id);
     if (row >= 0) {
       state.activityRows[row] = run;
-      patchView($('operations-history'), renderQualityRuns(state.activityRows, state.rules, credentialName));
+      patchView($('operations-history'), renderQualityRuns(state.activityRows, state.rules));
     }
   } catch (error) {
     if (!current() || isDiscarded(error)) return;
@@ -1360,6 +1645,7 @@ function patchView(target, html) {
       const preservedClasses = ['expanded', ...(current.matches('.model-result,.sample') ? ['hidden'] : [])].filter((name) => current.classList.contains(name));
       for (const attribute of [...current.attributes]) {
         if (['open', 'style', 'aria-busy'].includes(attribute.name)) continue;
+        if (attribute.name === 'srcdoc' && current.matches('iframe[data-inline-preview]')) continue;
         if (!next.hasAttribute(attribute.name)) current.removeAttribute(attribute.name);
       }
       for (const attribute of [...next.attributes]) {
@@ -1375,6 +1661,23 @@ function patchView(target, html) {
     existing.filter((node) => !used.has(node)).forEach((node) => node.remove());
   }
   patchChildren(target, template.content);
+}
+
+const inlinePreviewDocuments = new WeakMap();
+function hydrateInlinePreviews(container, run) {
+  for (const frame of container.querySelectorAll('iframe[data-inline-preview]')) {
+    const sample = run.samples?.[Number(frame.dataset.inlinePreview) - (run.pruned_samples || 0)];
+    const output = sample?.output || '';
+    if (inlinePreviewDocuments.get(frame) === output) continue;
+    inlinePreviewDocuments.set(frame, output);
+    try {
+      frame.srcdoc = safePreview(output);
+    } catch {
+      const source = frame.nextElementSibling;
+      if (source?.matches('[data-source-sample]')) source.open = true;
+      frame.replaceWith(Object.assign(document.createElement('p'), { className: 'field-note', textContent: '作品预览暂不可用，原文仍可查看和复制。' }));
+    }
+  }
 }
 
 function renderRun() {
@@ -1396,7 +1699,7 @@ function renderRun() {
   $('run-rerun').classList.toggle('hidden', isActive || !repeatable);
   $('run-export').classList.remove('hidden');
   $('run-cancel').classList.toggle('hidden', !isActive);
-  const rendered = renderRunEvidence(run, credentialName);
+  const rendered = renderRunEvidence(run);
   patchView($('run-meta'), rendered.metaHTML);
   patchView($('run-frozen-data'), `${rendered.conditionsHTML}<div class="run-identifier">任务 ${escapeHTML(run.id || run.run_id)}</div>`);
   const progress = Math.min(100, Math.round(rendered.completed / Math.max(1, rendered.planned) * 100));
@@ -1418,6 +1721,7 @@ function renderRun() {
   const sameRun = state.compareRun === id;
   if (sameRun) patchView($('sample-list'), rendered.samplesHTML);
   else $('sample-list').innerHTML = rendered.samplesHTML;
+  hydrateInlinePreviews($('sample-list'), run);
   if (!sameRun) {
     const models = [...new Set([...(run.config?.models || []), ...(run.samples || []).map((sample) => sample.model || sample.request_model || '模型未知')])];
     const options = models.map((model, index) => `<option value="${escapeHTML(model)}">${index + 1} · ${escapeHTML(model.length > 48 ? `${model.slice(0,18)}…${model.slice(-24)}` : model)}</option>`).join('');
@@ -1482,6 +1786,15 @@ function renderRuleContext() {
   }) : '';
   if (html || panel.hasChildNodes()) patchView(panel, html);
   panel.hidden = !html;
+  const retained = $('ops-orphaned-handling');
+  const orphaned = state.connected ? renderOrphanedHandling(state.orphanedHandling, credentialName, {
+    expanded: !!retained.querySelector('details[open]'),
+    canAcknowledge: state.resourceStatus.rules === 'ready' && state.targetsFresh,
+    readError: state.resourceStatus.rules === 'error' ? '规则读取失败，保留上次待核对记录。请刷新重试。'
+      : state.resourceStatus.targets === 'error' ? '凭证目录读取失败，请刷新后核对。' : '',
+  }) : '';
+  if (orphaned || retained.hasChildNodes()) patchView(retained, orphaned);
+  retained.hidden = !orphaned;
 }
 
 function renderActivityState() {
@@ -1511,8 +1824,9 @@ function historyRows() {
     const id = escapeHTML(run.id || run.run_id);
     const config = run.config || {};
     const title = escapeHTML(questionTitle(config.question || state.questions.find(question => question.id === config.question_id), config.question_id));
-    const supplier = frozenProviderLabel(config);
-    const credential = escapeHTML(supplier ? `供应商 · ${supplier}` : run.credential_email || credentialName(config.auth_id) || '凭证未记录');
+    const identity = frozenRunIdentity(run);
+    const supplier = identity.supplier;
+    const credential = escapeHTML(supplier ? `供应商 · ${identity.label}` : identity.label);
     const models = escapeHTML(config.models?.join(' / ') || '模型未记录');
     const time = hasDate ? `<time class="history-clock" datetime="${stamp.toISOString()}" title="${date(stamp)}"><span class="history-hour">${historyTime.format(stamp)}</span><span class="history-date">${historyDay.format(stamp)}</span></time>` : '时间未记录';
     return `<tr class="history-row" data-history-id="${id}" data-key="run:${id}">
@@ -1668,7 +1982,7 @@ function confirmHistoryDelete(id) {
   if (!run || active(run)) return;
   actionDialog({
     title: '删除测试记录',
-    description: `删除「${questionTitle(run.config?.question, run.config?.question_id)}」（${date(run.created_at)}）及本次回答？任务 ${id}，凭证 ${run.credential_email || credentialName(run.config?.auth_id) || '未记录'}。`,
+    description: `删除「${questionTitle(run.config?.question, run.config?.question_id)}」（${date(run.created_at)}）及本次回答？任务 ${id}，对象 ${frozenRunIdentity(run).label}。`,
     confirm: '删除', danger: true,
     submit: async () => {
       const epoch = client.epoch;
@@ -1701,18 +2015,26 @@ function confirmHistoryDelete(id) {
   });
 }
 
+function ruleCatalogNotice() {
+  if (!state.questions.length && state.resourceStatus.questions !== 'ready') return resourceMessage('questions', '题库');
+  return state.resourceStatus.targets === 'loading' ? '正在读取测试对象目录…' : '';
+}
+
 function renderRules() {
   const query = value('rule-search').toLocaleLowerCase(), filter = value('rule-filter');
   const filtered = state.rules.filter(rule => {
     const config = rule.config || rule;
-    return (filter === 'all' || ruleState(rule, state.targets) === filter) && [rule.name, rule.id, config.auth_id, credentialName(config.auth_id), ...(config.models || []), ruleScopeDescription(rule, state.targets)].join(' ').toLocaleLowerCase().includes(query);
+    return (filter === 'all' || ruleState(rule, state.targets) === filter) && [rule.name, rule.id, config.auth_id, ...(config.models || []), ruleScopeDescription(rule, state.targets)].join(' ').toLocaleLowerCase().includes(query);
   });
   const message = !state.rules.length && resourceMessage('rules', '检测规则');
-  patchView($('rules-list'), message ? renderQualityEmpty(message) : state.rules.length && !filtered.length ? renderQualityEmpty('没有匹配的规则', '调整搜索内容或状态筛选。', '<button class="text-button" data-rule-clear>清除筛选</button>') : renderRuleRows(filtered, state.targets, state));
+  const catalogNote = ruleCatalogNotice();
+  const controls = catalogNote ? { ...state, connected: false } : state;
+  patchView($('rules-list'), message ? renderQualityEmpty(message) : state.rules.length && !filtered.length ? renderQualityEmpty('没有匹配的规则', '调整搜索内容或状态筛选。', '<button class="text-button" data-rule-clear>清除筛选</button>') : renderRuleRows(filtered, state.targets, controls));
   const settingsPending = !['ready', 'error'].includes(state.resourceStatus.settings);
-  for (const button of document.querySelectorAll('#rule-new, #rules-list [data-rule-new]')) {
-    button.disabled = !state.connected || settingsPending;
-    button.title = state.connected && settingsPending ? '正在读取凭证处置能力' : '';
+  for (const button of document.querySelectorAll('#rule-new, #rules-list [data-rule-new], #rules-list [data-rule-edit]')) {
+    const waitingSettings = !button.hasAttribute('data-rule-edit') && settingsPending;
+    button.disabled = !state.connected || !!catalogNote || waitingSettings;
+    button.title = catalogNote || (waitingSettings ? '正在读取凭证处置能力' : '');
   }
   $('rule-count').textContent = state.resourceStatus.rules === 'ready' || state.rules.length ? String(state.rules.length) : '—';
   $('ops-all-count').textContent = $('rule-count').textContent;
@@ -1760,15 +2082,19 @@ function renderMetrics() {
     .join(''));
 }
 
-async function allPages(path, key) {
-  const list = [], seen = new Set(); let total, providerDirectoryVerified = true;
+async function allPages(path, key, options) {
+  const list = [], seen = new Set(); let total, providerDirectoryVerified = true, orphanedHandling = [];
   for (;;) {
-    const page = await api(`${path}?limit=100&offset=${list.length}`);
+    const page = await api(`${path}?limit=100&offset=${list.length}`, 'GET', undefined, options);
     providerDirectoryVerified &&= page.provider_directory_verified !== false;
+    if (path === '/rules' && !list.length) {
+      if (page.orphaned_handling !== undefined && !Array.isArray(page.orphaned_handling)) throw Error('处置目录格式无效，请刷新。');
+      orphanedHandling = page.orphaned_handling || [];
+    }
     if (!Array.isArray(page.items) || !Number.isSafeInteger(page.total) || page.total < 0 || (total !== undefined && total !== page.total)) throw Error('目录已变化，请刷新。');
     total = page.total;
     for (const row of page.items) { const id = row[key]; if (!id || seen.has(id)) throw Error('目录已变化，请刷新。'); seen.add(id); list.push(row); }
-    if (list.length === total) return { items:list, total, providerDirectoryVerified };
+    if (list.length === total) return { items:list, total, providerDirectoryVerified, orphanedHandling };
     if (!page.items.length || list.length > total) throw Error('目录读取不完整，请刷新。');
   }
 }
@@ -1796,7 +2122,7 @@ async function loadActivity() {
     $('ops-batch-summary').textContent = total ? `${state.scopeBatch ? '本批次 ' : ''}${offset + 1}–${Math.min(offset + 20, total)} / ${total}` : '0 条运行记录';
     $('ops-batch-prev').disabled = offset === 0;
     $('ops-batch-next').disabled = offset + 20 >= total;
-    patchView($('operations-history'), renderQualityRuns(state.activityRows, state.rules, credentialName));
+    patchView($('operations-history'), renderQualityRuns(state.activityRows, state.rules));
   } catch (error) {
     if (sequence !== state.reads.activity || isDiscarded(error)) return;
     state.resourceStatus.activity = 'error';
@@ -1827,7 +2153,7 @@ async function loadRuleSettings() {
     if (!data || typeof data !== 'object' || Array.isArray(data)) throw Error('管理接口返回了无效设置。');
     applyRuleSettings(data, 'ready');
   } catch (error) {
-    if (sequence === state.reads.settings) applyRuleSettings({}, 'error');
+    if (sequence === state.reads.settings) applyRuleSettings(state.settings, 'error');
     throw error;
   }
 }
@@ -1835,8 +2161,12 @@ async function loadRuleSettings() {
 let operationsPoll, operationsReading = false, activityReading = false;
 let operationsFrameVisible = window.self === window.top;
 
+function pageDisplayed() {
+  return !pageSuspended && operationsFrameVisible && !document.hidden && navigator.onLine !== false;
+}
+
 function operationsVisible() {
-  return state.connected && state.page === 'operations' && operationsFrameVisible && !document.hidden && navigator.onLine !== false;
+  return state.connected && state.page === 'operations' && pageDisplayed();
 }
 
 function scheduleOperationsPoll(delay = 5000) {
@@ -1847,11 +2177,66 @@ function scheduleOperationsPoll(delay = 5000) {
   }, delay);
 }
 
+let targetsReadAt = 0, operationsReadAt = 0, qualityRetryAt = 0;
+function recoverVisibleData(backendChanged = false) {
+  if (!state.connected || !pageDisplayed() || state.page === 'login') return;
+  const failed = state.resourceStatus;
+  if (failed.questions === 'error' && Date.now() >= qualityRetryAt) void loadQuestions().catch(() => {});
+  if (state.page === 'operations' && (failed.actions === 'error' || failed.settings === 'error') && !operationsReading) {
+    void loadOperations().catch(() => {});
+  } else if (backendChanged || (state.page === 'manual' && failed.targets === 'error')) {
+    void loadTargets().catch(() => {});
+    if (backendChanged) void loadRuleSettings().catch(() => {});
+  }
+  if (state.page === 'manual' && state.manualView === 'history' && failed.history === 'error') void loadHistory();
+}
 function syncOperationsVisibility() {
-  scheduleOperationsPoll(0);
+  scheduleConnectionRead();
+  schedulePoll();
+  loginWorkbench.syncVisibility?.();
+  if (!pageDisplayed() || !state.connected) {
+    clearTimeout(operationsPoll);
+    clearTimeout(qualityDetail?.timer);
+    return;
+  }
+  const now = Date.now();
+  scheduleOperationsPoll(Math.max(0, operationsReadAt + 5000 - now));
+  recoverVisibleData();
+  if (state.page === 'manual' && state.resourceStatus.questions === 'ready' &&
+    (now - targetsReadAt >= 5000 || state.busy.has('submit-run'))) void loadTargets().catch(() => {});
   if (!qualityDetail) return;
   clearTimeout(qualityDetail.timer);
   if (operationsVisible() && !qualityDetail.reading && qualityDetailActive(qualityDetail.run)) void readQualityDetail(qualityDetail);
+}
+
+let latestTargetsRead;
+function loadTargets(options) {
+  const sequence = ++state.reads.targets, epoch = client.epoch;
+  latestTargetsRead = (async () => {
+    let data;
+    try {
+      const result = await allPages('/targets', 'auth_id', options);
+      if (!result || typeof result !== 'object' || Array.isArray(result)) throw Error('凭证目录数据格式无效，请刷新重试。');
+      data = result;
+    } finally {
+      if (epoch === client.epoch && sequence === state.reads.targets) {
+        targetsReadAt = Date.now();
+        state.targetsFresh = data !== undefined;
+        state.resourceStatus.targets = data === undefined ? 'error' : 'ready';
+        if (data) {
+          state.targets = items(data);
+          state.providerDirectoryVerified = data.providerDirectoryVerified;
+        }
+        renderTargetSelectors();
+        renderRules();
+        renderRuleContext();
+        if (state.activityRows) patchView($('operations-history'), renderQualityRuns(state.activityRows, state.rules));
+        if (state.runs.length) renderHistory();
+        updateFreshness();
+      }
+    }
+  })();
+  return latestTargetsRead;
 }
 
 async function loadOperations(live = false) {
@@ -1860,7 +2245,7 @@ async function loadOperations(live = false) {
   const current = () => epoch === client.epoch && sequence === state.reads.operations;
   clearTimeout(operationsPoll);
   operationsReading = true;
-  const resources = live ? ['rules', 'metrics', 'activity'] : ['rules', 'metrics', 'activity', 'actions', 'targets', 'settings'];
+  const resources = live ? ['rules', 'metrics', 'activity', 'targets'] : ['rules', 'metrics', 'activity', 'actions', 'targets', 'settings'];
   for (const resource of resources) if (!state.resourceStatus[resource]) state.resourceStatus[resource] = 'loading';
   if (!state.rules.length) renderRules();
   renderActivityState();
@@ -1880,59 +2265,69 @@ async function loadOperations(live = false) {
       }
     }
   }
+  const rulesRead = read('rules', allPages('/rules', 'id'), data => {
+    if (data) {
+      state.rules = items(data);
+      state.orphanedHandling = data.orphanedHandling;
+    }
+    if (state.activityRows) patchView($('operations-history'), renderQualityRuns(state.activityRows, state.rules));
+    renderRules();
+    renderActivityState();
+  });
   const requests = [
-    read('rules', allPages('/rules', 'id'), data => {
-      if (data) state.rules = items(data);
-      if (state.activityRows) patchView($('operations-history'), renderQualityRuns(state.activityRows, state.rules, credentialName));
-      renderRules();
-      renderActivityState();
-    }),
+    rulesRead,
     read('metrics', api('/metrics?view=summary'), data => {
       if (data) state.metrics = data;
       renderMetrics();
     }),
     live && activityReading ? undefined : loadActivity(),
+    loadTargets(),
   ];
   if (!live) requests.push(
     read('actions', allPages('/actions', 'action_id'), data => {
       if (data) state.actions = items(data);
-    }),
-    read('targets', allPages('/targets', 'auth_id'), data => {
-      state.targetsFresh = data !== undefined;
-      if (data) {
-        state.targets = items(data);
-        state.providerDirectoryVerified = data.providerDirectoryVerified;
-      }
-      renderTargetSelectors();
-      renderRules();
-      renderRuleContext();
-      if (state.activityRows) patchView($('operations-history'), renderQualityRuns(state.activityRows, state.rules, credentialName));
-      if (state.runs.length) renderHistory();
     }),
     loadRuleSettings().catch(() => {}), // Optional settings have their own read status.
   );
   const results = await Promise.allSettled(requests);
   if (!current()) return;
   operationsReading = false;
+  operationsReadAt = Date.now();
   // Reconciliation callers still require positive reads of rules, actions and credentials.
   const failed = results.find(result => result.status === 'rejected');
   scheduleOperationsPoll(failed ? 12000 : undefined);
   if (failed) throw failed.reason;
 }
 
-async function refresh() {
-  const sequence = ++state.reads.refresh;
-  const runRead = state.reads.run;
+async function loadQuestions() {
+  const sequence = ++state.reads.questions;
   if (!state.resourceStatus.questions) state.resourceStatus.questions = 'loading';
-  const [questions, operations] = await Promise.allSettled([api('/questions'), loadOperations(), loadHistory()]);
+  try {
+    const data = await api('/questions');
+    if (sequence !== state.reads.questions) return;
+    const list = Array.isArray(data) ? data : data?.items;
+    if (!Array.isArray(list) || list.some(question => !question?.id)) throw Error('题库返回了无效的目录，请刷新重试。');
+    state.questions = list;
+    state.resourceStatus.questions = 'ready';
+  } catch (error) {
+    if (sequence === state.reads.questions) {
+      state.resourceStatus.questions = 'error';
+      qualityRetryAt = Date.now() + 3000;
+    }
+    throw error;
+  } finally {
+    if (sequence === state.reads.questions) {
+      renderQuestionSelectors();
+      renderRules();
+      updateFreshness();
+    }
+  }
+}
+
+async function refresh() {
+  const sequence = ++state.reads.refresh, runRead = state.reads.run;
+  await Promise.allSettled([loadQuestions(), loadOperations(), loadHistory()]);
   if (sequence !== state.reads.refresh) return;
-  state.resourceStatus.questions = questions.status === 'fulfilled' ? 'ready' : 'error';
-  if (questions.status === 'fulfilled') state.questions = items(questions.value);
-  renderQuestionSelectors();
-  updateFreshness();
-  // The two catalogs validate a new connection. Independent history/metric reads can be retried in that session.
-  if (!state.connected && !state.targetsFresh && !(state.page === 'operations' && state.resourceStatus.rules === 'ready')) throw operations.reason || Error('凭证目录读取失败，请刷新重试。');
-  if (!state.connected && questions.status === 'rejected') throw questions.reason;
   if (state.run && runRead === state.reads.run) await loadRun(state.run.id || state.run.run_id, false);
   const deletion = $('notice').dataset.ruleDeleteReceipt;
   if (deletion && state.page === 'operations' && state.resourceStatus.rules === 'ready' && state.resourceStatus.activity === 'ready') {
@@ -2030,6 +2425,7 @@ function updateRuleSchedule() {
   if (legacy) clearFieldError(cron);
   const rule = state.rules.find(r => r.id === value('rule-id'));
   $('rule-schedule-note').textContent = rule && ruleHeld(rule) ? '凭证暂停归属未解除，检测已停止。'
+    : rule && checked('rule-timer') && $('rule-timer').dataset.initial === 'true' && rule.timer_active !== true ? '保留定时设置，当前尚未运行；保存不会重新启动。'
     : checked('rule-timer') ? '保存后从下个周期开始，仅运行本条规则。'
     : rule?.enabled === false ? '原规则已暂停，保存不会恢复检测。' : '关闭时仅手动执行。';
 }
@@ -2110,15 +2506,20 @@ function updateRuleHandling() {
   $('rule-restore-option').hidden = !pause;
   $('rule-auto-restore').disabled = !pause;
   $('rule-restore-detail').textContent = $('rule-scope-directory').checked
-    ? '全部范围内，人工停用和本规则因答错停用的授权对象，整轮通过且停用快照匹配后才恢复。'
-    : '仅复检本规则因答错停用的授权对象。原模型、全部样本均通过且停用快照匹配后才恢复。';
+    ? '人工停用或本规则因答错停用的授权对象，本轮全部模型与样本通过且写前条件未变才恢复。他规则的答错归属不转移。'
+    : '仅恢复本规则因答错停用的授权对象。本轮全部模型与样本通过且写前条件未变才恢复。';
+  $('rule-scope-detail').textContent = $('rule-scope-directory').checked
+    ? '全部对象可检测已停用对象；未获本规则恢复授权时仅记录。上游错误停用期间退出所有答题和恢复。'
+    : $('rule-scope-all').checked ? '普通检测仅纳入已启用对象。本规则答错停用且开启自动恢复的对象另行复检。'
+    : '按指定条目执行；检测资格不授予他规则的恢复归属，也不代替整组启停授权。';
   $('rule-handling-note').textContent = action === 'delete_credential' ? '移除仅适用于已获准处置的文件凭证。整轮可判定且有明确答错时删除。'
     : pause ? '整轮可判定且有明确答错时暂停对象。整组启停还须在本规则中授权。' : '答错时仅记录检测结果。';
-  let note = '模型不支持可由已核实的 CPA 目录缺项或上游明确的 400/404 确认。普通限流、超时和未知结果只记入运行记录。';
-  if (errorActions.includes('disable_credential')) note += '错误确认暂停后，该对象的全部模型退出后续运维检测和恢复复检。';
+  let note = '上游错误独立于答错处理，无标准答案的题型也可使用受支持的探测通道。模型不支持可由已核实的非空 CPA 目录缺项或上游明确的 400/404 确认。普通限流、超时和未知结果只记入运行记录。';
+  if (errorActions.includes('disable_credential')) note += '错误确认停用后，该对象的全部模型退出后续运维检测和恢复复检，直到在 CPA 手动启用。';
   if (errorActions.includes('delete_credential')) note += '移除仅适用于允许删除的文件凭证。';
   if (!supported) note += state.resourceStatus.settings === 'error' ? '凭证处置能力读取失败，可刷新重试。' : '当前宿主未提供凭证处置。';
-  else if (managing && (value('rule-judge-mode') !== 'deterministic' || (value('rule-control-target') && !$('rule-control-fields').classList.contains('hidden')))) note += '处置需要标准答案判定并清除对照凭证。';
+  else if (managing && value('rule-control-target') && !$('rule-control-fields').classList.contains('hidden')) note += '管理探测暂不支持独立对照凭证。';
+  if (handlesCredential(action) && value('rule-judge-mode') !== 'deterministic') $('rule-handling-note').textContent += '答错自动处置需要标准答案判定；人工补充评审不自动处置。';
   $('rule-upstream-note').textContent = note;
 }
 
@@ -2134,6 +2535,12 @@ function draftRuleScope() {
       scope.auth_id = option.dataset.id;
       scope.provider = option.dataset.provider || '';
       if (option.dataset.index) scope.target_auth_index = option.dataset.index;
+      const saved = state.rules.find(rule => rule.id === value('rule-id'));
+      const prior = saved?.config || saved;
+      const sameBinding = prior?.auth_id === scope.auth_id && prior.provider === scope.provider &&
+        (!saved.target_auth_index || saved.target_auth_index === scope.target_auth_index) &&
+        (!saved.target_object_type || saved.target_object_type === option.dataset.kind);
+      if (!sameBinding && ['oauth', 'provider'].includes(option.dataset.kind)) scope.expected_target_object_type = option.dataset.kind;
     }
   }
   return scope;
@@ -2167,6 +2574,7 @@ function renderRuleCandidateCount(scope, kinds, sources) {
 }
 
 function updateRuleFields() {
+  if (state.editor?.saving) return;
   const scope = $('rule-form').elements.namedItem('rule-scope').value;
   const all = !!dynamicScopeLabel(scope);
   const keepScope = !$('rule-legacy-scope').hidden && !checked('rule-adopt-scope');
@@ -2205,13 +2613,14 @@ function updateRuleFields() {
 }
 
 function editRule(rule = {}) {
+  if (ruleCatalogNotice()) return;
   const config = rule.config || rule;
   const kinds = ruleObjectTypes(rule, state.targets);
   for (const input of $('rule-form').querySelectorAll('[name="rule-object"]')) input.checked = kinds.includes(input.value);
   ruleGroupGrants = new Set(rule.authorized_groups || []);
   $('rule-adopt-scope').checked = false;
   $('rule-legacy-scope').hidden = !(rule.legacy_scope || rule.legacy_provider_observation);
-  renderRuleTargetSelectors({...config,target_group:rule.target_group,target_auth_index:rule.target_auth_index});
+  renderRuleTargetSelectors(rule);
   loadRuleShortcuts();
   selectedRuleModels = rule.id ? [...(config.models || [])] : [ruleModelShortcuts[0]];
   $('rule-models').value = $('rule-shortcut-draft').value = '';
@@ -2262,16 +2671,16 @@ function editRule(rule = {}) {
   }
   $('rule-auto-restore').checked = rule.auto_restore === true;
   const timer = $('rule-timer');
-  timer.checked = !held && rule.timer_active === true;
+  timer.checked = ruleScheduleEnabled(rule) === true;
   timer.dataset.initial = String(timer.checked);
-  timer.disabled = held || (!!rule.id && typeof rule.timer_active !== 'boolean');
+  timer.disabled = held || (!!rule.id && typeof ruleScheduleEnabled(rule) !== 'boolean');
   updateRuleFields();
   $('rule-hold-note').classList.toggle('hidden', !held);
   setPage('operations');
   openEditor('rule-dialog');
 }
 
-async function saveRule() {
+async function saveRule(editor) {
   const config = runConfig('rule-');
   const body = {
     ...config,
@@ -2285,7 +2694,8 @@ async function saveRule() {
   };
   if (handlesCredential(body.action) || Object.values(body.upstream_error_actions).some(handlesCredential)) {
     if (!state.settings?.capabilities?.credential_management) throw Error('当前宿主未提供凭证处置，请刷新后重试。');
-    if (config.judge.mode !== 'deterministic') fieldError('rule-judge-mode', '暂停或移除凭证需使用标准答案判定。');
+    if (handlesCredential(body.action) && config.judge.mode !== 'deterministic') fieldError('rule-judge-mode', '答错后停用或移除凭证需使用标准答案判定；上游错误处理不受此限制。');
+    if (config.judge.mode === 'llm') fieldError('rule-judge-mode', '管理探测暂不支持独立模型判题，请使用人工评审或标准答案判定。');
     if (config.control_auth_id) fieldError('rule-control-target', '管理探测需清除对照凭证。');
   }
   const retentionMode = value('rule-retention-mode');
@@ -2301,8 +2711,26 @@ async function saveRule() {
     body.cron = cron.join(' ');
   }
   if (value('rule-id')) Object.assign(body, { id: value('rule-id'), revision: number('rule-revision') });
-  try { await api('/rules', body.id ? 'PUT' : 'POST', body); }
+  try {
+    const saved = await api('/rules', body.id ? 'PUT' : 'POST', body);
+    if (!saved || typeof saved.id !== 'string' || !saved.id || !Number.isSafeInteger(saved.revision) || saved.revision < 1 ||
+        body.id && (saved.id !== body.id || saved.revision <= body.revision)) {
+      const failure = new Error('保存回执缺少有效规则标识或版本，请核对规则列表。');
+      failure.outcomeUnknown = true;
+      throw failure;
+    }
+  }
   catch (error) {
+    if (!body.id && !isDiscarded(error) && (error.outcomeUnknown || !Number.isInteger(error.status) || error.status === 408 || error.status >= 500)) {
+      // A failed receipt does not prove creation failed. Retrying this POST
+      // could create a second scheduled rule, so preserve the draft for review.
+      editor.saveUncertain = true;
+      notice(uncertainRuleSaveMessage, true);
+      void loadOperations().catch(failure => {
+        if (!isDiscarded(failure) && state.editor === editor) notice('保存结果未确认，草稿已保留，已禁止重复保存。规则列表读取失败，请关闭草稿后刷新核对。', true);
+      });
+      return;
+    }
     if (error.code === 'invalid_cron' && !keepingLegacySchedule()) fieldError('rule-cron', '检测周期无效，请核对各段的取值、步长和日期。');
     throw error;
   }
@@ -2428,7 +2856,7 @@ async function dispatchClick(event) {
     await safely(async () => {
       renderRules();
       try {
-        const updated = await api('/rules/timer', 'PUT', { id: rule.id, revision: rule.revision, enabled: !rule.timer_active });
+        const updated = await api('/rules/timer', 'PUT', { id: rule.id, revision: rule.revision, enabled: !ruleScheduleEnabled(rule) });
         Object.assign(rule, updated);
       } catch (error) {
         if (isDiscarded(error)) throw error;
@@ -2469,7 +2897,7 @@ async function dispatchClick(event) {
   if (button.dataset.expandSample != null) {
     const output = button.closest('.sample').querySelector('.answer-text');
     const expanded = output.classList.toggle('expanded');
-    button.textContent = expanded ? '收起长回答' : '展开完整回答';
+    button.textContent = expanded ? '收起长回答' : button.dataset.partialOutput === 'true' ? '展开已接收内容' : '展开完整回答';
     button.setAttribute('aria-expanded', String(expanded));
     if (!expanded) button.scrollIntoView({ block: 'nearest' });
     return;
@@ -2493,21 +2921,22 @@ async function dispatchClick(event) {
     const prefix = preview ? 'preview' : 'evidence';
     const dialog = $(prefix + '-dialog'), context = $(prefix + '-context');
     const reading = !detail && sourceRun.source === 'manual_test';
+    const partial = preview && isPartialAnswer(sample);
     const ordinal = Number.isInteger(sample.index) && sample.index >= 0 ? `回答 ${sample.index + 1}` : '回答';
     dialog.classList.toggle('answer-reader-dialog', reading);
-    $(prefix + '-title').textContent = preview ? (reading ? '作品预览' : '隔离预览') : (reading ? '执行详情' : '样本条件与证据');
-    context.hidden = !reading;
-    context.textContent = reading ? [ordinal, sample.model || sample.request_model].filter(Boolean).join(' · ') : '';
+    $(prefix + '-title').textContent = preview ? (partial ? '部分作品预览' : reading ? '作品预览' : '隔离预览') : (reading ? '执行详情' : '样本条件与证据');
+    context.hidden = !reading && !partial;
+    context.textContent = [...(reading ? [ordinal, sample.model || sample.request_model] : []), partial ? '当前为已接收的部分内容，作品可能不完整。' : ''].filter(Boolean).join(' · ');
     if (preview) {
-      const documentHTML = safePreview(sample.output || '');
+      const documentHTML = safePreview(previewSource(sample.output || '')?.source || sample.output || '');
       dialog.showModal();
       $('safe-preview').srcdoc = documentHTML;
     } else {
       const evidenceID = sample.evidence?.auth_id;
       const pinned = evidenceID && evidenceID === sourceRun.config?.auth_id;
-      const supplier = pinned && frozenProviderLabel(sourceRun.config);
-      const label = supplier || (pinned ? sourceRun.credential_email || credentialName(evidenceID) : credentialName(evidenceID));
-      $('evidence-content').innerHTML = renderSampleEvidence(sample, sourceRun.source === 'manual_test', label, !!supplier);
+      const identity = pinned ? frozenRunIdentity(sourceRun) : { label: evidenceID, supplier: false };
+      const label = detail && pinned ? qualityIdentityLabel(identity) : identity.label;
+      $('evidence-content').innerHTML = renderSampleEvidence(sample, sourceRun.source === 'manual_test', label, identity.supplier);
       $('evidence-content').scrollTop = 0;
       dialog.showModal();
     }
@@ -2578,6 +3007,7 @@ async function dispatchClick(event) {
           state.scopeRule = rule.id;
           selectBatch('');
           await loadOperations().catch(() => {});
+          if (epoch !== client.epoch || state.page !== 'operations') return;
           notice('提交结果未确认。请先核对规则运行记录，不要重复执行。', true);
           return;
         }
@@ -2599,7 +3029,7 @@ async function dispatchClick(event) {
   if (button.dataset.ruleDelete) {
     const rule = state.rules.find((entry) => entry.id === button.dataset.ruleDelete);
     if (!rule) return;
-    actionDialog({ title: '删除检测规则', description: `将删除“${rule.name || rule.id}”及其运行记录和日志。保留 CPA 凭证。此操作无法撤销。`, confirm: '删除规则', danger: true, submit: async () => {
+    actionDialog({ title: '删除检测规则', description: `将删除“${rule.name || rule.id}”及可清理的运行记录和日志。CPA 凭证状态不变；仍有效的上游错误停用来源和未确认处置继续保留。此操作无法撤销。`, confirm: '删除规则', danger: true, submit: async () => {
       const epoch = client.epoch;
       const receipt = await cleanupRequest('/rules', { id: rule.id, revision: rule.revision });
       const selected = state.scopeRule === rule.id || (state.scopeBatch && (state.scopeBatch === rule.last_scope_batch || state.activityRows?.some(row => (row.rule_id || row.config?.rule_id) === rule.id)));
@@ -2625,12 +3055,15 @@ async function dispatchClick(event) {
     return;
   }
   if (button.dataset.handlingAck) {
-    const rule = state.rules.find(r => r.id === state.scopeRule);
-    const record = rule?.handling?.find(h => h.action_id === button.dataset.handlingAck);
+    const ruleID = button.dataset.handlingRule;
+    const handling = ruleID ? state.rules.find(r => r.id === ruleID)?.handling : state.orphanedHandling;
+    const record = handling?.find(h => h.action_id === button.dataset.handlingAck && h.auth_id === button.dataset.handlingAuth);
     if (!record) throw new Error('处置记录已变化，请刷新。');
-    actionDialog({title: '核对人工处理', description: '请先在 CPA 中手动启用或移除该凭证。确认后会重新核对状态、结束本次处置关联，并停止此规则。此操作不会修改 CPA 凭证。', confirm: '核对并停止规则', submit: async () => {
-      await api('/rules/handling/acknowledge', 'POST', {rule_id: rule.id, auth_id: record.auth_id, action_id: record.action_id});
-      await loadOperations(); notice('人工处理已核对，规则已停止。');
+    actionDialog({title: '核对未确认处置', description: '重新读取 CPA 当前状态，核对这次结果未确认的处置。只有确认已启用或已移除时才结束旧关联；不会修改 CPA 凭证或规则启停。普通已确认停用在 CPA 手动启用后会自动同步。', confirm: '核对当前状态', submit: async () => {
+      const scope = feedbackScope();
+      await api('/rules/handling/acknowledge', 'POST', {rule_id: ruleID || '', auth_id: record.auth_id, action_id: record.action_id});
+      await loadOperations();
+      if (scope === feedbackScope()) notice('处置结果已核对。');
     }});
     return;
   }
@@ -2647,34 +3080,46 @@ document.addEventListener('click', (event) => {
 document.addEventListener('keydown', (event) => {
   if (['Enter', ' '].includes(event.key) && event.target.matches('[data-run]:not(button)')) { event.preventDefault(); event.target.click(); }
 });
-$('connection-top').addEventListener('click', () => $('connection-dialog').showModal());
+$('connection-top').addEventListener('click', showConnectionDialog);
 $('connection-open').addEventListener('click', () => {
-  $('connection-dialog').showModal();
+  showConnectionDialog();
   $('management-key').focus();
 });
-$('connection-form').addEventListener('submit', (event) => {
+$('connection-dialog').addEventListener('close', () => {
+  $('management-key').value = '';
+  editorRevision = null;
+});
+$('connection-form').addEventListener('submit', event => {
   event.preventDefault();
-  safely(() => connectManagement(value('management-key')), 'connect', event.submitter);
+  const key = value('management-key');
+  const action = state.connected
+    ? () => changeBackend(pageAccess, 'PUT', editorRevision, 'configure', key)
+    : () => connectManagement(key);
+  safely(action, 'connect', event.submitter);
+});
+$('connection-clear').addEventListener('click', () => {
+  const revision = editorRevision, access = pageAccess;
+  if (!access || !Number.isSafeInteger(revision)) return;
+  actionDialog({ title: '清除后台管理配置？', description: '依赖管理接口的定时检测和处置将等待重新配置。浏览器访问和账号巡检继续按各自许可运行。', confirm: '清除后台配置', danger: true,
+    submit: () => changeBackend(access, 'DELETE', revision) });
 });
 $('disconnect').addEventListener('click', () => disconnect());
 $('refresh').addEventListener('click', () => safely(state.page === 'login' ? loginWorkbench.refresh : refresh, 'refresh', $('refresh')));
-for (const mode of document.querySelectorAll('[name="manual-target-kind"]')) mode.addEventListener('change', () => {
-  manualTargetDraft.kind = mode.value;
-  renderManualTargetSelectors(true);
-});
-$('manual-provider').addEventListener('change', event => {
-  manualTargetDraft.group = event.currentTarget.value;
-  renderManualTargetSelectors(true);
-});
 $('target').addEventListener('change', () => {
-  manualTargetDraft.targetIDs.set(manualTargetScope(), value('target'));
+  const option = $('target').selectedOptions[0], target = findTarget(option?.dataset.id);
+  Object.assign(manualTargetDraft, { id: target ? targetID(target) : '', provider: target?.provider || '', authIndex: target?.auth_index || '',
+    isProvider: !!target?.is_provider, label: option?.textContent || '' });
   renderTarget(true);
 });
 $('models').addEventListener('change', () => {
   manualTargetDraft.models.set(manualModelKey(), value('models'));
   renderTarget(true);
 });
-$('reasoning').addEventListener('change', () => { renderReasoning(true); renderAdmission(); });
+$('reasoning').addEventListener('change', event => {
+  manualReasoning = event.currentTarget.value;
+  clearFieldError($('reasoning'));
+  renderReasoning(true); renderAdmission();
+});
 $('samples').addEventListener('change', renderAdmission);
 $('question').addEventListener('change', renderQuestion);
 for (const input of $('rule-form').querySelectorAll('[name="rule-object"]')) input.addEventListener('change', () => {
@@ -2700,7 +3145,7 @@ $('rule-adopt-scope').addEventListener('change', () => {
     for (const input of $('rule-form').querySelectorAll('[name="rule-object"]')) input.checked = kinds.includes(input.value);
     $('rule-form').elements.namedItem('rule-scope').value = saved.target_scope || 'single';
     ruleGroupGrants = new Set(saved.authorized_groups || []);
-    renderRuleTargetSelectors({...saved.config || saved,target_group:saved.target_group,target_auth_index:saved.target_auth_index});
+    renderRuleTargetSelectors(saved);
   }
   updateRuleFields();
 });
@@ -2772,7 +3217,11 @@ $('rule-custom-shortcuts').addEventListener('click', event => {
 });
 $('run-form').addEventListener('submit', (event) => {
   event.preventDefault();
-  safely(() => submitRun(runConfig()), 'submit-run');
+  safely(() => {
+    const config = runConfig(), target = selectedManualTarget();
+    const binding = target?.is_provider ? { ...config, provider_name: target.provider_name || target.provider, subject_auth_index: target.auth_index } : config;
+    return submitRun(config, binding);
+  }, 'submit-run');
 });
 $('run-cancel').addEventListener('click', () =>
   safely(async () => {
@@ -2789,7 +3238,8 @@ $('run-cancel').addEventListener('click', () =>
 $('run-rerun').addEventListener('click', () =>
   safely(
     async () => {
-      await submitRun(copyRunConfig(state.run.config));
+      const binding = state.run.config;
+      await submitRun(copyRunConfig(binding), binding);
     },
     'submit-run',
   ),
@@ -2904,23 +3354,38 @@ $('rule-search').addEventListener('input', renderRules);
 $('ops-rule-context').addEventListener('toggle', event => {
   if (event.target.matches('details[data-skip-rule], details[data-rule-handling]')) renderRuleContext();
 }, true);
+$('ops-orphaned-handling').addEventListener('toggle', event => {
+  if (event.target.matches('details[data-orphaned-handling]')) renderRuleContext();
+}, true);
 $('rule-filter').addEventListener('change', renderRules);
 window.addEventListener('beforeunload', (event) => {
   if (editorDirty()) { event.preventDefault(); event.returnValue = ''; }
 });
-window.addEventListener('pagehide', () => {
-  client.clear();
-  loginWorkbench.reset();
+window.addEventListener('storage', event => {
+  if (event.key === managementKeyStorage || event.key === null) syncStoredAccess();
+  if (event.key === connectionRevisionStorage && pageAccess && pageDisplayed()) {
+    void readConnection(pageAccess);
+  }
+});
+window.addEventListener('pagehide', event => {
+  pageSuspended = true;
+  clearTimeout(connectionTimer);
   clearTimeout(state.poll);
   clearTimeout(operationsPoll);
   clearTimeout(qualityDetail?.timer);
-  stopThemeFollowing();
+  loginWorkbench.syncVisibility?.();
+  if (!event.persisted) {
+    pageAccess = null;
+    client.clear();
+    candidateClient?.clear();
+    stopThemeFollowing();
+  }
 });
-window.addEventListener('pageshow', (event) => {
+window.addEventListener('pageshow', event => {
   if (!event.persisted) return;
-  disconnect('', false, { forgetKey: false });
-  initializeTheme();
-  restoreManagementConnection();
+  pageSuspended = false;
+  syncStoredAccess();
+  syncOperationsVisibility();
 });
 document.body.classList.toggle('embedded', window.self !== window.top);
 if (window.self !== window.top) {
@@ -2941,7 +3406,7 @@ document.querySelector('.skip-link').addEventListener('click', event => {
   $('main').focus();
   $('main').scrollIntoView({ block: 'start' });
 });
-setPage(location.hash.slice(1));
+setPage(initialWorkspace());
 setManualView('setup');
 setReadingExpanded(false);
 initializeTheme();

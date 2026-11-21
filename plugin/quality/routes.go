@@ -8,6 +8,7 @@ type ManagementRoute struct {
 
 func ManagementRoutes() []ManagementRoute {
 	return []ManagementRoute{
+		{"GET", "/connection"}, {"PUT", "/connection"}, {"DELETE", "/connection"},
 		{"GET", "/presets"}, {"POST", "/presets"}, {"DELETE", "/presets"},
 		{"GET", "/targets"}, {"GET", "/questions"},
 		{"GET", "/runs"}, {"GET", "/runs/detail"}, {"POST", "/runs"}, {"DELETE", "/runs"}, {"POST", "/runs/cancel"}, {"POST", "/runs/review"},

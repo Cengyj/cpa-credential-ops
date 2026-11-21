@@ -26,6 +26,7 @@ render();
 </script></body>`;
 const target = {auth_id: 'fixture-credential', provider: 'openai', models: ['fixture-model'], effective_available: true};
 const responses = {
+  connection: { state: 'ready', revision: 1, configured: true, can_migrate: false },
   targets: { items: [target], total: 1 }, questions: { items: [] },
   rules: { items: [] }, actions: { items: [] }, runs: { items: [], total: 0 },
   settings: {}, metrics: {},
@@ -73,7 +74,7 @@ const responses = {
     assert.equal(session.length, 0);
 
     const capabilitiesRead = () => page.waitForResponse(origin + management + 'login/capabilities');
-    await frame.getByRole('button', { name: '连接管理接口', exact: true }).click();
+    await frame.getByRole('button', { name: '未连接', exact: true }).click();
     await frame.locator('#management-key').fill('fixture-key');
     await Promise.all([capabilitiesRead(), frame.locator('#connection-form button[type="submit"]').click()]);
     await frame.locator('body.connected').waitFor();

@@ -74,6 +74,8 @@ class RouteFixture:
                '--mount', f'type=bind,source={self.root},target=/probe', curl_image,
                'python3', '-u', '/probe/smoke_provider_route.py', '--serve')
         try:
+            from smoke_ui_package import check_backend_connection
+            check_backend_connection(phase, get, fetch, prefix)
             def request(path, body):
                 status, raw = get(prefix + path, True, body, method='POST')
                 assert status in (200, 202), (path, status, raw[:300])

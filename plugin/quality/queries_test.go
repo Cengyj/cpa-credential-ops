@@ -103,6 +103,97 @@ func TestScheduledSummaryKeepsOriginalErrorSource(t *testing.T) {
 	}
 }
 
+func TestSummaryMatchesRecordedProbePathsWithoutFullEvidence(t *testing.T) {
+	paths := []string{"provider_config_probe", "provider_native_probe", "cpa_management_probe", "", "unrecognized-private-route"}
+	run := &Run{Source: "scheduled_probe", CancelRequested: true}
+	for _, path := range paths {
+		run.Samples = append(run.Samples, Sample{Evidence: Evidence{Path: path, Reason: "detail-only-marker", AuthID: "detail-only-marker"}})
+	}
+	raw, err := json.Marshal(runListSummary(run))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pageRow Run
+	if err = json.Unmarshal(raw, &pageRow); err != nil {
+		t.Fatal(err)
+	}
+	if len(pageRow.Samples) != len(paths) {
+		t.Fatal("summary lost a sample")
+	}
+	for i, expected := range []string{"provider_config_probe", "provider_native_probe", "cpa_management_probe", "", ""} {
+		if got := pageRow.Samples[i].Evidence.Path; got != expected {
+			t.Fatalf("summary sample %d probe path = %q, want %q", i, got, expected)
+		}
+	}
+	if !pageRow.CancelRequested || strings.Contains(string(raw), "private-route") || strings.Contains(string(raw), "detail-only-marker") {
+		t.Fatal("summary dropped a pending cancellation or exposed detail-only evidence")
+	}
+}
+
+func TestRunSummaryKeepsFrozenObjectIdentity(t *testing.T) {
+	en, _ := lifeFixture(t)
+	const providerEmail = "供应商 · Frozen provider · route-a"
+	for _, tc := range []struct {
+		id, authID, index, name, email, status string
+		provider                               bool
+	}{
+		{"provider-completed", "provider-a", "route-a", "Frozen provider", "", "completed", true},
+		{"provider-skipped", "provider-a", "route-a", "Frozen provider", providerEmail, "skipped", true},
+		{"provider-legacy", "provider-a", "route-a", "", providerEmail, "skipped", true},
+		{"provider-unnamed", "provider-a", "route-a", "", "", "skipped", true},
+		{"other-route", "provider-b", "route-b", "Frozen provider", "", "completed", true},
+		{"oauth-completed", "account.json", "account-index", "", "frozen@example.test", "completed", false},
+		{"oauth-skipped", "account.json", "account-index", "", "frozen@example.test", "skipped", false},
+	} {
+		t.Run(tc.id, func(t *testing.T) {
+			config := lifeConfig()
+			config.AuthID = tc.authID
+			config.Parameters.ReasoningEffort = "high"
+			run := &Run{ID: tc.id, Source: "scheduled_probe", Status: tc.status, ActionStatus: "observe_only", CredentialEmail: tc.email,
+				Config: Frozen{RunConfig: config, SubjectIndex: tc.index, ProviderName: tc.name, ProviderObservation: tc.provider}}
+			if tc.status == "skipped" {
+				run.SkipDetail = &ScopeSkipDetail{NotExecuted: true, RunID: tc.id, AuthID: tc.authID, Email: tc.email,
+					Code: "identity_unverified", Reason: "Synthetic scope identity was not verified for this round."}
+			} else {
+				run.Samples = []Sample{{Model: config.Models[0], ExecutionStatus: "completed", QualityVerdict: "correct", Output: "4"}}
+			}
+			en.runs = map[string]*Run{run.ID: run}
+			original, err := json.Marshal(run)
+			if err != nil {
+				t.Fatal(err)
+			}
+			response := en.Handle(context.Background(), pluginapi.ManagementRequest{Method: "GET", Path: "/v0/management/plugins/model-quality/runs",
+				Query: url.Values{"view": {"summary"}, "source": {"scheduled_probe"}}})
+			var page struct{ Items []Run }
+			if response.StatusCode != 200 || json.Unmarshal(response.Body, &page) != nil || len(page.Items) != 1 {
+				t.Fatal("summary response unavailable", response.StatusCode, string(response.Body))
+			}
+			row := page.Items[0]
+			if row.Config.AuthID != tc.authID || row.Config.SubjectIndex != tc.index || row.Config.ProviderName != tc.name ||
+				row.Config.ProviderObservation != tc.provider || row.CredentialEmail != tc.email {
+				t.Fatalf("summary changed frozen identity: got auth=%q index=%q name=%q provider=%t email=%q", row.Config.AuthID,
+					row.Config.SubjectIndex, row.Config.ProviderName, row.Config.ProviderObservation, row.CredentialEmail)
+			}
+			if row.Status != tc.status || row.ActionStatus != run.ActionStatus || row.Config.Parameters.ReasoningEffort != "high" ||
+				len(row.Samples) != len(run.Samples) || (row.SkipDetail != nil) != (run.SkipDetail != nil) {
+				t.Fatal("identity projection changed this round's outcome", row)
+			}
+			detail, err := en.Run(run.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			detailJSON, err := json.Marshal(detail)
+			if err != nil || string(detailJSON) != string(original) {
+				t.Fatal("summary changed the complete historical record", err)
+			}
+			stored, err := json.Marshal(en.runs[run.ID])
+			if err != nil || string(stored) != string(original) {
+				t.Fatal("summary mutated stored evidence", err)
+			}
+		})
+	}
+}
+
 func TestManualAnswerPreviewUsesFirstRetainedText(t *testing.T) {
 	limit := strings.Repeat("答🙂", 48)
 	for _, tc := range []struct {
@@ -116,6 +207,10 @@ func TestManualAnswerPreviewUsesFirstRetainedText(t *testing.T) {
 		{"utf8 scan boundary", "答" + strings.Repeat(" ", 4092) + "🙂", "text", "答", true},
 		{"html", "<!DOCTYPE html>\n<html><body>Synthetic markup</body></html>", "html", "", false},
 		{"fenced svg", "```svg\n<?xml version=\"1.0\"?>\n<!-- icon -->\n<SVG/>\n```", "svg", "", false},
+		{"artwork after introduction", "这是生成的页面：\n\n<!doctype html><html></html>\n完毕。", "html", "", false},
+		{"fenced fragment after introduction", "预览：\n~~~HTML\n<main>drawing</main>\n~~~\n说明", "html", "", false},
+		{"other language fence", "```js\n<svg/>\n```", "text", "```js <svg/> ```", false},
+		{"artwork after unrelated fence", "```js\n<svg/>\n```\n<svg/>", "svg", "", false},
 		{"visual mention in text", "An <svg> element", "text", "An <svg> element", false},
 		{"empty", "\t \u3000\r\n", "", "", false},
 	} {

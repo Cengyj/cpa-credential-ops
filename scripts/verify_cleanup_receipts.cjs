@@ -233,7 +233,7 @@ async function main() {
       await screenshot('cleared');
       await page.click('[data-rule-select=rule-a]');
       await page.locator('#ops-rule-context [data-rule-handling] summary').first().click();
-      await page.locator('#ops-rule-context [data-key="handling:confirmed-401-6"]').waitFor();
+      await page.locator('#ops-rule-context .quality-handling-records > div').filter({ hasText: 'fixture-handled-6@example.test' }).waitFor();
       assert.equal(await page.locator('#ops-rule-context .quality-handling-records > div').count(), 6);
       assert.equal(await page.locator('#ops-rule-context [data-rule-batch], #ops-rule-context [data-run]').count(), 0);
       await page.locator('#ops-record-count').filter({ hasText: '共 0 条' }).waitFor();

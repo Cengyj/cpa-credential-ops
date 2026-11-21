@@ -104,7 +104,12 @@ async function main() {
       assert.match(await record.innerText(), /CPA 注册目录缺少 missing-pro/); assert.doesNotMatch(await record.innerText(), /400\/404/);
       const action = record.locator('[data-handling-ack]');
       assert.equal(await action.isVisible(), state === 'attention');
-      if (state !== 'attention') { assert.match(await record.innerText(), state === 'disabled' ? /已按错误规则暂停，退出后续检测/ : /无需人工标记/); await record.locator('summary').click(); assert(await action.isVisible()); await record.locator('summary').click(); }
+      if (state !== 'attention') {
+        assert.equal(await action.count(), 0, 'Confirmed handling reconciles from current CPA state without an acknowledgement step');
+        assert.match(await record.innerText(), state === 'disabled'
+          ? /已按错误规则停用，退出答题和恢复复检.*正常状态读取会自动结束旧关联/
+          : /已移除凭证.*不会自动重建凭证/);
+      }
     }
     await page.click('#ops-all-rules');
     await page.click('[data-rule-edit=rule]'); assert.match(await el('#rule-upstream-note').innerText(), /CPA 目录.*400\/404/);
@@ -153,7 +158,8 @@ async function main() {
     await shot('catalog-recheck'); await page.keyboard.press('Escape');
     for (const row of rows.slice(4, 6)) {
       await page.click('#operations-history [data-run="' + row.id + '"]');
-      await content.getByText('当前凭证状态检查', { exact: true }).waitFor();
+      await content.locator('.quality-detail-facts').getByText('当前凭证状态检查', { exact: true }).waitFor();
+      await content.locator('.quality-detail-byline').getByText('当前凭证状态检查', { exact: true }).waitFor();
       await content.getByText(row.preflight_detail.reason, { exact: true }).waitFor();
       assert.doesNotMatch(await content.innerText(), /模型不支持|400\/404|已暂停凭证|跳过原因/);
       assert.equal(await content.locator('.sample').count(), 0);
@@ -178,7 +184,7 @@ async function main() {
       await page.click('[data-rule-run="' + id + '"]');
       await el('#ops-dispatch-receipt').filter({ hasText: message }).waitFor();
     }
-    await page.click('[data-rule-run="single-runtime"]'); await content.getByText('当前凭证状态检查', { exact: true }).waitFor();
+    await page.click('[data-rule-run="single-runtime"]'); await content.locator('.quality-detail-facts').getByText('当前凭证状态检查', { exact: true }).waitFor();
     assert.deepEqual(writes.map(write => write.id), ['rule', 'manual-disabled', 'retained', catalog.auth_id, 'single-runtime']); await page.keyboard.press('Escape');
     assert.deepEqual(errors, []);
     if (out) await fs.writeFile(path.join(out, 'skipped-history-ui.json'), JSON.stringify({ writes, reads, exported, captures, modelCalls: 0, credentialWrites: 0 }, null, 2) + '\n');

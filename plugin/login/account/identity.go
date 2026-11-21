@@ -89,6 +89,7 @@ func LoginPrincipalFromAuth(a *Auth) (LoginPrincipal, error) {
 // The official save callback cannot enforce this as an atomic compare-and-swap.
 type LoginSnapshot struct {
 	AuthID            string `json:"auth_id"`
+	AuthIndex         string `json:"auth_index,omitempty"`
 	IdentityVersion   string `json:"identity_version"`
 	Name              string `json:"name"`
 	PolicyFingerprint string `json:"policy_fingerprint"`
@@ -110,8 +111,10 @@ type LoginCommitRequest struct {
 type LoginCommitResult struct {
 	CommitID          string `json:"commit_id"`
 	AuthID            string `json:"auth_id"`
+	AuthIndex         string `json:"auth_index,omitempty"`
 	IdentityVersion   string `json:"identity_version"`
 	Principal         string `json:"principal"`
+	Name              string `json:"name,omitempty"`
 	State             string `json:"state"`
 	CredentialEnabled bool   `json:"credential_enabled"`
 }

@@ -4,8 +4,6 @@ package main
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"errors"
 	"path/filepath"
 	"strings"
@@ -46,16 +44,13 @@ func newApplication(cfg quality.Config, native *quality.NativeHost) (runtimeEngi
 	}
 	service, err := login.New(login.Options{
 		Dir: filepath.Join(directory, "accounts"), Call: callback, RuntimeManifest: manifest,
-		Prepare: func(ctx context.Context, authID, identity string) error {
+		FinishWrite: engine.FinishCredentialLogin, PendingWrites: engine.PendingCredentialLogins,
+		Prepare: func(ctx context.Context, authID, identity, commitID string) error {
 			if authID == "" {
 				return nil
 			}
-			var random [16]byte
-			if _, err := rand.Read(random[:]); err != nil {
-				return err
-			}
 			_, err := engine.PrepareCredentialLogin(ctx, quality.CredentialLoginPrepareRequest{
-				AuthID: authID, ExpectedIdentity: identity, PreparationID: hex.EncodeToString(random[:]),
+				AuthID: authID, ExpectedIdentity: identity, PreparationID: commitID,
 			})
 			return err
 		},
@@ -66,12 +61,16 @@ func newApplication(cfg quality.Config, native *quality.NativeHost) (runtimeEngi
 	return &application{quality: engine, login: service}, nil
 }
 
+func (a *application) ReconfigureQuality(input quality.Config) error {
+	return a.quality.ReconfigureQuality(input)
+}
+
 func (a *application) Close() error {
 	return errors.Join(a.login.Close(), a.quality.Close())
 }
 
 func (a *application) Handle(ctx context.Context, request pluginapi.ManagementRequest) pluginapi.ManagementResponse {
-	if strings.HasPrefix(request.Path, "/v0/management/plugins/model-quality/login/") {
+	if strings.HasPrefix(request.Path, login.RoutePrefix+"/") {
 		return a.login.Handle(ctx, request)
 	}
 	return a.quality.Handle(ctx, request)

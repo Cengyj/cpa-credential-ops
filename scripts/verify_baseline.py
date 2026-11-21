@@ -3,8 +3,8 @@
 from pathlib import Path
 import argparse, hashlib, json
 root=Path(__file__).resolve().parents[1]
-p=argparse.ArgumentParser();p.add_argument('--reference',action='store_true');p.add_argument('--source',type=Path);a=p.parse_args()
-m=json.loads((root/'host-patches/baseline.json').read_text())
+p=argparse.ArgumentParser();p.add_argument('--reference',action='store_true');p.add_argument('--source',type=Path);p.add_argument('--manifest',type=Path,default=root/'host-patches/official-8.0.76-baseline.json');a=p.parse_args()
+m=json.loads(a.manifest.read_text())
 source=Path(m['source']) if a.reference else a.source
 if source is None:p.error('choose --reference or --source <unmodified-source>')
 fail=[]

@@ -212,14 +212,16 @@ async function finish(id) {
   assert.match(visual.samples[0].output, /<!doctype html>/i);
   await page.waitForFunction(() => document.querySelector('[data-preview-sample]'));
   assert.equal(await page.locator('.sample pre').textContent(), visual.samples[0].output);
+  await page.frameLocator('[data-inline-preview]').locator('svg').waitFor();
+  assert.equal(await page.locator('[data-inline-preview]').getAttribute('sandbox'), '');
   await page.locator('[data-preview-sample]').click();
   await page.frameLocator('#safe-preview').locator('svg').waitFor();
   assert.equal(await page.locator('#safe-preview').getAttribute('sandbox'), '');
-  assert.equal(await page.locator('#safe-preview').getAttribute('inert'), '');
+  assert.equal(await page.locator('#safe-preview').getAttribute('inert'), null);
   await page.screenshot({ path: path.join(out, 'native-html-preview.png'), animations: 'disabled' });
   await page.keyboard.press('Escape');
   await page.locator('#preview-dialog').waitFor({state: 'hidden'});
-  checks.push('native HTML output remains exact escaped source and opens only in an inert empty-sandbox preview');
+  checks.push('native HTML appears in an empty-sandbox inline preview, retains exact source and enlarges in a scrollable empty-sandbox preview');
   await setup();
   await page.locator('#question').selectOption('logic-candy');
   await page.locator('#models').selectOption('mq-reasoner');

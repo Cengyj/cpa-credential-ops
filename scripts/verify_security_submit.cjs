@@ -53,11 +53,13 @@ async function run() {
     };
     for (const [logout, reauthorize] of [[false, true], [true, true], [true, false], [false, false]]) {
       await open();
-      assert(!await get('logout').isChecked() && await get('reauthorize').isChecked());
+      const previous = cases.at(-1) || { logout: false, reauthorize: false };
+      assert.equal(await get('logout').isChecked(), previous.logout);
+      assert.equal(await get('reauthorize').isChecked(), previous.reauthorize);
       await get('logout').setChecked(logout); await get('reauthorize').setChecked(reauthorize);
       assert.equal(writes.length, cases.length, 'Opening and editing must not submit');
       const { route, request } = await receive();
-      assert.deepEqual(request.postDataJSON(), { id: 'fixture-enabled', revision: 1, action: 'reset_totp', logout_all_devices: logout, reauthorize });
+      assert.deepEqual(request.postDataJSON(), { id: 'fixture-enabled', revision: 1, action: 'reset_totp', logout_all_devices: logout, reauthorize, upload_to_cpa: false });
       assert(request.headers()['idempotency-key']);
       for (const name of ['submit', 'cancel', 'close', 'logout', 'reauthorize']) assert(await get(name).isDisabled());
       assert.equal(await get('submit').innerText(), '正在提交…');
@@ -72,7 +74,7 @@ async function run() {
     await row.locator('[data-account-action="more"]').click(); await page.locator('#account-logout-all').click();
     await get('reauthorize').uncheck();
     const logout = await receive();
-    assert.deepEqual(logout.request.postDataJSON(), { id: 'fixture-enabled', revision: 1, action: 'logout_all', logout_all_devices: false, reauthorize: false });
+    assert.deepEqual(logout.request.postDataJSON(), { id: 'fixture-enabled', revision: 1, action: 'logout_all', logout_all_devices: false, reauthorize: false, upload_to_cpa: false });
     await logout.route.fulfill({ status: 409, json: { code: 'conflict' } });
     await get('error').waitFor(); await dialog.locator('#account-security-cancel:enabled').waitFor(); await get('cancel').click();
     cases.push({ action: 'logout_all', logout: false, reauthorize: false });

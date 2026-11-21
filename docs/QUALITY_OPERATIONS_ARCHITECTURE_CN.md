@@ -1,14 +1,14 @@
 # 质量运维架构、实现现状与修复边界
 
-核对日期：2026-11-21。工作区源码版本：插件 `0.29.37`，嵌入 UI `13.6.60`。Git 基点为 `dd50c3d625f17639e92a7cd6c01ead6ecffe47ce`，本次分析包含工作区已有的未提交修改和新增文件，不能只用该提交复现本次源码状态。
+2026-11-21 的后台恢复更新对应插件 `0.31.0`、UI `13.8.0` 和内嵌 Go/Sobek `2.2.1`。第 5、7 节记录当前的调度和管理授权实现。文中 0.30.11 的历史对照以当时本机部署的 0.30.10 构建源为基线。
 
-本文记录源码审查结果和建议的修复架构。产品规则、用户决策及场景验收见 [质量运维逻辑说明](QUALITY_OPERATIONS_LOGIC_CN.md)。标为“目标”或“建议”的内容尚不能视为已实现、已测试或已部署。
+本文记录当前源码实现、回归定位与公开接口限制。产品规则、用户决策及场景验收见 [质量运维逻辑说明](QUALITY_OPERATIONS_LOGIC_CN.md)。近期构建、集成和本地部署结果见 [版本记录](CHANGELOG_CN.md)。此前交付见 [0.30.2 三轮审查](COMMERCIAL_AUDIT_0_30_2_CN.md)、 [0.30.1 审查](COMMERCIAL_AUDIT_0_30_1_CN.md) 和 [0.30.0 记录](QUALITY_OPERATIONS_0_30_0_CN.md)。
 
 ## 1. 系统边界
 
 CPA 负责凭证、提供商配置、模型目录、业务路由与实际启停。插件负责规则、检测任务、答题结果、凭证错误分类、普通处置记录和授权范围内的管理接口调用。
 
-质量运维没有接管 CPA 的业务路由。通过管理接口停用对象后，正常业务调用是否被路由到它，由 CPA 当前配置和运行时决定。插件不应以历史普通停用记录额外维持一层永久业务禁用。
+质量运维没有接管 CPA 的业务路由。通过管理接口停用对象后，正常业务调用是否被路由到它，由 CPA 当前配置和运行时决定。插件不应以历史普通停用记录额外维持一层永久业务禁用。上游错误停用期间，所有规则的答题与自动恢复均退出；用户在 CPA 启用后，下一轮按当前范围重新选择。
 
 官方宿主公开回调不提供历史独立质量暂停及其归属释放能力。普通 `disable_credential` 与历史 `pause_credential` 是不同机制。保留历史归属与保护，不用普通停用模拟独立暂停，不修改官方 CPA 源码。
 
@@ -53,7 +53,7 @@ flowchart TD
 | `provider_probe.go` | 使用当前配置构造定向请求、协议解析、机密过滤 | `executeProvider`、`probeRequest` |
 | `credential_policy.go` | 普通处置归属、答错及错误动作、恢复、人工核对 | `CredentialDisposition`、`decideManagedLocked`、`admitSnapshotLocked` |
 | `provider_disposition.go`、`provider_mutation.go` | 整组完整性、组归属、配置条件写入与确认 | `providerRoundVerdict`、`providerWriteSnapshots`、`setProviderDisabled` |
-| `upstream_error.go`、`catalog_action.go`、`error_policy_disabled.go` | 上游错误分类、目录缺项动作、旧错误停用阻断 | `managedUpstreamCondition`、`errorPolicyDisabled` |
+| `upstream_error.go`、`catalog_action.go`、`error_policy_disabled.go` | 上游错误分类、目录缺项动作、当前状态同步与有效错误来源排除 | `managedUpstreamCondition`、`reconcileCurrentTargetsLocked`、`observeMissingEntriesLocked`、`errorPolicyDisabled` |
 | `transitions.go`、`snapshots.go` | 执行复查、取消、原子提交本地状态、快照 | `checkExecution`、`commitLocked` |
 | `store.go`、`budget.go` | bbolt、迁移、调用和 token 预算 | `Store`、`reserve`、`account` |
 | `queries.go`、`metrics.go`、`result_limit.go`、`removed_credentials.go` | 历史投影、统计、保留和清理、已移除凭证核对 | `queryRules`、`metrics`、`clearRuleHistory`、`checkFinishedRounds` |
@@ -75,23 +75,27 @@ flowchart TD
 | `/rules`、`/rules/run`、`/rules/pause` | 规则配置、立即执行、规则启停 |
 | `/rules/timer`、`/rules/scheduling` | 单规则定时与兼容的全局调度控制 |
 | `/rules/question-preview`、`/rules/scope-preview` | 题面和范围预览，不发起模型请求 |
-| `/rules/handling/acknowledge` | 当前实现的人工处置核对，现状会停止规则 |
+| `/rules/handling/acknowledge` | 未确认处置的人工核对；不写 CPA，也不改规则启停。普通已确认停用通过正常状态读取自动同步 |
 | `/runs/history`、`/rules/run-history`、`/history`、`/metrics` | 手动与规则历史清理、审计和统计 |
 | `/actions/preview`、`/actions/release` | 历史独立暂停接口，受宿主能力限制 |
 
 完整方法与路径以 `ManagementRoutes` 为准；上表没有增加新接口。
+
+`GET /rules` 附带独立于规则分页的 `orphaned_handling` 安全摘要，展示已删除规则留下的 `attention`。原核对入口仅在 `rule_id` 为空、原规则确已不存在且 `auth_id/action_id` 精确匹配时允许孤立记录核对；复用当前启用/删除与整组完整性检查，不返回凭证快照、不新增 CPA 写入。
 
 ### 3.2 三条模型请求路径
 
 | 路径 | 主要使用场景 | 证据及限制 |
 | --- | --- | --- |
 | 原生 `host.model.execute` / `execute_stream` | 手动智商测试、通常的纯观察规则、未授权整组写入的供应商观察 | 由 CPA 处理原生路由与协议转换；官方回调没有历史独立暂停要求的可信最终 payload 证明 |
-| `/v8/management/requests/api-call` | 受支持的 OpenAI / Codex 文件凭证管理探测及停用中复检 | 精确绑定 `auth_index`，使用 `$TOKEN$` 替换；证据路径 `cpa_management_probe` |
+| `/v8/management/requests/api-call` | 受支持的 OpenAI / Codex 文件凭证管理探测及停用中复检 | 精确绑定 `auth_index`，认证头使用 `$TOKEN$` 占位符。题面与模型名包含相同字面文本时，发送给上游后仍保持原文。证据路径为 `cpa_management_probe` |
 | 提供商配置定向 HTTP 请求 | 授权处置、停用配置组检测和恢复 | 核实配置与映射，密钥只用于后端请求；证据路径 `provider_config_probe` |
 
 原生调用成功不保证相同参数的定向探测可执行。当前部分 Claude、Gemini、Interactions、Vertex 提供商的显式思考强度需要 CPA 原生转换，定向探测会报告不支持。配置缺少可核实的 URL、模型映射、身份或安全请求头时，也可能无法探测。
 
-提供商原生与定向输出均需避免泄露读取到的敏感配置。配置探测会检查返回模型与上游映射的一致性。管理探测证据不会被伪装为 CPA 业务最终 payload 的可信证明。
+提供商原生与定向输出均需避免泄露读取到的敏感配置。配置探测会检查返回模型与上游映射的一致性。文件凭证探测先用 `managementProbeResponse` 校验 CPA 的管理回执，再将上游状态与响应交给 `managedUpstreamCondition` 分类。错误正文与响应头仅在本轮内存中参与分类。管理探测证据不会被伪装为 CPA 业务最终 payload 的可信证明。
+
+0.30.3 的 `provider_reasoning.go` 为手动页面投影经过核实的路由思考配置，`management_client.go` 补充精确静态模型目录能力。显式配置优先，保留预算及特殊档位；模型键缺失、明确 null、空对象分别表示未知、无思考支持、没有声明档位或预算限制。自定义兼容通道聚合了多个路由的公开别名，不能用它推断单路由能力。此元数据仅服务展示与请求选择，参数转换及最终 payload 仍由 CPA 执行，原有定向探测协议限制不变。
 
 ### 3.3 普通启停接口
 
@@ -121,20 +125,32 @@ flowchart TD
 
 `commitLocked` 先在一个 bbolt 事务中提交相关本地状态，再更新引擎内存。CPA 写入与插件数据库不在同一事务中。
 
+`CredentialDisposition` 增加独立的 `AnswerOwnerRuleID` 与 `ErrorSource`，分别记录原答错恢复归属及新的上游错误来源。历史 `Snapshot` 留作追溯；每轮 `Frozen.ManagedProbe` 保存当前执行与写前条件。未知写入继续使用原意图和状态隔离。仍沿用现有数据库与事务结构，不引入新的存储系统。
+
 ## 5. 调度、执行与持久化顺序
 
 1. 新建或修改规则校验类型、范围、计划、策略和权限，更新 revision。预览不调用模型。
 2. 后端每秒检查定时计划。五段 Cron 使用服务端时区；旧间隔及时区配置保留兼容处理。
 3. 定时需要规则自身可运行、`SchedulingEnabled` 有效，以及旧全局开关或该规则单独定时授权。显式关闭全局调度会撤销单独授权。
-4. 到期时先推进下一次时间，再派发本轮。重叠和错过的周期不作为积压任务逐一补跑。
-5. 动态读取目录，按范围展开。同一次到期扫描可共享目录读取；新对象在下一次匹配轮次加入，不追加到已冻结批次。
-6. 保存批次、各对象任务与冻结计划，放入有界队列。批次使用一个轮转队列入口，展开中的待执行对象另有上限。
+4. 后台读取持久化的 `NextRun`。停机错过一个或多个周期时，用当前版本和当前目录合并补一轮，并按原 Cron 计算下一次时间。依赖的管理授权或目录未就绪时保留到期时间，读取 `timer_wait_reason` 可查看等待原因。已有合法排队或运行中的同规则轮次覆盖本次到期。
+5. 动态读取目录，在范围与恢复判断前同步当前 CPA 启用状态。确认外部启用时结束旧普通阻断、取消旧任务、重置相关旧计数；按本次对象类型和范围展开。同一次到期扫描可共享目录读取；新对象在下一次匹配轮次加入，不追加到已冻结批次。
+6. 在一个 bbolt 事务中保存下一次定时时间、批次与各对象的新冻结计划，再进入有界队列。中断前已经受理的任务按原回执中断。新进程依据已提交的时间及回执识别已处理周期。补检受理时追加 `rule_timer_catchup` 审计。
 7. worker 一次性预留主体、判题和对照的全部凭证依赖。冲突任务继续排队，不占用 worker 等待凭证锁。
 8. 执行前及每份样本前复查规则版本、取消、身份和限制。先持久记录预算预留，再发送请求。
 9. 解析完整性、质量判定与上游错误。完整轮次结束，或符合错误处置条件提前结束时，进入规则决策。
 10. 写入前再次检查当前规则、快照、证据与整组授权。先持久保存操作意图，再调用 CPA，最后保存确认结果或待核对状态。
 
+同一动态观察规则同时涵盖两种调用路径时，目录中可独立核实的启用 OAuth 文件可先走公开 SDK。该批次与待补时间、已受理的对象 ID 一同提交。后台连接就绪后重读目录，补检当前符合条件且未受理的对象。等待期间 OAuth 文件继续按原计划运行，多个周期合并保留最近一次应补的范围。恢复和正常到期相遇时派发一次完整的新批次。管理处置规则、原生提供商路由及需要定向探测的文件凭证必须先核实各自所需的目录和管理能力。SDK 目录暂时不可读会触发有上限、带抖动的退避，已受理的模型调用不进入该重试流程。
+
+质量配置的宿主输入仅包含 `quality.Config`。旧版本只有 `config_input` 摘要，升级首次读取已有面板设置并记录 `quality_host_input`。此后逐字段合并真正发生变化的宿主质量设置。`explicit_rule_timers` 单独保存，后台密钥及连接配置独立存储。更换连接和修改保留天数等无关参数均保留原有逐规则许可及其他面板设置。
+
 已建立的原生流可关闭。官方非流式回调及流建立之前的调用不提供同等的立即取消保证。取消后晚到的结果不得成为新的处置依据。
+
+撤销定时许可与取消旧排队、运行任务在同一事务提交；提交成功后取消活动上下文并推进内存调度代次。目录扫描和已捕获到期周期在落队列前复查该代次，关闭再开启不会复活旧任务。手动测试与“立即执行”不使用这项定时许可。手动提交在最终快照读取后、持久入队前再次检查请求取消。
+
+单规则的 `scheduling_enabled` 是保存的配置，`timer_active` 是同时满足规则状态与实例/单规则授权后计算出的实际状态。停止接口按保存的许可判断是否需要更新，不能仅凭当前不活跃就返回成功；前端开关修改保存的许可，状态标签和下次执行反映实际状态。
+
+写前本地条件失败使用明确的 `errCredentialPrecondition`，表示尚未发送状态或删除请求，可保留原归属并等待新的完整轮。请求已发送且结果无法确认仍进入待核对，不自动重放。人工核对要求当前启用快照或精确删除证据；供应商组必须核实当前完整成员，目录暂时遗漏不能解除保护。
 
 当前队列满时，动态派发可以返回带 `queue_full` 未执行项的批次回执，并不总是使整个 API 请求报错。文档和界面应区分“收到派发请求”与“已经开始模型调用”。
 
@@ -167,7 +183,7 @@ flowchart TD
 
 ## 7. 重启、认证和历史清理
 
-管理适配器授权保存在后端进程内存。插件重启后，需要新的已认证面板请求建立管理会话，之后关闭页面不影响已经授权的后端定时运行。浏览器的管理连接持久化是现有独立机制，不能据“后端内存授权”推断浏览器从不保存管理密钥。
+后台管理授权经 CPA 验证后保存在插件的专用数据卷。每个插件实例维护一个回环客户端和一个异步恢复任务。普通账号、质量和连接状态 GET 只读。浏览器退出与 CPA 是否可以在后台执行分别判定。各功能依赖和状态码见[后台连接和恢复](BACKGROUND_CONNECTION_CN.md)。
 
 普通供应商探测密钥不进入检测历史。账号登录模块的账号资料存储属于另一套功能，不在本次质量运维状态修复中改变。
 
@@ -177,80 +193,126 @@ flowchart TD
 
 当前“清空规则运行记录”作用于所有规则的可清理历史，即使页面正在筛选单条规则，也不是只清理筛选结果。它不改变 CPA 状态、规则定时和手动测试历史。
 
-删除规则会清除其规则、普通历史和已确认关联，不向 CPA 发起启用。进行中写入阻止删除，未知结果保留隔离和必要证据。历史独立暂停有自己的删除限制。
+删除规则清理规则及可清理历史，不向 CPA 发起启用。仍有效的上游错误停用来源及必要触发记录继续保留，不能通过删除原归属规则或错误触发规则绕过退出检测。没有错误来源的已确认普通答错关联沿用原删除清理语义。进行中写入阻止删除，未知结果保留隔离和必要证据。历史独立暂停有自己的删除限制。
 
-## 8. 已核实的实现差异
+## 8. 审查差异的当前处理结果
 
-| 编号 | 当前实现 | 与已确认目标的关系 | 定位 |
-| --- | --- | --- | --- |
-| C01 | 旧错误停用分支的前端手动测试检查只接受 `active` | 合法可用的供应商 `registered` 可被误拒绝；已用隔离输入复现用户报错 | `view.js` 中 `error_policy_block` 检查；与 `providerRouteReady` 对照 |
-| C02 | `scopeMember` 和错误记录排除发生在当前状态校准前 | CPA 外部启用后仍可能退出所有规则 | `error_policy_disabled.go`、`scope_plan.go` |
-| C03 | 已有 `observeEnabledTargetLocked` 主要在管理快照准入被调用，错误排除还先于该调用 | 不是各入口通用的外部启用校准 | `credential_policy.go` 的 `admitSnapshotLocked` |
-| C04 | 文件凭证答错停用调用 `stopManagedRules`，关闭其他直接依赖规则；供应商路径不相同 | 普通对象停用不应永久改写用户规则启停 | `credential_policy.go`、`provider_disposition.go` |
-| C05 | 人工核对结束普通关联时停止所属规则 | 不应成为手动启用后恢复正常使用的必经步骤 | `acknowledgeHandling`、`acknowledgeProviderGroupLocked` |
-| C06 | `loadOperations(true)` 轮询规则、统计和活动，不同步 targets | 前端可能继续使用旧对象状态 | `app.js` 的 `loadOperations` |
-| C07 | 测试明确要求外部启用后仍退出错误处置对象的后续检测 | 该断言与新目标冲突，需要在实现时同步更新 | `TestErrorPolicySuspensionsSkipEveryScope` |
-| C08 | “全部”对本规则答错停用对象仍依赖恢复授权，其他规则归属也会阻止检测 | 用户已确认继续只读检测；本规则恢复关闭时不恢复，他规则可测但不接管恢复归属 | `scopeAdmissionLocked`、`recoveryDenied` |
-| C09 | 已核实目录缺少一个模型时生成整个对象的目录检查运行，并可能处置 | 用户明确选择保留：应用模型不支持策略，本轮不检测其余模型；这是已确认行为，不列为待修复错误 | `firstMissingModel`、`queueCatalogRun`、`catalog_action.go` |
-| C10 | `managedRule` 将答错动作与上游错误动作都归为处置规则，`validateManagedRule` 统一要求确定性判题且无对照 | 用户已确认上游错误处理不依赖标准答案，应拆分答错证据要求与凭证错误证据要求 | `credential_policy.go` 的 `managedRule`、`validateManagedRule` |
-| C11 | 其他规则答错停用对象此前不能进入当前规则的普通探测，错误来源升级主要在原规则恢复分支处理 | 用户已确认 B 可发现新上游错误并停止 A 的恢复，同时保留 A 归属、B 触发证据且不重复写 CPA | `scopeAdmissionLocked`、`decideManagedLocked`、`decideProviderLocked` |
+下表保留原审查编号，区分已实现修复、沿用行为和仍有的公开接口限制。回归名称表示具体覆盖范围，实际命令、平台与结果以交付记录为准。
 
-## 9. 目标架构建议：先核对当前状态，再做范围与权限判定
+| 编号 | 当前实现 | 关键定位与回归 |
+| --- | --- | --- |
+| C01 | 前后端对合法供应商 `registered`、`active` 使用一致条件；旧错误记录不单独否决当前启用对象 | `view.js` 的 `targetRuntimeReady`、`credentialBlock`；`TestManualRegisteredProviderWithPersistedErrorSuspension`、`verify_manual_provider_selection.cjs` |
+| C02 | 目录不再因本地错误记录隐藏对象；在范围筛选前读取当前状态并同步确认过的普通记录 | `inventoryContextLocked`、`reconcileCurrentTargetsLocked`、`collectScopeLocked`；`TestErrorPolicySuspensionsSkipEveryScope` |
+| C03 | 目录展示、手动提交、规则派发和执行复查均接入当前状态同步 | `visibleTargets`、`submit`、`dispatchWithInventory`、`checkExecution`；`current_state_test.go` |
+| C04 | 普通停用只取消受影响任务，保留规则启用和定时设置；其他对象继续执行 | `cancelManagedRuns`、`decideManagedLocked`、`decideProviderLocked`；`TestManagedDeleteStopsDependentsAndDoesNotRecreate`、`TestExternalEnableCancelsStaleRecoveryWithoutChangingRulePermissions` |
+| C05 | 未确认处置核对保留规则设置；普通已确认停用无需按钮核对 | `acknowledgeHandling`、`acknowledgeProviderGroupLocked`；`verify_upstream_actions_ui.cjs` |
+| C06 | 运维可见轮询同步 targets；手动入口恢复可见时刷新，提交前主动读取当前目录 | `app.js` 的 `loadTargets`、`loadOperations`、`submitRun`；`verify_operations_live.cjs`、`verify_run_receipts.cjs` |
+| C07 | 旧的“外部启用后永久排除”断言已替换；当前启用进入新轮，旧任务和证据不重放 | `error_policy_disabled_test.go`、`TestExternalEnableCancelsStaleRecoveryWithoutChangingRulePermissions`、`smoke_error_suspensions.py` |
+| C08 | 全部范围允许本规则恢复关闭时继续检测，也允许他规则答错停用对象只读检测；恢复仍由原规则授权 | `scopeAdmissionLocked`、`canInspectManualDisabled`、`recoveryDenied`；`credential_policy_test.go` |
+| C09 | 保留已确认且非空目录缺项整对象处理，不测其余模型，也不绕过目录调用缺失模型 | `firstMissingModel`、`queueCatalogRun`、`catalog_action.go` |
+| C10 | 保存验证只为答错自动处置要求标准答案；错误策略支持可探测的自定义、视觉及人工评审题 | `validateManagedRule`、`executeManaged`、`probeRequest`；`TestErrorOnlyQuestionsExecuteWithoutStandardAnswers`、`TestAnswerHandlingStillRequiresSupportedAutomaticJudgment` |
+| C11 | B 的全部范围检测取得新错误时保存 `ErrorSource`，保留 A 的 `AnswerOwnerRuleID`，已停用不重复写 CPA，全部规则退出恢复 | `credential_entry_lifecycle_test.go`、`TestCrossRuleProviderErrorExcludesWholeGroupWithoutTakingRecoveryOwnership` |
+| C12 | 长期条目比较与本轮完整快照比较分开；同定位条目的跨轮内容变化不清除答错归属 | `sameCredentialEntry`、`projectOwnedTarget`、`sameSnapshot`；`TestAnswerOwnershipUsesCurrentEntryContentEachRound`、`TestOwnedRecoveryRejectsMutationInsideRoundButKeepsOwnership` |
+| C13 | 已核实 AuthID/auth_index 并非所有供应商编辑都稳定；没有猜测映射。当前实现保护无法关联的旧记录，不能承诺所有密钥轮换均自动延续恢复权 | 见 9.5；CPA `Auth.EnsureIndex`、`StableIDGenerator.Next` 与插件 `provider_directory.go` |
+| C14 | 手动测试冻结当前账号/供应商快照，已启用后不要求旧账号摘要、邮箱或旧内容匹配；执行中内容变化仍阻止旧任务 | `currentManualAccountLocked`、`verifyEnabledManualFile`、`verifyManualSubjectLocked`；`TestManualReenabledEntryUsesCurrentAccount` |
 
-本节是实现方向，不是新增 API 或字段已经存在的声明。
+## 9. 当前状态、权限与证据边界
 
-### 9.1 正常状态读取中的本地校准
+### 9.1 正常读取同步普通记录
 
-CPA 手动启用由 CPA 生效，主项目使用不依赖插件。这里的校准是正常请求中的自动状态同步，不是第二道启用审批，不增加“待插件核实”的用户流程、额外验证调用或后台解锁任务。
+CPA 为当前启停的权威来源。`reconcileCurrentTargetsLocked` 对目录中的已启用对象读取当前快照，只处理原状态已确认的普通 `disabled` 记录。历史独立暂停、未知写入、身份冲突保留原保护。该操作不写 CPA、不发起模型测试、不建立额外启用审批。
 
-在手动提交、对象展示、范围派发及执行复查的合适位置共用同一套状态解释：
+确认当前启用后，普通记录转为 `externally_enabled`，保留原证据与审计；取消依赖旧处置的排队或进行中任务，清空相关规则的旧失败计数与证据签名，保留规则启用和定时设置。执行复查继续核实规则版本、取消、当前身份和本轮快照，晚到的旧结果不能再次处置。当前启用后的新轮次可以依据新明确证据应用策略。
 
-1. 读取可核实的 CPA 当前对象和必要配置，区分读取失败与真实停用。
-2. 检查历史独立暂停、身份冲突及未知写入等仍须保留的限制。
-3. 对已确认的普通停用记录，识别同一对象是否已经被 CPA 启用。
-4. 若确认外部启用，仅结束普通记录的当前阻断和旧恢复归属，保存原因、关联和审计，不写 CPA、不调用模型。
-5. 用校准后的状态判断对象是否属于范围、是否允许检测以及是否允许恢复。
+读取失败用 `handling_state_reason` 或具体接口错误说明实际问题，不把旧记录投影为当前仍停用。`error_policy_block` 只投影当前仍停用且有效的错误来源。供应商整组启用在一次本地事务中同步：保留成员均须当前启用、身份一致、当前组成员和配置可核实；缺项、成员变化或部分停用不能只清掉一条路由后宣布整组解除。
 
-状态读取可以用于核对错误停用对象是否已被管理员启用；“停用期间不再答题”不能继续解释为“永远不读取其启用状态”。需要有界读取和适当刷新，不建立每份历史记录的高频后台轮询。
+前端的 `credentialBlock` 不将历史错误来源当作当前已启用对象的独立禁用条件。手动测试已经选择完整计划时，普通停用缓存允许“开始测试”进入当前状态读取；仍停用则没有模型任务 POST，当前启用则直接提交。管理会话切换使旧异步提交失效。正常刷新、提交或派发均可同步状态，不依赖后台轮询先完成。
 
-手动测试提交和规则派发自身读取当前状态，不能要求用户先等待另一个核实任务或固定轮询周期清除旧普通记录。读取失败报告实际的管理连接、目录或身份问题，不能用历史错误停用记录代替 CPA 当前状态。正常身份与写入条件检查仍保留。
+### 9.2 候选、执行、恢复与写入分别判定
 
-整组校准必须核实成员与组身份，在一致的本地转换中处理组记录，避免只清理其中一条路由而被另一条旧记录继续阻断。组成员变化不能当作原组已经完整恢复。
+规则先按 `ObjectTypes` 和 `TargetScope` 选择候选，再核实当前协议/目录能否执行，之后分别判断恢复与写入资格。
 
-### 9.2 探测权限与写入权限
+- 仅已启用：普通检测选择当前启用对象；只有本规则答错停用且当前开启恢复的对象取得恢复例外。
+- 全部对象：管理员停用、本规则答错停用但恢复关闭、他规则答错停用对象均可保持停用检测；身份或通道不可核实时记录具体原因。
+- 指定对象：遵守已保存的凭证/路由/组绑定与类型，不因发现相似名称扩大范围。
+- 错误停用：所有规则都退出后续答题及恢复；正常状态读取继续，直到 CPA 当前启用。
 
-建议把准入结果明确分成候选归属、可执行性、执行通道、可恢复性和可处置性。用户已经确认全部范围中，本规则答错停用但恢复关闭的对象，以及其他规则答错停用的对象，都可以只读检测。只读检测资格不能隐式授予恢复、删除、接管归属或整组写入权限。
+自动恢复仍要求答错动作为普通停用。当前全部范围可以授权没有其他归属的管理员停用对象恢复；已经有答错归属的对象只由原规则恢复。他规则只读检测不授予恢复、删除或接管归属权限。
 
-答错策略与上游错误策略分别消费本轮相应证据。共享底层快照和写入确认机制，但不得用“答错仅检测”覆盖上游错误策略。上游错误处置无需标准答案，自定义、视觉与人工评审题型也可使用支持的探测路径；答错自动处置继续要求完整明确的判题证据。
+固定路由经授权扩展到同组成员时，`subjectBindingProblem` 同时核对原绑定的提供方、已保存的索引及当前组。在成员采样前和 `providerWriteSnapshots` 写前复查时均使用这项判断。直接绑定配置组时，成员须仍在选定组内。固定的供应商对照或判题依赖遇到目录读取故障时，预览与派发都标记目录未核实，跳过记录仍归属于被测对象。
 
-不能只删除规则保存校验：还要检查题目与参数准入、执行通道选择、样本错误提取、动作判定和 UI 可选项，保证独立错误路径实际可执行。官方宿主尚不支持的对照身份、LLM 判题或协议功能仍保持对应能力限制。
+上游错误策略独立消费可信错误证据。自定义、视觉及人工评审题无需标准答案，但仍受实际协议和探测能力约束；答错自动处置要求支持的标准答案题及确定性判定。独立对照和 LLM judge 在管理探测中的限制继续保留。人工补充评审不能自动触发处置。
 
-自动恢复仍只在答错动作选择普通停用时提供。恢复分支使用原规则的 Cron 或立即执行，不新增恢复定时器。
+### 9.3 跨规则错误来源与完整组证据
 
-用户确认跨规则只读检测命中已配置停用的新上游错误后，停止整个对象的所有复检，包括原规则 A 的恢复。对象已在 CPA 停用，因此执行的是有新证据的本地处置原因更新，不重复发起 CPA 停用，不转移 A 的归属。需要分别持久保存原规则和动作，以及触发规则 B、运行、模型、错误与时间，不能依赖可能被清理的触发运行才能解释阻断原因。
+`CredentialDisposition.AnswerOwnerRuleID` 保存原答错恢复归属；`ErrorSource` 保存触发规则及版本、运行、路由、模型、错误类别、证据和时间。历史顶层 `UpstreamCondition`、`CatalogMissingModel` 保留兼容读取。没有原答错记录的首次错误停用不创建答错恢复权。
 
-该转换应再次核实当前仍停用、原归属与身份匹配、证据属于当前有效任务；整组情形核实原停用单位及成员。通过同一持久转换更新相关记录并阻止晚到的恢复写入。B 的该错误策略为仅记录时不执行上述转换。未知写入或历史独立暂停不能被新错误覆盖为普通已确认停用。
+A 答错停用后，B 的全部范围可检测；B 对新明确错误配置停用时，核实当前仍停用、原记录与本轮定位和内容一致，再在本地保存 B 来源。A 归属和原动作不变，CPA 停用写入为零。所有规则随后退出答题与恢复。B 仅记录错误不改变 A 资格。整组转换需要 B 的明确整组授权，所有组记录在同一持久转换中更新；未授权单路由不能触发组处置。
 
-### 9.3 新一轮证据边界
+`providerRoundVerdict` 检查同一批次下各路由的模型、题目与样本计划。各组员的 `roundVerdict` 逐一核对计划位置、执行状态和证据。任一成员的运行或样本留有执行错误或上游错误条件时，即便样本保存了「正确」，整组也保持停用并保留原答错归属。答错停用要求整组都可判定且至少一份答错，恢复要求整组全部正确。写前再次读取成员与配置。新的明确上游错误仍可单独按策略提前处理已授权组。
 
-外部启用被确认后，应通过状态代次、任务失效标记或等效机制，使旧停用期间冻结的任务与证据失去再次处置资格。具体字段和实现由开发阶段确定。
+`queryRules` 将原归属和错误来源投影到原归属规则的处置记录，界面显示 A 归属及 B 来源、触发模型与时间；B 的运行仍保留本轮错误。历史清理和删除任一相关规则不能清除仍有效的错误来源。删除后的源记录继续参与对象准入，不能依赖触发运行仍在普通历史中才识别原因。
 
-判定和写入前都要核实该证据仍属于当前规则版本及当前对象状态。一次人工启用不豁免新一轮明确错误；也不能允许旧错误在启用后立即重放。
+供应商配置目录和 CPA 运行时目录分别校验。配置含重复 JSON 字段、成员或模型映射结构残缺时，该读取无法建立可用路由。路由 ID、索引或执行器冲突时保留原归属，受影响的对象退出检测。核实已停用整组时，SDK 须明确返回凭证清单和凭证模型清单，缺少数组无法证明运行时已无该组。组成员列表在一次目录读取内排序并共享；持久化快照拥有独立副本。
 
-CPA 不提供的原子性不能由插件文档承诺。如果启停变化完全发生在两次读取之间，且接口未暴露可区分版本，插件不能宣称必然观察到该变化。
+### 9.4 规则生命周期与旧配置
 
-### 9.4 规则状态与历史迁移
+普通停用不再通过 `stopManagedRules` 永久停止其他依赖规则；只取消本轮受影响任务。外部启用、自动恢复与未知处置核对不启动管理员停止的规则，也不修改其定时选择。旧规则明确设置、旧范围迁移、供应商观察限制与整组授权仍保留。
 
-普通停用仅影响对象与本轮受影响任务，不永久关闭其他规则。管理员停止规则是另一条显式状态转换。
+没有对来源不明的历史停止进行批量恢复。仅有“当前停止”或旧停用记录不足以证明没有后续人工停止，因此本轮保留这些规则的原配置，用户可按当前需求明确启用。
 
-对于已经被旧代码自动关闭的规则，只有能够可靠证明停用来源且没有后续管理员停止操作时，才讨论修复原配置。证据不足时保留停止并提示，不批量启动历史规则。
+队列持久化、提交回执、幂等键、规则版本、主体/对照/判题依赖互斥、预算、取消和执行复查继续有效。重启将旧未结束任务记为中断；未知写入进入隔离，不重发调用或管理写入。
 
-已有旧规则的对象范围、整组授权、调度许可和历史独立暂停不能因升级、改名或目录发现而自动扩权。
+### 9.5 条目连续性的实现与公开接口限制
 
-## 10. 文档与验证状态
+用户确认的语义是跟随同一个 CPA 条目：token 刷新、同条目更换账号内容或密钥，不因完整内容摘要变化而丢失答错归属。当前代码把长期定位与本轮快照分开，适用于公开定位能够保持且唯一核实的情形；没有宣称所有供应商编辑都具备这样的稳定定位。
 
-本次对话此前的源码审查已完成隔离的 `quality` / `ui` Go 包检查和 `scripts/test_question_test.mjs`，并通过实际前端函数的合成对象输入复现 C01。Go 检查使用临时模块文件，把缺失的本地宿主 replace 指向只读的 CPA 8.0.76 源码；仓库依赖文件未因此修改。
+| 字段/检查 | 当前来源与用途 | 不能据此证明的事实 |
+| --- | --- | --- |
+| 文件 AuthID、auth_index、文件名、提供方 | CPA 文件定位；`Auth.EnsureIndex` 通常按类型与规范化文件路径派生索引，已设置索引可能沿用 | 同路径被删除后重建是否还是原条目 |
+| 供应商 AuthID | CPA `internal/watcher/synthesizer/helpers.go` 的 `StableIDGenerator.Next` 按配置材料派生；提供方实现可包含密钥、URL、代理、前缀、请求头、池配置 | 换密钥后新 AuthID 必定与旧条目连续 |
+| 供应商 auth_index | `sdk/cliproxy/auth/types.go` 的 `Auth.EnsureIndex` 可按提供方、URL、密钥及池设置派生；部分配置由管理端提供索引 | 所有配置编辑和删除重建都有永不变化的索引 |
+| `ProviderGroupID` | 插件按类型、组名、base URL 派生，供当前组归属与授权核实 | 仅凭组名、地址、列表位置就可证明成员连续 |
+| `sameCredentialEntry` | 比较 AuthID、auth_index、Name、Provider、ProviderMechanism、ProviderGroupID | 无操作事件时重建未观察到的条目生命周期 |
+| `Fingerprint`、`UpdatedAt`、`FileModifiedAt`、成员集合、ETag | 本轮内容、状态与并发条件检查；历史快照供追溯 | 时间/摘要变化必定发生过人工启用 |
 
-上述检查证明检查时工作区的既有行为，不证明本文件的目标架构已经实现。当前任务是编写逻辑与架构文档，不执行真实账号模型请求、启停或部署。本次文档核对包含本地链接、代码块闭合、18 项决策、7 项澄清和 31 项验收编号，以及范围矩阵、流程图与已确认答案的一致性。图表以 Markdown / Mermaid 源码提供。
+文件条目定位相同且可核实时，token、账号内容与轮次间时间变化不影响答错恢复归属。每轮从当前快照重新检测，在本轮写前核对全部内容。供应商定位保持不变的配置更新同样使用新轮次快照；组恢复还要求原授权模型计划和完整当前成员。
 
-旧 `ARCHITECTURE_REVIEW_CN.md` 描述的是历史独立暂停设计。旧范围、恢复和错误文档中“错误停用后不再核对状态”的内容应作为既有实现或历史行为阅读，不能覆盖本次已确认的外部启用要求。
+**仍存在能力缺口：供应商换密钥导致公开 AuthID/auth_index 改变时，没有可靠持久条目 ID 或编辑事件可区分同条目更新与删除重建。** 新增插件 UUID 不能解决如何唯一对应当前条目。当前没有按名称、列表位置或配置摘要猜测迁移的映射，也不能保证这种密钥轮换自动继承旧恢复权。旧记录保留，不能把旧归属施加到另一个当前已启用对象。
+
+完整且已核实目录观察到旧定位消失后，`observeMissingEntriesLocked` 将已确认记录转为 `entry_missing`，保留记录/审计并取消旧任务。该记录不再给随后复用同名定位的对象恢复例外；目录失败或未核实供应商目录不能触发此转换。若删除重建完全发生在两次观察之间，且当前公开字段完全相同，官方接口无法可靠还原中间操作。此限制明确保留，不以 token、更新时间或高频轮询伪装成已经解决。
+
+### 9.6 三类数据的生命周期
+
+| 数据 | 负责什么 | 何时失效或结束 |
+| --- | --- | --- |
+| 答错恢复归属 | 原规则与可核实 CPA 条目之间的恢复权限 | 正常读取已启用后结束；完整目录已观察到条目消失后不再授予新条目；跨轮内容更新本身不清除 |
+| 上游错误来源 | 追溯错误并使当前停用对象退出所有答题/恢复 | 正常读取 CPA 当前启用后结束阻断；删除规则或清历史不能绕过 |
+| 本轮快照与证据 | 证明本轮实际请求及写入条件 | 本轮内容、身份、组成员、状态或规则版本变化即失效，下轮重新取得 |
+
+未知写入仍独立保存意图与状态；不能借普通启用同步或稳定条目改造自动认定成功。没有条件状态/删除 API 的文件写入，仍有最后检查到实际写入的并发窗口；供应商 ETag 条件写入也不替代身份及完整组检查。
+
+### 9.7 两次读取之间的启停
+
+同条目答错停用，管理员在两次读取之间先启用再停用，而插件两次都只观察到停用时，归属不因内容或时间戳变化失效；按当前范围与原规则资格重新完成一轮。若正常读取确实观察到启用，旧普通来源与恢复归属结束，之后的人工停用按当前范围处理。
+
+CPA 公开 auth 回调提供当前状态，没有足以重建每次启停的可靠操作序列。稳定定位解决关联，不能还原未观察到的操作历史。上游错误不会因此获得答错恢复权限，也不会成为当前已启用对象的永久阻断。
+
+## 10. 源码回归与交付证据
+
+`plugin/quality/background_recovery_test.go` 用临时数据库、假 CPA、假凭证和可控时钟复现了三项旧行为。管理接口未就绪时旧实现推进了到期时间，重启后原周期没有入队，修改宿主保留天数还会清除逐规则许可并把面板预算从 58 改回 200。
+
+修复后，5 小时 3 分钟的中断合并为一条补检审计、一个批次、两个当前对象和四次假模型探测。部分批次重启时，已受理的文件任务记为中断，补检只排入当时的提供商和新加入的文件。用户在补检前暂停、停止定时、删除或修改规则时，旧周期无额外模型调用。停机期间才打开全局调度时，原本拥有逐规则许可的一条规则获得补检，原本缺少许可的另一条从下一个 Cron 开始。[调度竞态回归](../artifacts/backend-connection-0.31.0/scheduler-recovery-race.log)
+
+在已经确认答错停用的假凭证上更换管理密钥并重新加载同一数据目录，当前连接通过正式鉴权后继续原规则的复检。完整的两个模型样本通过，CPA 收到一次恢复写入，原处置 ID 和归属保持一致。[密钥轮换与重启回归](../artifacts/backend-connection-0.31.0/scheduler-rotation-race.log)
+
+本轮新增或更新的关键回归包括：
+
+- `error_only_questions_test.go`：保存、执行通道、定时/立即执行、无标准答案错误处置、人工评审不自动处置。
+- `credential_entry_lifecycle_test.go`：跨轮 token/账号内容、未观察到启停、本轮变化、跨规则 A/B 来源、历史和规则清理后的保护。
+- `provider_entry_lifecycle_test.go`：当前完整组快照、缺项/未知/成员变化、整组授权和零重复停用写入、整组启用的本地一致转换。
+- `current_state_test.go`、`manual_error_policy_test.go`、`provider_adapter_test.go`：外部启用、旧任务取消、管理员停规则、真实读取错误、合法 registered、当前账号替换、已观察到删除重建。
+- `scripts/test_question_test.mjs`、`verify_upstream_actions_ui.cjs`、`verify_manual_provider_selection.cjs`、`verify_operations_live.cjs`、`verify_run_receipts.cjs`：前端权限、策略保存、缓存状态下直接提交、目录同步、错误来源展示及回执。
+- `scripts/smoke_quality_operations.py`、`smoke_error_suspensions.py` 与已有供应商 smoke：隔离 CPA、假凭证/假上游的真实管理通道验证入口。
+
+本轮路由及写前复核用例见 `scope_dispatch_review_test.go`。目录、回执与历史展示用例分别在 `commercial_provider_directory_test.go`、`upstream_error_test.go` 和 `scripts/verify_provider_run_identity.cjs` 中。各版本的原生包和本地服务资产校验见 [版本记录](CHANGELOG_CN.md)。官方宿主保持只读，常规验证使用隔离的假账号和假上游。

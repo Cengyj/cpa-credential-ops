@@ -134,7 +134,7 @@ func TestRuleScopeRetainsProviderAndOAuthBlockers(t *testing.T) {
 			name, code string
 			setup      func(*Target) *CredentialDisposition
 		}{
-			{"other owner", "other_rule_owner", func(t *Target) *CredentialDisposition {
+			{"other owner without probe capability", "manual_disabled", func(t *Target) *CredentialDisposition {
 				return &CredentialDisposition{AuthID: t.AuthID, RuleID: "another", State: "disabled"}
 			}},
 			{"unconfirmed write", "handling_blocked", func(t *Target) *CredentialDisposition {

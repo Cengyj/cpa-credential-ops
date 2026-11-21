@@ -16,6 +16,7 @@ POSITIVE = {
 NEGATIVE = {
     'bad-parameter': (None, 400, 'invalid_request_error', 'Invalid temperature parameter'),
     'throttled': (None, 429, 'rate_limit_exceeded', 'Request rate limited, retry later'),
+    'request-window': (None, 429, 'quota_exceeded', 'Quota exceeded'),
     'unavailable': (None, 503, 'server_error', 'Synthetic service is unavailable'),
 }
 CONTROLS = [*NEGATIVE, 'healthy']
@@ -62,6 +63,8 @@ def verify(prefix, request, root, targets, credential, recorded_calls, mutation_
             if fault:
                 _, status, code, message = fault
                 body = {'status': status, 'error': {'code': code, 'type': code, 'message': message}}
+                if account == 'request-window':
+                    body['headers'] = {'X-RateLimit-Remaining-Requests': '0'}
                 patterns[account + '@example.test'] = [body, '4', '4', '4']
             else:
                 patterns[account + '@example.test'] = ['4'] * 4

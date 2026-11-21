@@ -10,9 +10,20 @@ import (
 )
 
 type runtimeEngine interface {
+	ReconfigureQuality(quality.Config) error
 	Close() error
 	Handle(context.Context, pluginapi.ManagementRequest) pluginapi.ManagementResponse
 	Usage(quality.UsageEvent)
+}
+
+type connectedApplication struct {
+	runtimeEngine
+	management *quality.ManagementClient
+}
+
+func (app *connectedApplication) Close() error {
+	app.management.Close()
+	return app.runtimeEngine.Close()
 }
 
 type engineInstance struct {
@@ -71,8 +82,18 @@ func (r *engineRuntime) configure(config runtimeConfig, reconfigure bool, create
 	defer r.transition.Unlock()
 	// CPA announces ordinary provider config writes to every plugin. Keep
 	// in-flight confirmations and the authenticated session for the same config.
-	if reconfigure && r.current != nil && r.current.config == config {
-		return nil
+	if reconfigure && r.current != nil {
+		prior := r.current.config
+		if prior == config {
+			return nil
+		}
+		if prior.managementURL == config.managementURL && prior.settings.DataDir == config.settings.DataDir && prior.settings.Workers == config.settings.Workers && prior.settings.Queue == config.settings.Queue {
+			if err := r.current.engine.ReconfigureQuality(config.settings); err != nil {
+				return err
+			}
+			r.current.config = config
+			return nil
+		}
 	}
 	if err := r.stopCurrent(); err != nil {
 		return err

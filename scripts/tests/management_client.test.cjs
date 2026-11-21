@@ -237,6 +237,7 @@ test('an unreadable write response remains uncertain without replaying the reque
   const write = client.requestHostLogin('/accounts/security', 'POST', { id: 'fixture-account' }, 'fixture-truncated-once');
   const failure = assert.rejects(write, error => {
     assert.equal(error.code, 'management_response_invalid');
+    assert.equal(error.status, 200);
     assert.equal(error.outcomeUnknown, true);
     assert.doesNotMatch(error.message, /synthetic-secret/);
     return true;
@@ -246,4 +247,114 @@ test('an unreadable write response remains uncertain without replaying the reque
   clock.advance(120000);
   assert.equal(calls.length, 1);
   assert.equal(clock.timers.size, 0);
+});
+
+test('a forbidden read retains its HTTP status with plain text or a non-object JSON body', async () => {
+  const { client, calls } = harness();
+  for (const body of ['Synthetic denial', 'null', '[]', 'false']) {
+    const read = client.requestHostLogin('/accounts');
+    const failure = assert.rejects(read, error => error.status === 403 && error.code !== 'management_network_error');
+    calls.at(-1).resolve({ status: 403, ok: false, text: async () => body });
+    await failure;
+  }
+});
+
+test('a 401 invalidates the current key without waiting for an error body', async () => {
+  const invalidated = [];
+  const { client, calls, isDiscarded } = harness({ onUnauthorized: key => invalidated.push(key) });
+  const read = client.requestHostLogin('/accounts');
+  const failure = assert.rejects(read, isDiscarded);
+  let bodyRead = false;
+  calls[0].resolve({ status: 401, ok: false, text: async () => { bodyRead = true; return 'unneeded'; } });
+  await failure;
+  assert.deepEqual(invalidated, ['fixture-management-key']);
+  assert.equal(bodyRead, false);
+});
+
+test('a denied HTTP response remains a denial if its body stream breaks', async () => {
+  const { client, calls } = harness();
+  const read = client.requestHostLogin('/accounts');
+  const failure = assert.rejects(read, error => error.status === 403 && error.code === 'management_response_invalid');
+  calls[0].resolve({ status: 403, ok: false, text: async () => { throw new TypeError('incomplete fixture body'); } });
+  await failure;
+});
+
+test('simultaneous workspace and visibility reads share transport until a mutation changes the snapshot', async () => {
+  const { client, calls } = harness();
+  const first = client.request('/targets?limit=100');
+  const second = client.request('/targets?limit=100');
+  assert.equal(calls.length, 1, 'concurrent display reads should issue one GET');
+  const write = client.request('/rules/timer', 'PUT', { id: 'fake', revision: 1, enabled: false });
+  const during = client.request('/targets?limit=100');
+  assert.equal(calls.length, 3, 'the configuration write starts a new read generation');
+  calls[1].resolve(response({ ok: true }));
+  await write;
+  const after = client.request('/targets?limit=100');
+  assert.equal(calls.length, 4, 'post-commit reads cannot reuse a pre-commit response');
+  calls[0].resolve(response({ version: 1 }));
+  calls[2].resolve(response({ version: 2 }));
+  calls[3].resolve(response({ version: 3 }));
+  assert.deepEqual(await Promise.all([first, second, during, after].map(read => read.then(item => item.version))), [1, 1, 2, 3]);
+});
+
+test('browser restriction, rate limit and backend credential failure keep independent sources', async () => {
+  const invalidated = [];
+  const { client, calls } = harness({ onUnauthorized: key => invalidated.push(key) });
+  for (const [status, body, source] of [
+    [403, { error: 'Forbidden' }, 'browser_access'],
+    [422, { code: 'management_invalid', source: 'backend_management' }, 'backend_management'],
+    [409, { code: 'revision_conflict' }, 'business'],
+    [429, { error: 'Slow down' }, 'browser_access'],
+  ]) {
+    const request = client.request('/connection');
+    calls.at(-1).resolve(response(body, status));
+    await assert.rejects(request, error => error.source === source && error.status === status);
+  }
+  assert.deepEqual(invalidated, []);
+});
+
+test('a browser 429 with Retry-After suppresses further display requests during the hold', async () => {
+  const { client, calls } = harness();
+  const read = client.request('/connection');
+  calls[0].resolve({ ...response({ error: 'Slow down' }, 429), headers: { get: () => '60' } });
+  await assert.rejects(read, error => error.retryAfterMs === 60000);
+  await assert.rejects(client.request('/rules'), error => error.status === 429);
+  assert.equal(calls.length, 1);
+});
+
+test('CPA IP-ban duration survives as a browser read hold while a model 401 never logs out a session', async () => {
+  const invalidated = [];
+  const { client, calls } = harness({ onUnauthorized: key => invalidated.push(key) });
+  const task = client.request('/runs/detail?id=synthetic');
+  calls[0].resolve(response({ samples: [{ http_status: 401, credential_error: 'upstream' }] }));
+  assert.equal((await task).samples[0].http_status, 401);
+  const read = client.request('/connection');
+  calls[1].resolve(response({ error: 'IP banned due to too many failed attempts. Try again in 16m14s' }, 403));
+  await assert.rejects(read, error => error.retryAfterMs === 974000 && /暂时封禁/.test(error.message));
+  await assert.rejects(client.requestHostLogin('/accounts'), error => error.status === 403);
+  assert.equal(calls.length, 2);
+  assert.deepEqual(invalidated, []);
+});
+
+test('a connection response can carry a backend delay or an unknown durable write', async () => {
+  const { client, calls } = harness();
+  const candidate = client.request('/connection', 'PUT', { revision: 8, mode: 'configure' });
+  calls[0].resolve({ ...response({ error: { code: 'management_temporarily_banned', source: 'backend_management' } }, 503),
+    headers: { get: () => '180' } });
+  await assert.rejects(candidate, error => error.source === 'backend_management' && error.retryAfterMs === 180000);
+  const retry = client.request('/connection');
+  calls[1].resolve(response({ state: 'waiting' }));
+  assert.equal((await retry).state, 'waiting');
+  const unknown = client.request('/connection', 'DELETE', { revision: 8 });
+  calls[2].resolve(response({ error: { code: 'connection_save_unknown', source: 'backend_management', outcome_unknown: true } }, 507));
+  await assert.rejects(unknown, error => error.outcomeUnknown && error.source === 'backend_management');
+  assert.equal(calls.length, 3);
+});
+
+test('an aborted mutation in the active page is an unknown receipt and cannot be replayed', async () => {
+  const { client, calls, isDiscarded } = harness();
+  const action = client.requestHostLogin('/accounts/security', 'POST', { id: 'fixture-account' }, 'fixture-receipt');
+  calls[0].reject(abortError());
+  await assert.rejects(action, error => !isDiscarded(error) && error.outcomeUnknown && error.source === 'browser_network');
+  assert.equal(calls.length, 1);
 });

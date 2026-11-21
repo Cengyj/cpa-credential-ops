@@ -34,12 +34,34 @@ func (en *Engine) changedTimer(id string, on bool) map[string]bool {
 
 // An explicit instance-wide stop revokes individual authorizations as well.
 func (en *Engine) writeScheduleSettings(c Config, revokeTimers bool) error {
+	return en.commitLocked(en.scheduleSettingsChanges(c, revokeTimers, en.cfg.SchedulingEnabled))
+}
+
+func (en *Engine) scheduleSettingsChanges(c Config, revokeTimers, previouslyEnabled bool) *changeSet {
 	update := changes()
 	update.settings = &c
 	if revokeTimers {
 		update.timers = map[string]bool{}
+		for _, rule := range en.rules {
+			if rule.PendingSchedule != nil {
+				next := cloneRule(rule)
+				next.PendingSchedule = nil
+				update.rules[rule.ID] = next
+			}
+		}
 	}
-	return en.commitLocked(update)
+	if !previouslyEnabled && c.SchedulingEnabled {
+		now := en.now()
+		for _, rule := range en.rules {
+			if ruleScheduled(rule) && !en.timers[rule.ID] && (rule.PendingSchedule != nil || !rule.NextRun.IsZero() && !rule.NextRun.After(now)) {
+				next := cloneRule(rule)
+				next.PendingSchedule = nil
+				next.NextRun = nextRun(*next, now)
+				update.rules[rule.ID] = next
+			}
+		}
+	}
+	return update
 }
 
 var fiveFieldCron = cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
@@ -115,13 +137,14 @@ func nextRun(r Rule, now time.Time) time.Time {
 
 type ruleView struct {
 	Rule
-	Handling     []HandlingSummary `json:"handling,omitempty"`
-	TimerActive  bool              `json:"timer_active"`
-	NextRunLocal string            `json:"next_run_local,omitempty"`
+	Handling        []HandlingSummary `json:"handling,omitempty"`
+	TimerActive     bool              `json:"timer_active"`
+	TimerWaitReason string            `json:"timer_wait_reason,omitempty"`
+	NextRunLocal    string            `json:"next_run_local,omitempty"`
 }
 
 func viewRule(r Rule) ruleView {
-	view := ruleView{Rule: r, TimerActive: r.timerActive}
+	view := ruleView{Rule: r, TimerActive: r.timerActive, TimerWaitReason: r.timerWaitReason}
 	if ruleScheduled(&r) && !r.NextRun.IsZero() {
 		if loc, err := ruleScheduleLocation(&r, time.Local); err == nil {
 			view.NextRunLocal = r.NextRun.In(loc).Format(time.RFC3339)
@@ -138,12 +161,20 @@ type ruleWrite struct {
 func decodeRuleWrite(raw []byte, update bool) (ruleWrite, error) {
 	var body struct {
 		ruleView
-		Activation string          `json:"activation"`
-		Cron       json.RawMessage `json:"cron"`
-		MaxResults json.RawMessage `json:"max_results"`
+		Activation               string          `json:"activation"`
+		ExpectedTargetObjectType string          `json:"expected_target_object_type"`
+		Cron                     json.RawMessage `json:"cron"`
+		MaxResults               json.RawMessage `json:"max_results"`
 	}
 	if err := DecodeStrict(raw, &body); err != nil {
 		return ruleWrite{}, err
+	}
+	if kind := body.ExpectedTargetObjectType; kind != "" {
+		if kind != objectOAuth && kind != objectProvider || body.TargetScope != "" && body.TargetScope != "single" || body.TargetGroup != "" ||
+			body.AuthID == "" || body.Provider == "" || body.TargetAuthIndex == "" {
+			return ruleWrite{}, fmt.Errorf("invalid_request: 来源核对需要指定单个对象、提供方、索引及有效对象类型")
+		}
+		body.Rule.expectedTargetObjectType = kind
 	}
 	if body.Cron != nil {
 		var expression *string

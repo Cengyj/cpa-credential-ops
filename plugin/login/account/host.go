@@ -113,6 +113,9 @@ func (m *Manager) entries() ([]Entry, error) {
 		Files []Entry `json:"files"`
 	}
 	e := m.invoke("host.auth.list", struct{}{}, &r)
+	if e == nil && r.Files == nil {
+		e = errors.New("storage_unavailable")
+	}
 	return r.Files, e
 }
 func encode(v any) ([]byte, error) {
@@ -211,29 +214,48 @@ func (m *Manager) get(id string) (*Auth, error) {
 	if e != nil {
 		return nil, e
 	}
-	for _, v := range entries {
+	var matched *Entry
+	for i, v := range entries {
 		if v.ID == id || v.Name == id || v.Index == id {
-			return m.read(v)
+			if matched != nil {
+				return nil, errors.New("identity_conflict")
+			}
+			matched = &entries[i]
 		}
+	}
+	if matched != nil {
+		return m.read(*matched)
 	}
 	return nil, errors.New("not_found")
 }
 func (m *Manager) LoginSnapshot(id string) (LoginSnapshot, error) {
-	a, e := m.get(id)
-	if e != nil {
-		return LoginSnapshot{}, e
+	a, err := m.get(id)
+	if err != nil {
+		return LoginSnapshot{}, err
 	}
 	return snapshot(a)
 }
+func (m *Manager) LoginBinding(id string) (LoginSnapshot, LoginPrincipal, []string, error) {
+	a, e := m.get(id)
+	if e != nil {
+		return LoginSnapshot{}, LoginPrincipal{}, nil, e
+	}
+	s, p, e := snapshotAndPrincipal(a)
+	return s, p, LoginPlanTypes(a), e
+}
 func snapshot(a *Auth) (LoginSnapshot, error) {
+	s, _, err := snapshotAndPrincipal(a)
+	return s, err
+}
+func snapshotAndPrincipal(a *Auth) (LoginSnapshot, LoginPrincipal, error) {
 	if a == nil || a.Provider != "codex" || a.FileName == "" || filepath.Base(a.FileName) != a.FileName || !strings.HasSuffix(a.FileName, ".json") {
-		return LoginSnapshot{}, errors.New("unsupported_login_target")
+		return LoginSnapshot{}, LoginPrincipal{}, errors.New("unsupported_login_target")
 	}
 	p, e := LoginPrincipalFromAuth(a)
 	if e != nil {
-		return LoginSnapshot{}, e
+		return LoginSnapshot{}, LoginPrincipal{}, e
 	}
-	return LoginSnapshot{AuthID: a.ID, Name: a.FileName, IdentityVersion: loginHash("identity", a.ID, p.Key()), Principal: p.Key(), PolicyFingerprint: loginHash(string(a.raw), strconv.FormatBool(a.Disabled))}, nil
+	return LoginSnapshot{AuthID: a.ID, AuthIndex: a.Index, Name: a.FileName, IdentityVersion: loginHash("identity", a.ID, p.Key()), Principal: p.Key(), PolicyFingerprint: loginHash(string(a.raw), strconv.FormatBool(a.Disabled))}, p, nil
 }
 
 type Target struct {
@@ -327,10 +349,46 @@ func (m *Manager) LoginCommitStatus(id string) (LoginCommitResult, error) {
 			return errors.New("not_found")
 		}
 		v := ojson.ParseBytes(b)
-		r = LoginCommitResult{CommitID: v.Get("commit_id").String(), AuthID: v.Get("auth_id").String(), IdentityVersion: v.Get("identity_version").String(), Principal: v.Get("principal").String(), State: v.Get("state").String(), CredentialEnabled: v.Get("credential_enabled").Bool()}
+		r = LoginCommitResult{CommitID: v.Get("commit_id").String(), AuthID: v.Get("auth_id").String(), AuthIndex: v.Get("auth_index").String(), Name: v.Get("name").String(), IdentityVersion: v.Get("identity_version").String(), Principal: v.Get("principal").String(), State: v.Get("state").String(), CredentialEnabled: v.Get("credential_enabled").Bool()}
+		if !ojson.ValidBytes(b) || r.CommitID != id || r.State == "" {
+			return errors.New("storage_unavailable")
+		}
 		return nil
 	})
 	return r, e
+}
+
+// VerifyLoginReceipt corroborates a durable successful write after a restart.
+// It never submits a save or exposes credential material to the quality engine.
+func (m *Manager) VerifyLoginReceipt(r LoginCommitResult) error {
+	actual, err := m.get(r.AuthID)
+	if err != nil {
+		return err
+	}
+	current, err := snapshot(actual)
+	if err != nil || current.AuthID != r.AuthID || current.Name != r.Name || r.AuthIndex != current.AuthIndex || current.IdentityVersion != r.IdentityVersion {
+		return errors.New("identity_conflict")
+	}
+	var live struct {
+		Auth Entry `json:"auth"`
+	}
+	if err := m.invoke("host.auth.get_runtime", map[string]string{"auth_index": actual.Index}, &live); err != nil {
+		return err
+	}
+	provider := live.Auth.Provider
+	if provider == "" {
+		provider = live.Auth.Type
+	}
+	if live.Auth.ID == "" || live.Auth.Index == "" || live.Auth.Status == "" {
+		return errors.New("storage_unavailable")
+	}
+	if live.Auth.ID != actual.ID || live.Auth.Index != actual.Index || provider != actual.Provider {
+		return errors.New("identity_conflict")
+	}
+	if runtimeDisabled := live.Auth.Disabled || live.Auth.Status == "disabled"; runtimeDisabled != actual.Disabled {
+		return errors.New("storage_unavailable")
+	}
+	return nil
 }
 
 // Public host.auth.save has no CAS. Re-read immediately before the one write,
@@ -344,8 +402,12 @@ func (m *Manager) CommitLoginCandidate(ctx context.Context, r LoginCommitRequest
 		return result, errors.New("invalid_request")
 	}
 	result.AuthID = r.Candidate.ID
-	if old, e := m.LoginCommitStatus(r.CommitID); e == nil && old.State != "upload_excluded" {
-		return old, errors.New("already_consumed")
+	if old, readErr := m.LoginCommitStatus(r.CommitID); readErr == nil {
+		if old.State != "upload_excluded" {
+			return old, errors.New("already_consumed")
+		}
+	} else if readErr.Error() != "not_found" {
+		return result, errors.New("storage_unavailable")
 	}
 	if e := ctx.Err(); e != nil {
 		return result, errors.New("cancelled")
@@ -368,7 +430,7 @@ func (m *Manager) CommitLoginCandidate(ctx context.Context, r LoginCommitRequest
 			return result, e
 		}
 		s, e := snapshot(before)
-		if e != nil || s.IdentityVersion != r.Expected.IdentityVersion || s.Principal != r.Expected.Principal || s.PolicyFingerprint != r.Expected.PolicyFingerprint || principal.Key() != s.Principal {
+		if e != nil || s != r.Expected || principal.Key() != s.Principal {
 			return result, errors.New("policy_changed")
 		}
 		name = s.Name
@@ -413,7 +475,7 @@ func (m *Manager) CommitLoginCandidate(ctx context.Context, r LoginCommitRequest
 	}
 	if r.Expected.AuthID != "" {
 		fresh, e := m.LoginSnapshot(r.Expected.AuthID)
-		if e != nil || fresh.PolicyFingerprint != r.Expected.PolicyFingerprint || fresh.IdentityVersion != r.Expected.IdentityVersion {
+		if e != nil || fresh != r.Expected {
 			return result, errors.New("policy_changed")
 		}
 	}
@@ -463,7 +525,7 @@ func (m *Manager) CommitLoginCandidate(ctx context.Context, r LoginCommitRequest
 	}
 	if r.Expected.AuthID != "" {
 		fresh, e := m.LoginSnapshot(r.Expected.AuthID)
-		if e != nil || fresh.PolicyFingerprint != r.Expected.PolicyFingerprint || fresh.IdentityVersion != r.Expected.IdentityVersion {
+		if e != nil || fresh != r.Expected {
 			return abort(errors.New("policy_changed"))
 		}
 	}
@@ -484,18 +546,8 @@ func (m *Manager) CommitLoginCandidate(ctx context.Context, r LoginCommitRequest
 	}
 	// Successful save means the official callback completed runtime upsert.
 	// Confirm physical material and public runtime presence as separate checks.
-	entries, e := m.entries()
-	if e != nil {
-		return result, errors.New("commit_unknown")
-	}
-	var actual *Auth
-	for _, entry := range entries {
-		if entry.Name == name {
-			actual, e = m.read(entry)
-			break
-		}
-	}
-	if e != nil || actual == nil || grant(actual) != grant(r.Candidate) {
+	actual, e := m.get(name)
+	if e != nil || actual.FileName != name || grant(actual) != grant(r.Candidate) || (r.Expected.AuthID != "" && (actual.ID != r.Expected.AuthID || actual.Index != r.Expected.AuthIndex)) {
 		return result, errors.New("commit_unknown")
 	}
 	wanted, e := canonicalJSON(data.Bytes())
@@ -530,6 +582,8 @@ func (m *Manager) CommitLoginCandidate(ctx context.Context, r LoginCommitRequest
 		return result, errors.New("commit_unknown")
 	}
 	result.AuthID = actual.ID
+	result.AuthIndex = actual.Index
+	result.Name = actual.FileName
 	result.IdentityVersion = s.IdentityVersion
 	result.State = "committed"
 	result.CredentialEnabled = !runtimeDisabled

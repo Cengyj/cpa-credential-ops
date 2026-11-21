@@ -26,7 +26,9 @@ type Owner struct {
 type Options struct {
 	Call            func(method string, request, response any) error
 	RuntimeManifest string
-	Prepare         func(context.Context, string, string) error
+	Prepare         func(context.Context, string, string, string) error
+	FinishWrite     func(authID, preparationID, identity, state string) error
+	PendingWrites   func() map[string]string
 	DefaultProxyURL string
 	Dir             string
 	Config          *codex.Config
@@ -102,9 +104,9 @@ func New(opts Options) (*Service, error) {
 	}()
 	if opts.Owner == nil {
 		opts.Owner = func() (Owner, error) {
-			return Owner{ID: "plugin", Valid: opts.Manager.Valid, Prepare: func(ctx context.Context, id, identity, _ string) error {
+			return Owner{ID: "plugin", Valid: opts.Manager.Valid, Prepare: func(ctx context.Context, id, identity, commitID string) error {
 				if opts.Prepare != nil {
-					return opts.Prepare(ctx, id, identity)
+					return opts.Prepare(ctx, id, identity, commitID)
 				}
 				return ctx.Err()
 			}}, nil
@@ -187,6 +189,10 @@ func New(opts Options) (*Service, error) {
 	}
 	s.wg.Add(1)
 	go s.monitor()
+	if opts.PendingWrites != nil && opts.FinishWrite != nil {
+		s.wg.Add(1)
+		go s.monitorCredentialReceipts()
+	}
 	initialized = true
 	return s, nil
 }
@@ -454,19 +460,17 @@ func (s *Service) start(r StartRequest, account *storedAccount) (Job, error) {
 		if expected.IdentityVersion != r.ExpectedIdentityVersion {
 			return Job{}, errors.New("identity_changed")
 		}
-		a, ok := s.opts.Manager.GetByID(r.TargetAuthID)
-		if !ok {
-			return Job{}, errors.New("identity_changed")
+		// Confirm the principal and file locator again before assigning a
+		// workspace to the login engine. A failed read is not an identity.
+		current, principal, plans, readErr := s.opts.Manager.LoginBinding(r.TargetAuthID)
+		if readErr != nil {
+			return Job{}, readErr
 		}
-		principal, principalErr := auth.LoginPrincipalFromAuth(a)
-		if principalErr != nil {
-			return Job{}, principalErr
-		}
-		if principal.Key() != expected.Principal {
+		if current != expected {
 			return Job{}, errors.New("identity_changed")
 		}
 		workspace = principal.AccountID
-		r.knownPlans = append(r.knownPlans, auth.LoginPlanTypes(a)...)
+		r.knownPlans = append(r.knownPlans, plans...)
 	}
 	if r.UseSavedCredentials {
 		r.Credentials, err = s.vault.read(r.TargetAuthID)
@@ -1001,7 +1005,7 @@ func (s *Service) Candidate(id string) (Candidate, error) {
 	if err != nil {
 		return Candidate{}, err
 	}
-	restrictions := []string{"not_inference_verified", "rules_stopped"}
+	restrictions := []string{"not_inference_verified", "credential_write_isolation"}
 	if j.expected.AuthID == "" {
 		restrictions = append(restrictions, "new_credential_disabled")
 	} else {
@@ -1158,14 +1162,23 @@ func (s *Service) beginCommitLocked(j *session) error {
 			}
 			return s.checkAutomaticExecution(j)
 		}
+		prepared := make(map[string]string)
 		result, err := s.opts.Manager.CommitLoginCandidate(commitCtx, auth.LoginCommitRequest{CommitID: id, Candidate: candidate, Expected: expected, EnableCredential: enableCredential, Guard: guard, Prepare: func(ctx context.Context, authID, identity string) error {
 			if replacing {
-				if err := owner.Prepare(ctx, previous.AuthID, previous.IdentityVersion, id); err != nil {
+				previousID := previousBindingPrefix + id
+				prepared[previous.AuthID] = previousID
+				if err := owner.Prepare(ctx, previous.AuthID, previous.IdentityVersion, previousID); err != nil {
 					return err
 				}
 			}
+			prepared[authID] = id
 			return owner.Prepare(ctx, authID, identity, id)
 		}})
+		for authID, preparationID := range prepared {
+			if finishErr := s.finishCredentialWrite(authID, preparationID, result); finishErr != nil && err == nil {
+				err = errors.New("quality_reconciliation_pending")
+			}
+		}
 		status := result.State
 		excluded := err != nil && err.Error() == "cpa_plan_excluded" && (status == "aborted" || status == "upload_excluded")
 		if status == "" {

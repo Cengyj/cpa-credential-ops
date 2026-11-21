@@ -12,27 +12,33 @@ import (
 
 // changeSet publishes a state transition only after all of its records are durable.
 type changeSet struct {
-	settings           *Config
-	disposition        *CredentialDisposition
-	dispositions       []*CredentialDisposition
-	timers             map[string]bool
-	rules              map[string]*Rule
-	runs               map[string]*Run
-	audits             []Audit
-	intent             *Action
-	loginPreparationID string
-	loginPreparation   []byte
+	hostInput    *Config
+	settings     *Config
+	disposition  *CredentialDisposition
+	dispositions []*CredentialDisposition
+	timers       map[string]bool
+	rules        map[string]*Rule
+	runs         map[string]*Run
+	audits       []Audit
+	intent       *Action
+	loginHold    *credentialLoginHold
 }
 
 func changes() *changeSet { return &changeSet{rules: map[string]*Rule{}, runs: map[string]*Run{}} }
 func (en *Engine) commitLocked(c *changeSet) error {
-	if len(c.rules) == 0 && len(c.runs) == 0 && len(c.audits) == 0 && c.settings == nil && c.timers == nil && c.intent == nil && c.loginPreparationID == "" && c.disposition == nil && len(c.dispositions) == 0 {
+	en.cancelRevokedSchedulesLocked(c)
+	if len(c.rules) == 0 && len(c.runs) == 0 && len(c.audits) == 0 && c.settings == nil && c.timers == nil && c.intent == nil && c.loginHold == nil && c.disposition == nil && len(c.dispositions) == 0 {
 		return nil
 	}
 	if c.disposition != nil {
 		c.dispositions = append(c.dispositions, c.disposition)
 	}
 	err := en.store.Write(func(tx *bolt.Tx) error {
+		if c.hostInput != nil {
+			if err := putQualityHostInput(tx, *c.hostInput); err != nil {
+				return err
+			}
+		}
 		if c.settings != nil {
 			if err := put(tx, "meta", "settings", c.settings); err != nil {
 				return err
@@ -48,8 +54,8 @@ func (en *Engine) commitLocked(c *changeSet) error {
 				return err
 			}
 		}
-		if c.loginPreparationID != "" {
-			if err := tx.Bucket([]byte("meta")).Put([]byte("login-prepare:"+c.loginPreparationID), c.loginPreparation); err != nil {
+		if c.loginHold != nil {
+			if err := put(tx, "meta", loginHoldPrefix+c.loginHold.AuthID, c.loginHold); err != nil {
 				return err
 			}
 		}
@@ -80,8 +86,19 @@ func (en *Engine) commitLocked(c *changeSet) error {
 		}
 		return en.fault
 	}
+	if en.schedulesRevokedLocked(c) {
+		en.scheduleGeneration++
+	}
 	if c.timers != nil {
 		en.timers = c.timers
+	}
+	if hold := c.loginHold; hold != nil {
+		if en.loginHolds == nil {
+			en.loginHolds = make(map[string]*credentialLoginHold)
+		}
+		en.loginGeneration++
+		hold.generation = en.loginGeneration
+		en.loginHolds[hold.AuthID] = hold
 	}
 	for _, d := range c.dispositions {
 		if en.managed == nil {
@@ -117,6 +134,56 @@ func (en *Engine) commitLocked(c *changeSet) error {
 	return nil
 }
 
+func (en *Engine) schedulesRevokedLocked(c *changeSet) bool {
+	if c.settings == nil || c.settings.SchedulingEnabled {
+		return false
+	}
+	if en.cfg.SchedulingEnabled {
+		return true
+	}
+	if c.timers != nil {
+		for id, allowed := range en.timers {
+			if allowed && !c.timers[id] {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// Revocation and task cancellation share the same durable transaction. A later
+// restart of scheduling cannot revive work admitted under the old permission.
+func (en *Engine) cancelRevokedSchedulesLocked(c *changeSet) {
+	if c.settings == nil && c.timers == nil {
+		return
+	}
+	global, timers := en.cfg.SchedulingEnabled, en.timers
+	if c.settings != nil {
+		global = c.settings.SchedulingEnabled
+	}
+	if c.timers != nil {
+		timers = c.timers
+	}
+	for id, old := range en.runs {
+		if next := c.runs[id]; next != nil {
+			old = next
+		}
+		if !old.Config.Scheduled || old.Config.RuleID == "" || old.CancelRequested || old.Status != "queued" && old.Status != "running" {
+			continue
+		}
+		rule := en.rules[old.Config.RuleID]
+		if next := c.rules[old.Config.RuleID]; next != nil {
+			rule = next
+		}
+		if rule != nil && rule.SchedulingEnabled && (global || timers[rule.ID]) {
+			continue
+		}
+		next := en.cancelledRunLocked(old, "blocked")
+		next.BlockReason = "scheduling_disabled"
+		c.runs[id] = next
+	}
+}
+
 func (en *Engine) mutableLocked() error {
 	if en.closed || en.fault != nil {
 		return fmt.Errorf("unavailable: plugin is stopping or persistence failed")
@@ -135,7 +202,12 @@ func ruleStatus(r *Rule) string {
 	}
 	return "paused"
 }
-func resetRule(r *Rule) { r.FailCount = 0; r.EvidenceSignature = ""; r.NextRun = time.Time{} }
+func resetRule(r *Rule) {
+	r.FailCount = 0
+	r.EvidenceSignature = ""
+	r.NextRun = time.Time{}
+	r.PendingSchedule = nil
+}
 func dependencies(c RunConfig) []string {
 	ids := []string{c.AuthID}
 	if c.ControlAuthID != "" {
@@ -179,6 +251,13 @@ func (en *Engine) checkTargetsLocked(c RunConfig, targets []Target) error {
 	return en.checkTargetsForRunLocked(c, targets, false)
 }
 func (en *Engine) checkTargetsForRunLocked(c RunConfig, targets []Target, ruleProbe bool) error {
+	if hold := en.loginWaitLocked(c); hold != nil {
+		code, reason := hold.reason()
+		return rejectScope("blocked: "+reason, code, reason)
+	}
+	return en.checkTargetPoliciesLocked(c, targets, ruleProbe)
+}
+func (en *Engine) checkTargetPoliciesLocked(c RunConfig, targets []Target, ruleProbe bool) error {
 	if en.fault != nil {
 		return fmt.Errorf("unavailable: persistent state requires operator attention")
 	}
@@ -198,6 +277,9 @@ func (en *Engine) checkTargetsForRunLocked(c RunConfig, targets []Target, rulePr
 		}
 		if found.QualityPaused || found.RetainedPause {
 			return fmt.Errorf("blocked: credential quality pause awaits manual release")
+		}
+		if groupTargetBlocked(en.managed, *found) {
+			return fmt.Errorf("blocked: provider group has unresolved credential handling")
 		}
 		if ruleProbe && id == c.AuthID {
 			if !ruleSubjectEnabled(*found) {
@@ -271,30 +353,48 @@ func (en *Engine) cancelledRunLocked(old *Run, queuedStatus string) *Run {
 	return r
 }
 
+func (en *Engine) executionTargets(ctx context.Context, f Frozen) ([]Target, error) {
+	if host, ok := en.host.(interface {
+		pinnedTarget(context.Context, string, string) (Target, error)
+	}); ok && f.ScopeBatchID != "" && f.Judge.Mode != "llm" && f.ControlAuthID == "" {
+		en.mu.Lock()
+		peer := en.rules[f.RuleID].expandedProviderPeer(f.AuthID)
+		en.mu.Unlock()
+		if !peer {
+			t, err := host.pinnedTarget(ctx, f.AuthID, f.SubjectIndex)
+			return []Target{t}, err
+		}
+	}
+	// The original route must remain in the current directory for an expanded member.
+	return en.host.Targets(ctx)
+}
+
 // checkExecution repeats admission after queue waits and before each subject, control, or judge call.
 func (en *Engine) checkExecution(ctx context.Context, runID string, f Frozen) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	var targets []Target
-	en.mu.Lock()
-	manualSubject, err := en.frozenDispositionLocked(f)
-	ctx = en.runInventoryContextLocked(ctx, manualSubject)
-	en.mu.Unlock()
-	if err != nil {
-		return err
-	}
-	if host, ok := en.host.(interface {
-		pinnedTarget(context.Context, string, string) (Target, error)
-	}); ok && f.ScopeBatchID != "" && f.Judge.Mode != "llm" && f.ControlAuthID == "" {
-		var t Target
-		t, err = host.pinnedTarget(ctx, f.AuthID, f.SubjectIndex)
-		targets = []Target{t}
-	} else {
-		targets, err = en.host.Targets(ctx)
-	}
+	targets, err := en.executionTargets(ctx, f)
 	if err != nil {
 		return fmt.Errorf("unavailable: credential status cannot be verified")
+	}
+	if f.RuleID == "" && (f.SubjectIndex != "" || f.ExpectedObjectType != "") {
+		kind := f.ExpectedObjectType
+		if kind == "" && (f.ProviderName != "" || f.ProviderObservation) {
+			kind = objectProvider
+		}
+		if err := f.verifyManualSubject(targets, kind, f.SubjectIndex); err != nil {
+			return err
+		}
+	}
+	en.mu.Lock()
+	stateErr := currentTargetError(en.reconcileCurrentTargetsLocked(ctx, targets, dependencies(f.RunConfig)), dependencies(f.RunConfig))
+	if stateErr == nil {
+		stateErr = en.frozenDispositionLocked(f)
+	}
+	en.mu.Unlock()
+	if stateErr != nil {
+		return stateErr
 	}
 	if f.RuleID != "" {
 		// Check the current target kind before reading any file credential state.
@@ -314,14 +414,14 @@ func (en *Engine) checkExecution(ctx context.Context, runID string, f Frozen) er
 	}
 	if expected := f.ManagedProbe; expected != nil {
 		en.mu.Lock()
-		_, err = en.frozenDispositionLocked(f)
+		err = en.frozenDispositionLocked(f)
 		en.mu.Unlock()
 		if err != nil {
 			return err
 		}
 		h, ok := en.host.(managedHost)
 		if !ok || !en.Capabilities().ManagementSession {
-			return fmt.Errorf("management_session_required: reconnect the authenticated plugin panel")
+			return fmt.Errorf("management_session_required: background management connection is not ready")
 		}
 		current, err := h.CredentialSnapshot(ctx, expected.AuthID, expected.AuthIndex)
 		if err != nil || !sameSnapshot(current, *expected) {
@@ -337,13 +437,15 @@ func (en *Engine) checkExecution(ctx context.Context, runID string, f Frozen) er
 	if r == nil || r.Status != "running" || r.CancelRequested {
 		return fmt.Errorf("blocked: task is no longer admitted")
 	}
-	manualSubject, err = en.frozenDispositionLocked(f)
-	if err != nil {
+	if err := en.frozenDispositionLocked(f); err != nil {
 		return err
 	}
-	manualAccount, err := en.verifyManualSubjectLocked(ctx, f.RunConfig, targets, manualSubject)
-	if err != nil {
-		return err
+	var manualAccount string
+	if f.RuleID == "" && f.ManualAccountFingerprint != "" && f.ManualPolicyActionID == "" {
+		manualAccount, err = en.currentManualAccountLocked(ctx, f.RunConfig, targets)
+		if err != nil {
+			return err
+		}
 	}
 	if manualAccount != f.ManualAccountFingerprint {
 		return fmt.Errorf("blocked: 测试提交后 CPA 凭证绑定的账号已变化，请重新核对。")
@@ -357,7 +459,10 @@ func (en *Engine) checkExecution(ctx context.Context, runID string, f Frozen) er
 			return problem
 		}
 		for _, t := range targets {
-			if usesCredential(f.RunConfig, t.AuthID) && groupGuard(en.managed, t) != nil && !activeDisposition(en.managed[t.AuthID]) {
+			if f.CatalogMissingModel != "" && t.AuthID == f.AuthID && firstMissingModel(t, []string{f.CatalogMissingModel}) == "" {
+				return fmt.Errorf("blocked: CPA 当前目录已不能证实本轮所记录的模型缺项")
+			}
+			if usesCredential(f.RunConfig, t.AuthID) && groupTargetBlocked(en.managed, t) && !activeDisposition(en.managed[t.AuthID]) {
 				return fmt.Errorf("blocked: provider group membership changed")
 			}
 		}

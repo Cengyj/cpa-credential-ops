@@ -34,7 +34,7 @@ async function main() {
       { action_id: 'known', auth_id: 'a', state: 'disabled', upstream_condition: 'unauthorized' },
       { action_id: 'removed', auth_id: 'b', state: 'deleted', upstream_condition: 'payment_required' },
       { action_id: 'attention', auth_id: 'c', state: 'attention', upstream_condition: 'quota_exhausted' },
-      ...['route-one','route-two'].map(auth_id => ({ action_id:'group-action', auth_id, state:'disabled', upstream_condition:'unauthorized' })),
+      ...['route-one','route-two'].map(auth_id => ({ action_id:'group-action', auth_id, state:'attention', upstream_condition:'unauthorized' })),
     ];
     const runs = [...codes, 'rate_limit', 'management_401'].map((code, index) => {
       const condition = codes.includes(code) ? { upstream_condition: code } : {};
@@ -58,7 +58,22 @@ async function main() {
       skip_detail: { auth_id: record.auth_id, email: record.auth_id + '@example.test', code: 'error_policy_disabled',
         ...(record.catalog_missing_model ? { model: record.catalog_missing_model } : {}),
         reason: causes[i] + '，凭证已按错误策略停用。停用期间跳过检测，不会自动恢复。' } }));
-    const records = [...runs, ...skipped];
+    const providerRule = { ...recovery, id: 'provider-rule', name: '供应商答错暂停与恢复', revision: 7, object_types: ['provider'] };
+    rules.push(providerRule);
+    const providerRun = { id: 'provider-correct', created_at: runs[0].created_at, source: 'scheduled_probe', status: 'completed', action_status: 'observe_only',
+      config: { ...runs[0].config, rule_id: providerRule.id, rule_revision: 7, auth_id: 'synthetic-provider', provider: 'codex',
+        provider_name: 'Synthetic provider', subject_auth_index: 'synthetic-route', provider_observation: true,
+        managed_probe: { provider_mechanism: 'excluded_models' } },
+      samples: [{ model: 'fixture-reasoner', index: 0, execution_status: 'completed', quality_verdict: 'correct', output: '21', evidence: { path: 'provider_config_probe' } }] };
+    const providerCases = [
+      [providerRun, '本轮未处置'],
+      [{ ...providerRun, id: 'provider-skipped', status: 'skipped', samples: [], skip_detail: { code: 'provider_unavailable', reason: 'Synthetic route unavailable' } }, '本轮未执行，未处置'],
+      [{ ...providerRun, id: 'provider-legacy-skipped', status: 'skipped', action_status: undefined, samples: [], skip_detail: { code: 'error_policy_disabled', reason: 'Synthetic previous upstream error' } }, '保持暂停，本轮未改写'],
+      [{ ...providerRun, id: 'provider-suspended', action_status: 'credential_suspended', credential_action: 'disable_credential' }, '已暂停'],
+      [{ ...providerRun, id: 'provider-restored', action_status: 'credential_restored', credential_action: 'restore_credential' }, '整轮通过，已恢复'],
+      [{ ...providerRun, id: 'provider-uncertain', action_status: 'credential_action_uncertain', credential_action: 'restore_credential' }, '恢复结果待核对'],
+    ];
+    const records = [...runs, ...skipped, ...providerCases.map(([run]) => run)];
     let settingsGate, capability = 'supported', emptyRules = true;
     await page.route('**/*', async route => {
       const req = route.request(), u = new URL(req.url()); assert.equal(u.origin, origin);
@@ -93,10 +108,9 @@ async function main() {
         const data = req.postDataJSON();
         assert.equal(data.rule_id, 'new');
         assert.equal(data.action_id, 'group-action');
-        assert(['route-one','route-two'].includes(data.auth_id));
+        assert.equal(data.auth_id, 'route-two', 'A shared group action must retain the clicked member identity');
         const rule = rules.find(rule => rule.id === data.rule_id);
         rule.handling = rule.handling.filter(record => record.action_id !== data.action_id);
-        rule.enabled = false;
         acknowledgements.push(data);
         return route.fulfill({ json:{ok:true} });
       }
@@ -135,10 +149,10 @@ async function main() {
     }
     assert(await wrong('observe_only').isChecked()); assert(await el('#rule-auto-restore').isDisabled());
     await wrong('disable_credential').check(); await el('#rule-auto-restore').check();
-    await wrong('observe_only').check(); assert(await el('#rule-restore-option').isHidden());
     await page.selectOption('#rule-judge-mode', 'manual'); await page.click('#rule-form button[type=submit]');
     await el('#rule-judge-mode-error').waitFor(); assert.equal(writes.length, 0);
-    await page.selectOption('#rule-judge-mode', 'deterministic');
+    await wrong('observe_only').check(); assert(await el('#rule-restore-option').isHidden());
+    assert.match(await el('#rule-upstream-note').innerText(), /上游错误独立于答错处理/);
     for (const [width, height, theme] of [[1440, 900, 'light'], [1280, 620, 'white'], [390, 844, 'dark'], [320, 710, 'light']]) {
       await page.setViewportSize({ width, height });
       await page.evaluate(theme => { document.documentElement.dataset.theme = theme; }, theme);
@@ -151,6 +165,7 @@ async function main() {
     }
     await save();
     assert.deepEqual(writes[0].upstream_error_actions, defaultActions); assert.equal(writes[0].action, 'observe_only'); assert.equal(writes[0].auto_restore, false);
+    assert.equal(writes[0].judge.mode, 'manual');
     assert.equal(writes[0].activation, 'keep'); assert.equal(rules.find(rule => rule.id === 'new').timer_active, false);
     await page.setViewportSize({ width: 1440, height: 900 });
     await page.click('[data-rule-edit=new]');
@@ -174,18 +189,17 @@ async function main() {
     const handlingDetails = el('#ops-rule-context details[data-rule-handling]');
     await handlingDetails.locator('summary').click();
     const resolved = handlingDetails.locator('.quality-handling-records > div').first();
-    assert.match(await resolved.innerText(), /401 认证失败.*已按错误规则暂停，退出后续检测/);
+    assert.match(await resolved.innerText(), /401 认证失败.*已按错误规则停用，退出答题和恢复复检/);
+    assert.match(await resolved.innerText(), /正常状态读取会自动结束旧关联/);
     assert(await handlingDetails.locator('[data-handling-ack=known]').isHidden()); assert(await handlingDetails.locator('[data-handling-ack=removed]').isHidden());
     assert(await handlingDetails.locator('[data-handling-ack=attention]').isVisible());
-    await resolved.locator('summary').click(); assert(await handlingDetails.locator('[data-handling-ack=known]').isVisible());
-    await resolved.locator('summary').click();
     const member = handlingDetails.locator('.quality-handling-records > div').filter({ hasText:'route-two' });
-    await member.locator('summary').click();
     await member.locator('[data-handling-ack]').click(); await el('#action-cancel').click();
     assert.deepEqual(acknowledgements, []);
     await member.locator('[data-handling-ack]').click(); await el('#action-confirm').click();
     await el('#action-dialog').waitFor({state:'hidden'});
     assert.equal(acknowledgements.length, 1);
+    assert.equal(rules.find(rule => rule.id === 'new').enabled, true);
     await member.waitFor({state:'detached'});
     assert.equal(await handlingDetails.locator('[data-handling-ack="group-action"]').count(), 0);
     await el('#ops-all-rules').click(); assert(await handlingDetails.isHidden());
@@ -204,6 +218,26 @@ async function main() {
       assert.equal(exported.upstream_condition, run.upstream_condition); assert.equal(exported.samples[0].upstream_condition, run.samples[0].upstream_condition);
       receipts.push({ id: run.id, action: exported.action_status, condition: exported.upstream_condition, verdict: exported.samples[0].quality_verdict });
       if (i === 0) await shots('upstream-detail');
+      await page.keyboard.press('Escape');
+    }
+    const providerHandling = [];
+    assert.equal(await el('#operations-history').getByRole('columnheader', { name: '对象与规则', exact: true }).count(), 1);
+    assert.equal(await el('#operations-history').getByRole('columnheader', { name: '本轮处置', exact: true }).count(), 1);
+    for (const [run, label] of providerCases) {
+      const row = el('[data-key="run:' + run.id + '"]');
+      assert.equal(await row.locator('.quality-handling-cell').getAttribute('data-label'), '本轮处置');
+      assert.equal(await row.locator('[data-handling]').innerText(), label);
+      assert.doesNotMatch(await row.innerText(), /供应商仅观察/);
+      await row.locator('[data-run]').click();
+      const facts = el('#quality-detail-content .quality-detail-facts');
+      await facts.locator('dt').getByText('本轮处置', { exact: true }).waitFor();
+      await facts.getByText(label, { exact: true }).waitFor();
+      assert.doesNotMatch(await facts.innerText(), /供应商仅观察/);
+      if (run.id === 'provider-correct') {
+        assert.match(await facts.innerText(), /正确/);
+        await shots('provider-correct-no-action');
+      }
+      providerHandling.push({ id: run.id, action_status: run.action_status, label });
       await page.keyboard.press('Escape');
     }
     await page.click('[data-rule-run=recovery]');
@@ -250,8 +284,23 @@ async function main() {
       }
       await save(); assert.deepEqual(writes.at(-1).upstream_error_actions, neutral);
     }
-    assert.equal(writes.length, 7); assert.deepEqual(errors, []);
-    if (out) await fs.writeFile(path.join(out, 'upstream-ui.json'), JSON.stringify({ layouts, saved: writes, acknowledgements, results: receipts, allPreview, enabledPreview, skipEvidence, real_writes: 0 }, null, 2) + '\n');
+    assert.equal(writes.length, 7);
+    capability = 'supported'; await refresh();
+    for (const question of ['custom', 'visual-pelican-html']) {
+      await page.click('[data-rule-edit=new]'); await el('#rule-question').selectOption(question);
+      assert.equal(await el('#rule-judge-mode').inputValue(), 'manual');
+      assert(await el('#rule-auto-restore').isDisabled());
+      if (question === 'custom') await el('#rule-prompt').fill('Explain the synthetic fixture response.');
+      for (const code of codes) await picker(code).selectOption('disable_credential');
+      await save();
+      assert.equal(writes.at(-1).question_id, question);
+      assert.equal(writes.at(-1).judge.mode, 'manual');
+      assert.equal(writes.at(-1).action, 'observe_only');
+      assert.deepEqual(writes.at(-1).upstream_error_actions, defaultActions);
+      assert.equal(writes.at(-1).auto_restore, false);
+    }
+    assert.equal(writes.length, 9); assert.deepEqual(errors, []);
+    if (out) await fs.writeFile(path.join(out, 'upstream-ui.json'), JSON.stringify({ layouts, saved: writes, acknowledgements, results: receipts, providerHandling, allPreview, enabledPreview, skipEvidence, real_writes: 0 }, null, 2) + '\n');
     console.log('Upstream condition selects, round trips, scoped recovery, evidence, acknowledgement visibility and exports passed.');
   } finally { await browser?.close(); fixture.kill(); await exit; }
 }

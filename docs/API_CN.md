@@ -1,4 +1,14 @@
+> 官方插件新增 `GET /connection`、`PUT /connection` 和 `DELETE /connection`，前缀均为 `/v0/management/plugins/model-quality`。请求字段、配置修订、回执及错误码见[后台连接和恢复](BACKGROUND_CONNECTION_CN.md)。
+>
 > 当前官方 CPA：`GET /v0/management/plugins/model-quality/rules/question-preview?id=logic-candy` 在管理鉴权后只读返回固定题的 ID、版本、题面和参考答案；未知、随机、自定义或视觉题返回 404。一般 `/questions` 列表仍不含参考答案。规则范围、Cron、保留条数及官方能力限制以[质量观察说明](QUALITY_SCOPE_CN.md)为准；下文 v8 业务路由表是早期补丁宿主的历史记录。
+>
+> 官方接口 `GET /v0/management/plugins/model-quality/runs?view=summary` 按运行 ID 返回摘要。同一对象的不同轮次各占一条。`config.subject_auth_index` 和 `config.provider_name` 分别按当轮保存的值返回。准入跳过的原因在 `skip_detail` 中，目录预检见 `preflight_detail`，已申请取消的轮次返回 `cancel_requested: true`。
+>
+> 手动提交 `POST /v0/management/plugins/model-quality/runs` 可附 `expected_object_type`（`oauth` 或 `provider`）及 `expected_auth_index`。插件用服务端读到的 CPA 对象核对这些前置条件，类型或索引变化返回 409。旧客户端可省略这两个字段。同一幂等键和相同请求可再次取得原运行回执。规则用自己的固定对象绑定。
+>
+> 新建或明确改选固定规则时，可在规则保存或范围预览请求提供 `expected_target_object_type`，并提供 `auth_id`、`provider` 和 `target_auth_index`。来源或定位发生变化返回 409。服务器在读取当前目录后记录已核实的 `target_object_type`。老客户端省略预期来源时，以服务端受理时的目录为准。
+>
+> 摘要仅投影已记录的三种 `samples[].evidence.path` 值，即 `provider_config_probe`、`provider_native_probe` 和 `cpa_management_probe`。未保存或未识别的路径省略。样本执行状态、错误与答案判定分别保留。完整冻结配置和原始样本见鉴权接口 `GET /v0/management/plugins/model-quality/runs/detail?id=运行ID`。
 >
 > 0.15.0 新增鉴权账号安全操作和本地完成接口，见 [重置 2FA 与退出设备](OPENAI_ACCOUNT_SECURITY_CN.md)。
 
@@ -55,6 +65,8 @@
 每模型 samples为1..8，总数还受 max_samples 限制；模型数、temperature、reasoning_effort、输出预算均服务端检查。custom 题可提供 prompt、review_standard，二者共同冻结；不得改内建题面后继承原答案。视觉/自定义题默认没有确定性 oracle。
 
 直接提交人工评阅任务（`judge.mode=manual` 或不指定 `judge.mode`）时，若 `parameters.max_tokens` 缺省或为零，服务端冻结 `min(2048, max_output_tokens)`；非手动模式原有默认值 1024 不变。省略 `temperature` 不等于传入 0。显式 token 预算超出上限仍会被拒绝；规则、旧记录和显式同配置重跑不改写已有参数。
+
+原生模型流式回调按解码后的 UTF-8 正文字节执行 `max_response_bytes` 限制。每个响应帧和整条流另设有限的接收额度，覆盖 JSON 包装及 SSE 元数据。回答超限、响应帧超限、累计传输超限均保留此前收到的正文并报告各自原因。上游明确返回 `finish_reason=length` 时，样本状态为 `incomplete`。
 
 可选 control_auth_id/control_provider 与 seed 用于随机题有效对照。judge mode为 deterministic/manual/llm；LLM 需要独立 auth_id/provider/model。任何依赖被质量暂停都会阻止整个运行。答案仅提供给独立 judge，不发送给被测模型。
 

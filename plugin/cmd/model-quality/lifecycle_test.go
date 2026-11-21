@@ -14,6 +14,8 @@ type testRuntimeEngine struct {
 	closed atomic.Int32
 }
 
+func (*testRuntimeEngine) ReconfigureQuality(quality.Config) error { return nil }
+
 func (e *testRuntimeEngine) Close() error {
 	e.closed.Add(1)
 	return nil
@@ -140,4 +142,24 @@ func TestFailedRuntimeReplacementLeavesNoClosedInstancePublished(t *testing.T) {
 	if _, _, err := r.acquire(); err == nil || engine.closed.Load() != 1 {
 		t.Fatal("failed replacement retained old engine")
 	}
+}
+
+func TestOrdinaryQualityReloadReusesBackgroundServices(t *testing.T) {
+	var r engineRuntime
+	settings := runtimeConfig{settings: quality.DefaultConfig()}
+	app := &testRuntimeEngine{}
+	starts := 0
+	create := func() (runtimeEngine, error) { starts++; return app, nil }
+	if err := r.configure(settings, false, create); err != nil {
+		t.Fatal(err)
+	}
+	defer r.close()
+	settings.settings.DailyCalls++
+	if err := r.configure(settings, true, create); err != nil {
+		t.Fatal(err)
+	}
+	if starts != 1 || app.closed.Load() != 0 {
+		t.Fatalf("changing budget recreated background services: starts=%d closes=%d", starts, app.closed.Load())
+	}
+	t.Logf("startup + budget change: starts=%d closes=%d", starts, app.closed.Load())
 }

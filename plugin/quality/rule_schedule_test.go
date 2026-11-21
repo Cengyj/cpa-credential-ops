@@ -3,7 +3,9 @@ package quality
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -14,14 +16,19 @@ import (
 
 type scheduledDirectoryHost struct {
 	*observationHost
-	readErr error
+	mu          sync.Mutex
+	readErr     error
+	failedReads int
 }
 
-func (h *scheduledDirectoryHost) Targets(ctx context.Context) ([]Target, error) {
+func (h *scheduledDirectoryHost) Targets(context.Context) ([]Target, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	if h.readErr != nil {
+		h.failedReads++
 		return nil, h.readErr
 	}
-	return h.observationHost.Targets(ctx)
+	return slices.Clone(h.targets), nil
 }
 
 func TestBackgroundTimerRematchesAfterUnavailableAndEmptyDirectory(t *testing.T) {
@@ -58,22 +65,44 @@ func TestBackgroundTimerRematchesAfterUnavailableAndEmptyDirectory(t *testing.T)
 		if first.LastScopeBatch == "" || host.executeCalls != 1 {
 			t.Fatal("first scheduled run did not reach its target", first, host.executeCalls)
 		}
-		host.readErr = errors.New("synthetic private directory contents")
-		failed := nextRound()
-		if !failed.LastScopeDispatch.DirectoryUnavailable || failed.LastScopeBatch != first.LastScopeBatch || !strings.Contains(failed.LastScopeDispatch.Reason, "目录尚未读到") || len(en.Runs()) != 1 || host.executeCalls != 1 {
+		unavailable := errors.New("synthetic private directory contents")
+		host.mu.Lock()
+		host.readErr = unavailable
+		host.mu.Unlock()
+		due := en.Rules()[0].NextRun
+		time.Sleep(time.Until(due) + time.Second)
+		synctest.Wait()
+		failed := en.Rules()[0]
+		if !failed.NextRun.Equal(due) || !failed.timerActive {
+			t.Fatal("directory failure consumed the pending timer")
+		}
+		if failed.LastScopeDispatch.DirectoryUnavailable || failed.LastScopeBatch != first.LastScopeBatch || !strings.Contains(failed.timerWaitReason, "目录尚未读到") || len(en.Runs()) != 1 || host.executeCalls != 1 {
 			t.Fatal("directory failure lost its receipt or changed an earlier run", failed.LastScopeDispatch)
 		}
 		var persisted Rule
-		if err := en.store.Get("rules", rule.ID, &persisted); err != nil || persisted.LastScopeDispatch == nil || !persisted.LastScopeDispatch.DirectoryUnavailable || persisted.LastScopeDispatch.Reason != failed.LastScopeDispatch.Reason || strings.Contains(persisted.LastScopeDispatch.Reason, host.readErr.Error()) {
-			t.Fatal("directory failure must persist a display-safe reason", persisted.LastScopeDispatch, err)
+		if err := en.store.Get("rules", rule.ID, &persisted); err != nil || persisted.LastScopeDispatch == nil || !persisted.LastScopeDispatch.At.Equal(first.LastScopeDispatch.At) || strings.Contains(failed.timerWaitReason, unavailable.Error()) {
+			t.Fatal("directory outage replaced an admitted dispatch or exposed a raw error", persisted.LastScopeDispatch, err)
 		}
+		host.mu.Lock()
 		host.readErr = nil
 		host.targets[0].ManualDisabled = true
-		empty := nextRound()
+		failedReads := host.failedReads
+		host.mu.Unlock()
+		if failedReads != 1 {
+			t.Fatalf("duplicate directory read before the first retry deadline: %d", failedReads)
+		}
+		time.Sleep(4 * time.Second)
+		synctest.Wait()
+		empty := en.Rules()[0]
+		if !empty.NextRun.After(due) {
+			t.Fatal("fresh empty directory did not complete the overdue cycle")
+		}
 		if empty.LastScopeDispatch.DirectoryUnavailable || empty.LastScopeDispatch.Matched != 0 || !strings.Contains(empty.LastScopeDispatch.Reason, "没有可纳入") || len(en.Runs()) != 1 {
 			t.Fatal("unexpected evidence for empty scope", empty.LastScopeDispatch)
 		}
+		host.mu.Lock()
 		host.targets = append(host.targets, scopedTarget("added-after-timer-start", "a"))
+		host.mu.Unlock()
 		last := nextRound()
 		var found bool
 		for _, run := range en.Runs() {

@@ -43,7 +43,7 @@ func TestOfficialCredentialLoginPreparationPreservesRetainedPause(t *testing.T) 
 				t.Fatal("rejected preparation changed retained rule or evidence")
 			}
 			if err := en.store.db.View(func(tx *bolt.Tx) error {
-				if tx.Bucket([]byte("meta")).Get([]byte("login-prepare:retained-pause-preparation")) != nil {
+				if tx.Bucket([]byte("meta")).Get([]byte(loginHoldPrefix+authID)) != nil {
 					t.Fatal("rejected preparation persisted a ready marker")
 				}
 				return nil
@@ -72,6 +72,7 @@ func TestCredentialLoginPreparationStopsDependenciesAndWaitsForWorkers(t *testin
 	paused.ActionID = "owned-pause"
 	paused.BlockedAuthID = rule.AuthID
 	paused.Status = "awaiting_release"
+	paused.Enabled = false
 	en.rules[paused.ID] = paused
 	run := semanticRound(en, rule, "incorrect")
 	run.Status = "running"
@@ -99,16 +100,16 @@ func TestCredentialLoginPreparationStopsDependenciesAndWaitsForWorkers(t *testin
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
-	for _, r := range []*Rule{rule, secondary, paused} {
+	for _, r := range []*Rule{rule, secondary} {
 		current := en.rules[r.ID]
-		if current.Enabled || current.FailCount != 0 || current.EvidenceSignature != "" || !current.NextRun.IsZero() {
+		if !current.Enabled || current.FailCount != 0 || current.EvidenceSignature != "" {
 			t.Fatalf("dependent rule not reset: %s", r.ID)
 		}
 	}
-	if en.rules[rule.ID].Status != "paused" || en.rules[secondary.ID].Status != "paused" {
-		t.Fatal("ordinary login invented a quality pause")
+	if en.ruleForDisplayLocked(en.rules[rule.ID]).Status != "credential_update_pending" || en.ruleForDisplayLocked(secondary).Status != "credential_update_pending" {
+		t.Fatal("temporary hold was not visible independently of enabled intent")
 	}
-	if en.rules[paused.ID].ActionID != "owned-pause" || en.rules[paused.ID].Status != "awaiting_release" {
+	if en.rules[paused.ID].ActionID != "owned-pause" || en.rules[paused.ID].Status != "awaiting_release" || en.rules[paused.ID].Enabled {
 		t.Fatal("existing quality ownership changed")
 	}
 	revision := en.rules[rule.ID].Revision

@@ -12,8 +12,7 @@ import (
 )
 
 type Store struct {
-	db       *bolt.DB
-	migrated bool
+	db *bolt.DB
 }
 
 var buckets = []string{"meta", "runs", "rules", "audit", "usage", "idempotency", "presets"}
@@ -42,7 +41,6 @@ func OpenStore(dir string, _ int64) (*Store, error) {
 			if err := migrateManualOnly(tx); err != nil {
 				return err
 			}
-			s.migrated = true
 		}
 		return b.Put([]byte("schema"), []byte("2"))
 	})

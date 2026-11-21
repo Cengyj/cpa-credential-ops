@@ -11,41 +11,46 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
-	bolt "go.etcd.io/bbolt"
 )
 
 type Engine struct {
-	managed        map[string]*CredentialDisposition
-	mu             sync.Mutex
-	store          *Store
-	host           Host
-	cfg            Config
-	runs           map[string]*Run
-	rules          map[string]*Rule
-	timers         map[string]bool
-	active         map[string]context.CancelFunc
-	busyAuth       map[string]struct{}
-	queue          chan string
-	scopeBatches   map[string][]string
-	finishedRules  map[string]bool
-	roundRemaining map[string]int
-	roundEnded     chan struct{}
-	scanning       map[string]bool
-	snapshotSlots  chan struct{}
-	events         chan UsageEvent
-	dropped        atomic.Uint64
-	ctx            context.Context
-	cancel         context.CancelFunc
-	wg             sync.WaitGroup
-	closed         bool
-	closeDone      chan struct{}
-	closeErr       error
-	queueChanged   chan struct{}
-	fault          error
-	now            func() time.Time
-	budget         Budget
-	budgetPending  map[string]int
+	loginHolds      map[string]*credentialLoginHold
+	loginGeneration uint64
+	managed         map[string]*CredentialDisposition
+	mu              sync.Mutex
+	store           *Store
+	host            Host
+	cfg             Config
+	runs            map[string]*Run
+	rules           map[string]*Rule
+	timers          map[string]bool
+	active          map[string]context.CancelFunc
+	busyAuth        map[string]struct{}
+	queue           chan string
+	scopeBatches    map[string][]string
+	finishedRules   map[string]bool
+	roundRemaining  map[string]int
+	roundEnded      chan struct{}
+	scanning        map[string]bool
+	snapshotSlots   chan struct{}
+	events          chan UsageEvent
+	dropped         atomic.Uint64
+	ctx             context.Context
+	cancel          context.CancelFunc
+	wg              sync.WaitGroup
+	closed          bool
+	closeDone       chan struct{}
+	closeErr        error
+	queueChanged    chan struct{}
+	fault           error
+	now             func() time.Time
+	budget          Budget
+	budgetPending   map[string]int
+
+	// In-flight scans and captured ticks never cross an instance-wide revocation.
+	scheduleGeneration uint64
+	scheduleRetry      map[string]scheduleRetry
+	loadedAt           time.Time
 }
 
 func ID() string {
@@ -84,51 +89,22 @@ func New(c Config, h Host) (*Engine, error) {
 	return en, nil
 }
 func (en *Engine) load() error {
+	en.loadedAt = en.now()
 	previousProviders, err := en.previousProviderSetting()
 	if err != nil {
+		return err
+	}
+	if err := en.loadLoginHolds(); err != nil {
 		return err
 	}
 	if err := en.loadDispositions(); err != nil {
 		return err
 	}
-	var inputHash string
-	if err := en.store.Get("meta", "config_input", &inputHash); (err == nil && inputHash == fingerprint(en.cfg)) || en.store.migrated {
-		var saved Config
-		if err = en.store.Get("meta", "settings", &saved); err == nil {
-			if err = saved.Validate(); err != nil {
-				return err
-			}
-			if saved.DataDir != en.cfg.DataDir || saved.Workers != en.cfg.Workers || saved.Queue != en.cfg.Queue {
-				return fmt.Errorf("stored structural settings conflict")
-			}
-			if en.store.migrated {
-				if err = en.store.Put("meta", "config_input", fingerprint(en.cfg)); err != nil {
-					return err
-				}
-			}
-			en.cfg = saved
-		} else if !errors.Is(err, os.ErrNotExist) {
-			return err
-		}
-	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
-	} else {
-		if err = en.store.Write(func(tx *bolt.Tx) error {
-			if err := tx.Bucket([]byte("meta")).Delete([]byte(ruleTimersKey)); err != nil {
-				return err
-			}
-			if err := put(tx, "meta", "config_input", fingerprint(en.cfg)); err != nil {
-				return err
-			}
-			return put(tx, "meta", "settings", en.cfg)
-		}); err != nil {
-			return err
-		}
-	}
-
-	if err := en.store.Get("meta", ruleTimersKey, &en.timers); err != nil && !errors.Is(err, os.ErrNotExist) {
+	var timers map[string]bool
+	if err := en.store.Get("meta", ruleTimersKey, &timers); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
+	en.timers = timers
 	if e := en.store.All("rules", func(raw []byte) error {
 		var r Rule
 		if e := json.Unmarshal(raw, &r); e != nil {
@@ -139,6 +115,9 @@ func (en *Engine) load() error {
 		return nil
 	}); e != nil {
 		return e
+	}
+	if err := en.loadQualitySettings(); err != nil {
+		return err
 	}
 	if err := en.migrateRuleScopes(previousProviders); err != nil {
 		return err

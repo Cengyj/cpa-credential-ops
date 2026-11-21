@@ -9,9 +9,10 @@ import (
 )
 
 const (
-	objectOAuth    = "oauth"
-	objectProvider = "provider"
-	objectUnknown  = "unknown"
+	objectOAuth         = "oauth"
+	objectProvider      = "provider"
+	objectUnknown       = "unknown"
+	objectProviderGroup = "provider_group"
 )
 
 func objectType(t Target) string {
@@ -34,6 +35,9 @@ func ruleTypes(r *Rule) []string {
 }
 
 func selectRuleObjects(in *Rule, old *Rule) error {
+	if in.ExpectedObjectType != "" || in.ExpectedAuthIndex != "" {
+		return fmt.Errorf("invalid_request: manual test bindings cannot be used in a rule")
+	}
 	if in.ObjectTypes == nil {
 		in.ObjectTypes = []string{objectOAuth}
 		if old != nil {
@@ -58,6 +62,12 @@ func selectRuleObjects(in *Rule, old *Rule) error {
 		in.TargetAuthIndex = ""
 	} else if in.TargetAuthIndex == "" && old != nil && in.AuthID == old.AuthID && in.Provider == old.Provider {
 		in.TargetAuthIndex = old.TargetAuthIndex
+	}
+	// The server records the origin it verified for this exact binding.
+	in.TargetObjectType = ""
+	if old != nil && !dynamicScope(in.TargetScope) && in.TargetGroup == "" && in.AuthID != "" && in.AuthID == old.AuthID &&
+		in.Provider == old.Provider && in.TargetAuthIndex == old.TargetAuthIndex {
+		in.TargetObjectType = old.TargetObjectType
 	}
 	if old != nil && in.AuthorizedGroups == nil {
 		in.AuthorizedGroups = slices.Clone(old.AuthorizedGroups)
@@ -85,6 +95,72 @@ func selectRuleObjects(in *Rule, old *Rule) error {
 		return fmt.Errorf("invalid_request: 请确认采用当前规则的检测范围")
 	}
 	return nil
+}
+
+// This describes a missing bound subject for history. It never grants admission.
+func missingSubjectType(r *Rule) string {
+	if r.TargetGroup != "" {
+		return objectProviderGroup
+	}
+	if r.TargetObjectType == objectProvider || r.TargetObjectType == objectOAuth {
+		return r.TargetObjectType
+	}
+	if !r.LegacyScope && len(r.ObjectTypes) == 1 {
+		return r.ObjectTypes[0]
+	}
+	return objectUnknown
+}
+
+func (r *Rule) boundHistoryTarget() Target {
+	id := r.AuthID
+	if r.TargetGroup != "" {
+		id = r.TargetGroup
+	}
+	kind := missingSubjectType(r)
+	return Target{AuthID: id, AuthIndex: r.TargetAuthIndex, Provider: r.Provider, ProviderGroupID: r.TargetGroup,
+		ObjectType: kind, IsProvider: kind == objectProvider}
+}
+
+func (r *Rule) recordBoundTarget(t Target) bool {
+	if r.LegacyScope || dynamicScope(r.TargetScope) || r.TargetGroup != "" || r.AuthID == "" || r.AuthID != t.AuthID ||
+		r.Provider == "" || r.Provider != t.Provider || t.AuthIndex == "" || r.TargetAuthIndex != "" && r.TargetAuthIndex != t.AuthIndex ||
+		t.identityConflict || !r.acceptsSubject(t) || t.IsProvider && providerBindingProblem(t) != nil {
+		return false
+	}
+	kind := objectType(t)
+	if kind != objectUnknown && !r.boundOriginChanged(t.AuthID, kind) {
+		r.TargetAuthIndex, r.TargetObjectType = t.AuthIndex, kind
+		return true
+	}
+	return false
+}
+
+// Check a newly selected binding against the same directory read as the save or preview.
+func (r *Rule) verifySelectedRuleTarget(targets []Target) error {
+	changed := errors.New("conflict: CPA 当前目录无法核实所选对象的来源、提供方或索引，请刷新后重新选择")
+	found := false
+	for _, t := range targets {
+		if t.AuthID != r.AuthID {
+			continue
+		}
+		if found || !r.recordBoundTarget(t) || r.TargetObjectType != r.expectedTargetObjectType {
+			return changed
+		}
+		found = true
+	}
+	if !found {
+		return changed
+	}
+	return nil
+}
+
+func (r *Rule) boundOriginChanged(id, kind string) bool {
+	return r.AuthID != "" && id == r.AuthID && (kind == objectOAuth || kind == objectProvider) &&
+		(r.TargetObjectType == objectOAuth || r.TargetObjectType == objectProvider) && r.TargetObjectType != kind
+}
+
+func boundOriginRejection() *scopeRejection {
+	return rejectScope("blocked: bound object origin changed", "bound_origin_changed", "CPA 当前的对象类型与规则保存的绑定不一致，本轮未执行。")
 }
 
 // Capture the last effective legacy permission without using a live catalog at
@@ -156,7 +232,8 @@ func selectedGroup(r *Rule, targets []Target) string {
 		return ""
 	}
 	for _, t := range targets {
-		if t.AuthID == r.AuthID && t.Provider == r.Provider && (r.TargetAuthIndex == "" || t.AuthIndex == r.TargetAuthIndex) && r.holdsGroup(t) {
+		if t.AuthID == r.AuthID && t.Provider == r.Provider && (r.TargetAuthIndex == "" || t.AuthIndex == r.TargetAuthIndex) &&
+			!r.boundOriginChanged(t.AuthID, objectType(t)) && r.holdsGroup(t) && providerBindingProblem(t) == nil {
 			return t.ProviderGroupID
 		}
 	}
@@ -173,6 +250,32 @@ func selectedIdentity(r *Rule, t Target, group string) bool {
 	return r.AuthID != "" && r.AuthID == t.AuthID
 }
 
+func (r *Rule) expandedProviderPeer(id string) bool {
+	return r != nil && !dynamicScope(r.TargetScope) && r.TargetGroup == "" && r.AuthID != "" && r.AuthID != id
+}
+
+// Matching the pinned member alone does not prove an expanded route remains
+// in scope. Resolve its original binding again using the same current directory.
+func (r *Rule) subjectBindingProblem(t Target, targets []Target) *scopeRejection {
+	if r.boundOriginChanged(t.AuthID, objectType(t)) {
+		return boundOriginRejection()
+	}
+	if r.AuthID == t.AuthID && (t.Provider != r.Provider || r.TargetAuthIndex != "" && t.AuthIndex != r.TargetAuthIndex) {
+		return rejectScope("blocked: bound route has changed", "identity_conflict", "已绑定对象的提供方或路由索引发生变化。")
+	}
+	group := r.TargetGroup
+	if r.expandedProviderPeer(t.AuthID) {
+		group = selectedGroup(r, targets)
+		if group == "" {
+			return rejectScope("blocked: bound provider route no longer identifies the authorized group", "group_members_changed", "无法通过规则绑定的原路由核实当前配置组。")
+		}
+	}
+	if group != "" && (!t.IsProvider || t.ProviderGroupID != group) {
+		return rejectScope("blocked: provider left the selected group", "group_members_changed", "本轮对象已不在规则绑定的提供商配置组。")
+	}
+	return nil
+}
+
 func providerRuleProblem(rule *Rule, t Target, models []string, subject bool) *scopeRejection {
 	if objectType(t) == objectUnknown {
 		return rejectScope("blocked: unverified inventory entry", "unverified_inventory_entry", "CPA 未能核实这项目录记录的对象来源。")
@@ -186,11 +289,24 @@ func providerRuleProblem(rule *Rule, t Target, models []string, subject bool) *s
 	if !subject || rule.LegacyScope {
 		return providerRouteProblem(t, models)
 	}
+	return providerBindingProblem(t)
+}
+
+func providerBindingProblem(t Target) *scopeRejection {
+	if t.identityConflict {
+		return rejectScope("blocked: unverified provider", "identity_conflict", "CPA 返回的提供商路由或密钥索引互相冲突。")
+	}
+	if contains(t.Reasons, "provider_directory_unavailable") {
+		return rejectScope("blocked: provider directory unavailable", "provider_directory_unavailable", t.ProviderProbeReason)
+	}
 	if contains(t.Reasons, "provider_runtime_unconfirmed") {
 		return rejectScope("blocked: provider runtime unconfirmed", "provider_runtime_unconfirmed", "CPA 配置与运行时尚未确认同一路由的启停状态。")
 	}
-	if t.AuthID == "" || t.AuthIndex == "" || t.Provider == "" || t.identityConflict || contains(t.Reasons, "provider_route_unverified") {
-		return rejectScope("blocked: unverified provider", "provider_unavailable", "CPA 无法唯一确认该提供商路由及密钥索引。")
+	if t.AuthID == "" || t.AuthIndex == "" || t.Provider == "" {
+		return rejectScope("blocked: unverified provider", "provider_unavailable", "CPA 返回的提供商路由标识或密钥索引不完整。")
+	}
+	if contains(t.Reasons, "provider_route_unverified") {
+		return rejectScope("blocked: unverified provider", "provider_route_unverified", "本轮未能匹配到身份和索引一致的 CPA 提供商配置路由。")
 	}
 	return nil
 }
@@ -202,15 +318,17 @@ func (en *Engine) checkRuleProvidersLocked(r *Rule, c RunConfig, targets []Targe
 			continue
 		}
 		subject := t.AuthID == c.AuthID
+		if subject {
+			if problem := r.subjectBindingProblem(t, targets); problem != nil {
+				return problem
+			}
+		}
 		if subject && objectType(t) != objectUnknown && !r.acceptsSubject(t) {
 			code := "object_type_excluded"
 			if t.IsProvider {
 				code = "provider_targets_excluded"
 			}
 			return rejectScope("blocked: target origin excluded by this rule", code, "指定对象的类型未在本规则中勾选。")
-		}
-		if subject && c.AuthID == r.AuthID && r.TargetAuthIndex != "" && t.AuthIndex != r.TargetAuthIndex {
-			return rejectScope("blocked: bound route has changed", "identity_conflict", "已绑定对象的路由索引发生变化。")
 		}
 		models := c.Models
 		if c.Judge.Mode == "llm" && t.AuthID == c.Judge.AuthID {

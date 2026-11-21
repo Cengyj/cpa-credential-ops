@@ -2,6 +2,7 @@ package quality
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -76,22 +77,69 @@ func upstreamAction(f *Frozen, s *Sample) string {
 }
 
 type CredentialDisposition struct {
-	TriggerAuthID       string             `json:"trigger_auth_id,omitempty"`
-	TriggerRunID        string             `json:"trigger_run_id,omitempty"`
-	CatalogMissingModel string             `json:"catalog_missing_model,omitempty"`
-	UpstreamCondition   string             `json:"upstream_condition,omitempty"`
-	Email               string             `json:"email,omitempty"`
-	AuthID              string             `json:"auth_id"`
-	RuleID              string             `json:"rule_id"`
-	RuleRevision        uint64             `json:"rule_revision"`
-	ActionID            string             `json:"action_id"`
-	RunID               string             `json:"run_id"`
-	Operation           string             `json:"operation"`
-	State               string             `json:"state"`
-	Snapshot            CredentialSnapshot `json:"snapshot"`
-	Models              []string           `json:"models"`
-	CreatedAt           time.Time          `json:"created_at"`
-	UpdatedAt           time.Time          `json:"updated_at"`
+	ErrorSource         *CredentialErrorSource `json:"error_source,omitempty"`
+	AnswerOwnerRuleID   string                 `json:"answer_owner_rule_id,omitempty"`
+	TriggerAuthID       string                 `json:"trigger_auth_id,omitempty"`
+	TriggerRunID        string                 `json:"trigger_run_id,omitempty"`
+	CatalogMissingModel string                 `json:"catalog_missing_model,omitempty"`
+	UpstreamCondition   string                 `json:"upstream_condition,omitempty"`
+	Email               string                 `json:"email,omitempty"`
+	AuthID              string                 `json:"auth_id"`
+	RuleID              string                 `json:"rule_id"`
+	RuleRevision        uint64                 `json:"rule_revision"`
+	ActionID            string                 `json:"action_id"`
+	RunID               string                 `json:"run_id"`
+	Operation           string                 `json:"operation"`
+	State               string                 `json:"state"`
+	Snapshot            CredentialSnapshot     `json:"snapshot"`
+	Models              []string               `json:"models"`
+	CreatedAt           time.Time              `json:"created_at"`
+	UpdatedAt           time.Time              `json:"updated_at"`
+}
+
+// Error provenance never grants recovery ownership. Keep it independently of
+// the answer disposition and the trigger run's configurable history retention.
+type CredentialErrorSource struct {
+	RuleID         string    `json:"rule_id"`
+	RuleRevision   uint64    `json:"rule_revision"`
+	RunID          string    `json:"run_id"`
+	AuthID         string    `json:"auth_id"`
+	Condition      string    `json:"condition"`
+	Model          string    `json:"model,omitempty"`
+	CatalogMissing bool      `json:"catalog_missing,omitempty"`
+	Evidence       Evidence  `json:"evidence"`
+	CreatedAt      time.Time `json:"created_at"`
+}
+
+func (en *Engine) setErrorSource(d *CredentialDisposition, run *Run, condition string) {
+	d.UpstreamCondition, d.CatalogMissingModel = condition, run.Config.CatalogMissingModel
+	if d.CatalogMissingModel != "" {
+		d.UpstreamCondition = ""
+	}
+	d.TriggerAuthID, d.TriggerRunID = run.Config.AuthID, run.ID
+	d.UpdatedAt = en.now()
+	source := &CredentialErrorSource{RuleID: run.Config.RuleID, RuleRevision: run.Config.RuleRevision,
+		RunID: run.ID, AuthID: run.Config.AuthID, Condition: condition, CreatedAt: en.now(),
+		Model: run.Config.CatalogMissingModel, CatalogMissing: run.Config.CatalogMissingModel != ""}
+	if len(run.Samples) > 0 && !source.CatalogMissing {
+		last := run.Samples[len(run.Samples)-1]
+		source.Model, source.Evidence = last.Model, last.Evidence
+	}
+	d.ErrorSource = source
+}
+
+func answerOwner(d *CredentialDisposition) string {
+	if d == nil {
+		return ""
+	}
+	if d.AnswerOwnerRuleID != "" {
+		return d.AnswerOwnerRuleID
+	}
+	// Older answer dispositions predate the explicit owner field.
+	if d.State == "disabled" && d.UpstreamCondition == "" && d.CatalogMissingModel == "" && d.ErrorSource == nil {
+		return d.RuleID
+	}
+	return ""
 }
 
 func (en *Engine) loadDispositions() error {
@@ -113,7 +161,7 @@ func (en *Engine) loadDispositions() error {
 }
 
 func activeDisposition(d *CredentialDisposition) bool {
-	return d != nil && d.State != "restored" && d.State != "externally_enabled" && d.State != "acknowledged" && d.State != "precondition_failed"
+	return d != nil && d.State != "restored" && d.State != "externally_enabled" && d.State != "entry_missing" && d.State != "acknowledged" && d.State != "precondition_failed"
 }
 
 func pendingCredentialAction(state string) string {
@@ -166,12 +214,24 @@ func (en *Engine) interruptCredentialWrites() error {
 }
 
 type HandlingSummary struct {
-	CatalogMissingModel string `json:"catalog_missing_model,omitempty"`
-	UpstreamCondition   string `json:"upstream_condition,omitempty"`
-	Email               string `json:"email,omitempty"`
-	AuthID              string `json:"auth_id"`
-	ActionID            string `json:"action_id"`
-	State               string `json:"state"`
+	AnswerOwnerRuleID   string                 `json:"answer_owner_rule_id,omitempty"`
+	ErrorSource         *CredentialErrorSource `json:"error_source,omitempty"`
+	CatalogMissingModel string                 `json:"catalog_missing_model,omitempty"`
+	UpstreamCondition   string                 `json:"upstream_condition,omitempty"`
+	Email               string                 `json:"email,omitempty"`
+	AuthID              string                 `json:"auth_id"`
+	ActionID            string                 `json:"action_id"`
+	State               string                 `json:"state"`
+}
+
+func handlingSummary(d *CredentialDisposition) HandlingSummary {
+	return HandlingSummary{Email: d.Email, AuthID: d.AuthID, ActionID: d.ActionID, State: d.State,
+		UpstreamCondition: d.UpstreamCondition, CatalogMissingModel: d.CatalogMissingModel,
+		AnswerOwnerRuleID: answerOwner(d), ErrorSource: cloneValue(d.ErrorSource)}
+}
+
+func (en *Engine) orphanedHandlingLocked(d *CredentialDisposition) bool {
+	return d != nil && d.State == "attention" && en.rules[d.RuleID] == nil
 }
 
 // Acknowledgment is an explicit local release of bookkeeping after an operator
@@ -184,7 +244,8 @@ func (en *Engine) acknowledgeHandling(ctx context.Context, ruleID, authID, actio
 	}
 	d := en.managed[authID]
 	r := en.rules[ruleID]
-	if d == nil || r == nil || d.RuleID != ruleID || d.ActionID != actionID || !activeDisposition(d) {
+	orphaned := ruleID == "" && en.orphanedHandlingLocked(d)
+	if authID == "" || actionID == "" || d == nil || d.ActionID != actionID || !activeDisposition(d) || !orphaned && (r == nil || d.RuleID != ruleID) {
 		return fmt.Errorf("conflict: credential handling record changed")
 	}
 	if _, busy := en.busyAuth[authID]; busy {
@@ -192,6 +253,7 @@ func (en *Engine) acknowledgeHandling(ctx context.Context, ruleID, authID, actio
 	}
 	directory := &providerInventoryStatus{Verified: true}
 	if d.Snapshot.ProviderMechanism != "" {
+		directory.Verified = false
 		ctx = context.WithValue(ctx, providerInventoryStatusKey{}, directory)
 	}
 	targets, err := en.host.Targets(ctx)
@@ -201,29 +263,67 @@ func (en *Engine) acknowledgeHandling(ctx context.Context, ruleID, authID, actio
 	if !directory.Verified {
 		return fmt.Errorf("blocked: the current provider configuration could not be verified")
 	}
+	found := false
 	for _, t := range targets {
-		if t.AuthID == authID && (t.ManualDisabled || t.QualityPaused || t.RetainedPause || t.RuntimeStatus != "active" && t.RuntimeStatus != "registered") {
-			return fmt.Errorf("blocked: first resolve this credential's disabled state in CPA")
+		if t.AuthID != authID {
+			continue
+		}
+		if found {
+			return fmt.Errorf("blocked: credential catalog contains duplicate identities")
+		}
+		found = true
+		if _, err := en.acknowledgedTargetSnapshot(ctx, t); err != nil {
+			return err
 		}
 	}
 	if d.Snapshot.ProviderMechanism == "group_disabled" {
-		return en.acknowledgeProviderGroupLocked(r, d, targets)
+		return en.acknowledgeProviderGroupLocked(ctx, r, d, targets)
+	}
+	if !found && d.Snapshot.ProviderMechanism == "" {
+		h, ok := en.host.(interface {
+			removedCredentials(context.Context, []*CredentialDisposition, int) ([]*CredentialDisposition, error)
+		})
+		if !ok {
+			return fmt.Errorf("blocked: current credential removal cannot be verified")
+		}
+		removed, err := h.removedCredentials(ctx, []*CredentialDisposition{d}, 1)
+		if err != nil || len(removed) != 1 {
+			return fmt.Errorf("blocked: current credential removal could not be confirmed in CPA")
+		}
 	}
 	next := *d
 	next.State = "acknowledged"
 	next.UpdatedAt = en.now()
 	c := changes()
 	c.disposition = &next
-	stopped := cloneRule(r)
-	stopped.Enabled = false
-	stopped.SchedulingEnabled = false
-	stopped.Revision++
-	resetRule(stopped)
-	stopped.Status = ruleStatus(stopped)
-	c.rules[r.ID] = stopped
-	en.cancelRuleChangesLocked(c, r.ID, "credential_handling_acknowledged")
-	c.audits = append(c.audits, en.audit("credential_handling_acknowledged", r.ID, "", d.ActionID, "Operator acknowledged external resolution; rule stopped; no CPA credential write"))
+	if r != nil {
+		en.cancelRuleChangesLocked(c, r.ID, "credential_handling_acknowledged")
+	} else {
+		en.cancelManagedRuns(c, authID, "")
+	}
+	c.audits = append(c.audits, en.audit("credential_handling_acknowledged", d.RuleID, "", d.ActionID, "Operator acknowledged external resolution; rule settings preserved; no CPA credential write"))
 	return en.commitLocked(c)
+}
+
+// A stale enabled list row is insufficient to clear an uncertain write. Read
+// the current identified credential without probing or changing its CPA state.
+func (en *Engine) acknowledgedTargetSnapshot(ctx context.Context, t Target) (CredentialSnapshot, error) {
+	var empty CredentialSnapshot
+	if !t.identityVerified || !ruleSubjectEnabled(t) || t.RuntimeStatus != "active" && t.RuntimeStatus != "registered" || en.localPause(RunConfig{AuthID: t.AuthID}) != "" {
+		return empty, fmt.Errorf("blocked: first resolve this credential's state and identity in CPA")
+	}
+	h, ok := en.host.(managedHost)
+	if !ok {
+		return empty, fmt.Errorf("unsupported: current credential snapshots are unavailable")
+	}
+	s, err := h.CredentialSnapshot(ctx, t.AuthID, t.AuthIndex)
+	if err != nil {
+		return empty, err
+	}
+	if s.Disabled || s.AuthID != t.AuthID || s.AuthIndex != t.AuthIndex || s.Provider != t.Provider || s.Name == "" || s.Fingerprint == "" || s.ProviderMechanism == "" && s.UpdatedAt.IsZero() {
+		return empty, fmt.Errorf("blocked: current credential enablement could not be confirmed in CPA")
+	}
+	return s, nil
 }
 
 func (en *Engine) validateManagedRule(in, old *Rule) error {
@@ -237,8 +337,14 @@ func (en *Engine) validateManagedRule(in, old *Rule) error {
 		if !en.Capabilities().CredentialManagement {
 			return fmt.Errorf("unsupported: CPA management adapter is unavailable")
 		}
-		if in.Judge.Mode != "" && in.Judge.Mode != "deterministic" || in.ControlAuthID != "" {
-			return fmt.Errorf("invalid_request: credential handling requires standard-answer judging without a control credential")
+		if in.ControlAuthID != "" || in.Judge.Mode == "llm" {
+			return fmt.Errorf("unsupported: management probes do not support independent control or LLM judge credentials")
+		}
+		if credentialMutation(in.Action) {
+			q, err := FreezeQuestion(in.RunConfig)
+			if err != nil || in.Judge.Mode != "" && in.Judge.Mode != "deterministic" || q.Answer == "" || q.Kind != "logic" && q.Kind != "random" {
+				return fmt.Errorf("invalid_request: answer handling requires a supported standard-answer question and deterministic judging")
+			}
 		}
 		if _, ok := en.host.(managedHost); !ok {
 			return fmt.Errorf("unsupported: CPA credential actions unavailable")
@@ -276,7 +382,7 @@ func recoveryDenied(r *Rule, d *CredentialDisposition) ScopeSkipDetail {
 		if d.State != "disabled" {
 			return ScopeSkipDetail{Code: "handling_blocked", Reason: "这份处置记录没有已确认的停用状态，不能复检。"}
 		}
-		if d.RuleID != r.ID {
+		if answerOwner(d) != r.ID {
 			return ScopeSkipDetail{Code: "other_rule_owner", Reason: "停用记录属于另一条规则。"}
 		}
 	} else if r.TargetScope != scopeAllCredentials {
@@ -289,7 +395,7 @@ func recoveryDenied(r *Rule, d *CredentialDisposition) ScopeSkipDetail {
 func (en *Engine) admitManagedLocked(ctx context.Context, r *Rule, t Target, validateOnly bool) (Target, *CredentialSnapshot, error) {
 	h, ok := en.host.(managedHost)
 	if !ok || !en.Capabilities().ManagementSession {
-		return t, nil, fmt.Errorf("management_session_required: reconnect the authenticated plugin panel")
+		return t, nil, fmt.Errorf("management_session_required: background management connection is not ready")
 	}
 	if en.localPause(RunConfig{AuthID: t.AuthID}) != "" || t.QualityPaused || t.RetainedPause {
 		return t, nil, fmt.Errorf("blocked: retained quality pause")
@@ -303,24 +409,29 @@ func (en *Engine) admitManagedLocked(ctx context.Context, r *Rule, t Target, val
 
 func (en *Engine) admitSnapshotLocked(r *Rule, t Target, snapshot CredentialSnapshot, validateOnly bool) (Target, *CredentialSnapshot, error) {
 	d := en.managed[t.AuthID]
-	if detail := errorPolicyDisabled(d); detail.Code != "" {
-		return t, nil, &scopeRejection{"blocked: credential already disabled by error policy", detail}
-	}
 	if activeDisposition(d) {
-		if d.State == "disabled" && !snapshot.Disabled {
+		if d.State != "disabled" {
+			return t, nil, rejectScope("blocked: credential handling requires attention", "handling_blocked", "对象的上次处置尚待核对。")
+		}
+		if !snapshot.Disabled {
 			if err := en.observeEnabledTargetLocked(t, snapshot, d, validateOnly); err != nil {
 				return t, nil, err
 			}
 		} else {
-			if detail := recoveryDenied(r, d); detail.Code != "" {
-				return t, &snapshot, &scopeRejection{"blocked: credential handling requires attention or recovery is disabled", detail}
+			if detail := errorPolicyDisabled(d); detail.Code != "" {
+				return t, nil, &scopeRejection{"blocked: credential already disabled by error policy", detail}
+			}
+			if !canInspectManualDisabled(r, d) {
+				if detail := recoveryDenied(r, d); detail.Code != "" {
+					return t, nil, &scopeRejection{"blocked: disabled credential is outside detection scope", detail}
+				}
 			}
 			return projectOwnedTarget(r, t, snapshot, d)
 		}
 	}
 	if snapshot.Disabled && !canInspectManualDisabled(r, d) {
 		if detail := recoveryDenied(r, d); detail.Code != "" {
-			return t, nil, &scopeRejection{"blocked: disabled credential is outside recovery scope", detail}
+			return t, nil, &scopeRejection{"blocked: disabled credential is outside detection scope", detail}
 		}
 	}
 	return projectManagedTarget(r, t, snapshot)
@@ -356,19 +467,27 @@ func (en *Engine) observeEnabledTargetLocked(t Target, s CredentialSnapshot, d *
 	}
 	c := changes()
 	c.disposition = &next
+	en.cancelManagedRuns(c, t.AuthID, "")
+	for id, old := range en.rules {
+		if id == d.RuleID || usesCredential(old.RunConfig, t.AuthID) {
+			updated := cloneRule(old)
+			updated.FailCount, updated.EvidenceSignature = 0, ""
+			c.rules[id] = updated
+		}
+	}
 	c.audits = append(c.audits, en.audit(kind, d.RuleID, d.RunID, d.ActionID, detail))
 	return en.commitLocked(c)
 }
 
 func projectOwnedTarget(r *Rule, t Target, snapshot CredentialSnapshot, d *CredentialDisposition) (Target, *CredentialSnapshot, error) {
-	if !sameSnapshot(snapshot, d.Snapshot) {
-		return t, nil, rejectScope("blocked: suspended credential was modified; automatic restore stopped", "snapshot_changed", snapshotDifference(snapshot, d.Snapshot))
+	if !sameCredentialEntry(snapshot, d.Snapshot) {
+		return t, nil, rejectScope("blocked: suspended entry identity cannot be matched", "identity_conflict", "CPA 当前条目标识无法与原答错停用记录唯一关联；原记录保留，不猜测恢复归属。")
 	}
-	if len(d.Models) != len(r.Models) {
+	if d.RuleID == r.ID && r.AutoRestore && len(d.Models) != len(r.Models) {
 		return t, nil, rejectScope("blocked: recovery must test the original complete model selection", "recovery_models_changed", "当前所选模型数量与停用记录中的数量不同。")
 	}
 	for _, model := range r.Models {
-		if !contains(d.Models, model) {
+		if d.RuleID == r.ID && r.AutoRestore && !contains(d.Models, model) {
 			return t, nil, &scopeRejection{"blocked: recovery must test the original complete model selection", ScopeSkipDetail{Code: "recovery_models_changed", Model: model, Reason: "当前所选模型不在停用时的模型集合中。"}}
 		}
 	}
@@ -463,21 +582,6 @@ func managedRoundVerdict(run *Run) string {
 	return verdict
 }
 
-func (en *Engine) stopManagedRules(c *changeSet, authID, owner string, stopOwner bool) {
-	for id, old := range en.rules {
-		if !usesCredential(old.RunConfig, authID) || id == owner && !stopOwner {
-			continue
-		}
-		r := cloneRule(old)
-		r.Enabled = false
-		r.SchedulingEnabled = false
-		r.Revision++
-		resetRule(r)
-		r.Status = ruleStatus(r)
-		c.rules[id] = r
-	}
-}
-
 func (en *Engine) cancelManagedRuns(c *changeSet, authID, exceptRun string) {
 	for id, old := range en.runs {
 		if id == exceptRun || !usesCredential(old.Config.RunConfig, authID) || (old.Status != "queued" && old.Status != "running") {
@@ -540,7 +644,8 @@ func (en *Engine) decideManagedLocked(run *Run, r *Rule, c *changeSet) {
 		return
 	}
 	current, err := h.CredentialSnapshot(en.ctx, run.Config.AuthID, run.Config.ManagedProbe.AuthIndex)
-	if err != nil || !sameSnapshot(current, *run.Config.ManagedProbe) {
+	// A file write needs a current file snapshot, even for the same CPA ID and index.
+	if err != nil || current.ProviderMechanism != "" || r.boundOriginChanged(current.AuthID, objectOAuth) || !sameSnapshot(current, *run.Config.ManagedProbe) {
 		out.ActionStatus = "credential_changed"
 		_ = en.commitLocked(c)
 		return
@@ -553,19 +658,19 @@ func (en *Engine) decideManagedLocked(run *Run, r *Rule, c *changeSet) {
 	prior := en.managed[current.AuthID]
 	restore := false
 	if activeDisposition(prior) {
-		if prior.State != "disabled" || prior.RuleID != r.ID || !sameSnapshot(current, prior.Snapshot) {
+		if prior.State != "disabled" || !sameCredentialEntry(current, prior.Snapshot) {
 			out.ActionStatus = "credential_action_attention"
 			_ = en.commitLocked(c)
 			return
 		}
-		if current.Disabled && condition != "" && !catalogAction {
-			if canRecoverDisabled(r, prior) {
+		if current.Disabled && condition != "" {
+			if operation == disableCredential {
 				next := *prior
-				next.UpstreamCondition = condition
-				next.TriggerAuthID, next.TriggerRunID = run.Config.AuthID, run.ID
-				next.UpdatedAt = en.now()
+				next.AnswerOwnerRuleID = answerOwner(prior)
+				en.setErrorSource(&next, run, condition)
 				c.disposition = &next
-				c.audits = append(c.audits, en.audit("error_policy_disabled", r.ID, run.ID, prior.ActionID, "Confirmed upstream condition during an owned recovery probe; credential kept disabled; no CPA write"))
+				en.cancelManagedRuns(c, current.AuthID, run.ID)
+				c.audits = append(c.audits, en.audit("error_policy_disabled", r.ID, run.ID, prior.ActionID, "Confirmed upstream condition on a disabled entry; original answer owner retained; no CPA write"))
 			}
 			out.ActionStatus = "credential_kept_disabled"
 			_ = en.commitLocked(c)
@@ -578,6 +683,14 @@ func (en *Engine) decideManagedLocked(run *Run, r *Rule, c *changeSet) {
 		}
 		restore = true
 	} else if current.Disabled {
+		if condition != "" && operation == disableCredential {
+			d := &CredentialDisposition{AuthID: current.AuthID, RuleID: r.ID, RuleRevision: r.Revision, ActionID: ID(), RunID: run.ID,
+				Operation: disableCredential, State: "disabled", Snapshot: current, CreatedAt: en.now(), UpdatedAt: en.now()}
+			en.setErrorSource(d, run, condition)
+			c.disposition = d
+			en.cancelManagedRuns(c, current.AuthID, run.ID)
+			c.audits = append(c.audits, en.audit("error_policy_disabled", r.ID, run.ID, d.ActionID, "Confirmed upstream condition on an already disabled entry; no answer recovery ownership and no CPA write"))
+		}
 		if condition != "" || !canRecoverDisabled(r, prior) || verdict != "correct" {
 			out.ActionStatus = "credential_kept_disabled"
 			_ = en.commitLocked(c)
@@ -599,22 +712,20 @@ func (en *Engine) decideManagedLocked(run *Run, r *Rule, c *changeSet) {
 	}
 	d := &CredentialDisposition{AuthID: current.AuthID, RuleID: r.ID, RuleRevision: r.Revision, ActionID: ID(), RunID: run.ID, Operation: operation, State: state, Snapshot: current, Models: append([]string(nil), run.Config.Models...), CreatedAt: en.now(), UpdatedAt: en.now()}
 	d.Email = run.CredentialEmail
-	if catalogAction {
-		d.CatalogMissingModel = run.Config.CatalogMissingModel
-	} else {
-		d.UpstreamCondition = condition
+	if condition != "" {
+		en.setErrorSource(d, run, condition)
+	} else if operation == disableCredential {
+		d.AnswerOwnerRuleID = r.ID
 	}
 	if restore && activeDisposition(prior) {
 		d.ActionID = prior.ActionID
 		d.CreatedAt = prior.CreatedAt
+		d.AnswerOwnerRuleID = answerOwner(prior)
 	}
 	c.disposition = d
 	out.CredentialAction = operation
 	out.ActionStatus = state
 	if !restore {
-		if condition == "" {
-			en.stopManagedRules(c, current.AuthID, r.ID, operation == deleteCredential)
-		}
 		en.cancelManagedRuns(c, current.AuthID, run.ID)
 	}
 	detail := "Complete management probe round; exact credential snapshot checked before requesting CPA action"
@@ -645,6 +756,12 @@ func (en *Engine) decideManagedLocked(run *Run, r *Rule, c *changeSet) {
 		next.State = "attention"
 		next.Snapshot = current
 		out.ActionStatus = "credential_action_uncertain"
+		if errors.Is(err, errCredentialPrecondition) {
+			next.State, out.ActionStatus = "precondition_failed", "credential_changed"
+			if prior != nil {
+				next = *prior
+			}
+		}
 	} else {
 		switch next.State {
 		case "disabled":
@@ -660,6 +777,9 @@ func (en *Engine) decideManagedLocked(run *Run, r *Rule, c *changeSet) {
 	detail = "CPA action confirmed; ownership and credential snapshot recorded"
 	if err != nil {
 		detail = "CPA action could not be confirmed; no automatic retry: " + scrubError(err)
+		if errors.Is(err, errCredentialPrecondition) {
+			detail = "Credential changed during the final local check; no CPA write was attempted and prior ownership was preserved"
+		}
 	}
 	result.audits = append(result.audits, en.audit(out.ActionStatus, r.ID, run.ID, next.ActionID, detail))
 	_ = en.commitLocked(result)
@@ -686,7 +806,8 @@ func applyCredentialIntent(ctx context.Context, h managedHost, d CredentialDispo
 }
 
 func canInspectManualDisabled(rule *Rule, d *CredentialDisposition) bool {
-	return rule != nil && !rule.LegacyScope && rule.TargetScope == scopeAllCredentials && !activeDisposition(d)
+	return rule != nil && !rule.LegacyScope && rule.TargetScope == scopeAllCredentials &&
+		(!activeDisposition(d) || d.State == "disabled" && errorPolicyDisabled(d).Code == "")
 }
 
 func managedEvidencePath(snapshot *CredentialSnapshot, path string) bool {

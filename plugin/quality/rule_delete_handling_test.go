@@ -13,7 +13,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
 
-func TestDeleteRuleClearsOnlyItsConfirmedHandling(t *testing.T) {
+func TestDeleteRuleRetainsErrorSourceWithoutGrantingRecovery(t *testing.T) {
 	ctx := context.Background()
 	f := managementTestFixture(t)
 	en := f.engine
@@ -33,6 +33,7 @@ func TestDeleteRuleClearsOnlyItsConfirmedHandling(t *testing.T) {
 	c.dispositions = []*CredentialDisposition{
 		{AuthID: "removed", RuleID: r.ID, State: "deleted"},
 		{AuthID: "restored", RuleID: r.ID, State: "restored"},
+		{AuthID: "missing", RuleID: r.ID, State: "entry_missing"},
 		{AuthID: "unrelated", RuleID: other.ID, State: "disabled"},
 	}
 	if err := en.commitLocked(c); err != nil {
@@ -47,15 +48,15 @@ func TestDeleteRuleClearsOnlyItsConfirmedHandling(t *testing.T) {
 	if resp.StatusCode != http.StatusOK || string(resp.Body) != `{"ok":true}` {
 		t.Fatal(resp.StatusCode, string(resp.Body))
 	}
-	if en.rules[r.ID] != nil || en.rules[other.ID] == nil || en.timers[r.ID] || en.runs[runs[0].ID] != nil {
-		t.Fatal("deleted owner or history is still published")
+	if en.rules[r.ID] != nil || en.rules[other.ID] == nil || en.timers[r.ID] || en.runs[runs[0].ID] == nil {
+		t.Fatal("rule deletion lost the retained error evidence")
 	}
-	for _, authID := range []string{"one", "removed", "restored"} {
+	for _, authID := range []string{"removed", "restored", "missing"} {
 		if err := en.store.Get("meta", dispositionPrefix+authID, &CredentialDisposition{}); en.managed[authID] != nil || !errors.Is(err, os.ErrNotExist) {
 			t.Fatal(authID, err)
 		}
 	}
-	if en.managed["unrelated"] == nil || !f.entries["one"].Disabled || len(f.patches) != 1 || f.deletes != 0 || f.probes+f.nativeCalls != before {
+	if errorPolicyDisabled(en.managed["one"]).Code == "" || en.managed["unrelated"] == nil || !f.entries["one"].Disabled || len(f.patches) != 1 || f.deletes != 0 || f.probes+f.nativeCalls != before {
 		t.Fatal("deletion touched CPA or another rule's handling")
 	}
 	if err := en.Close(); err != nil {
@@ -66,8 +67,18 @@ func TestDeleteRuleClearsOnlyItsConfirmedHandling(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = en.Close() })
-	if en.rules[r.ID] != nil || en.timers[r.ID] || en.managed["one"] != nil || en.managed["unrelated"] == nil {
-		t.Fatal("cleanup did not survive restart")
+	if en.rules[r.ID] != nil || en.timers[r.ID] || errorPolicyDisabled(en.managed["one"]).Code == "" || en.managed["unrelated"] == nil {
+		t.Fatal("error source isolation did not survive restart")
+	}
+	other.TargetScope, other.Action, other.AutoRestore = scopeAllCredentials, disableCredential, true
+	other.ID, other.Revision = "", 0
+	other, err = en.SaveRule(ctx, *other, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reply, err := en.dispatchRule(ctx, other.ID, other.Revision, false)
+	if err != nil || reply.Count != 0 || reply.RecoveryCount != 0 || f.probes+f.nativeCalls != before || len(f.patches) != 1 {
+		t.Fatal("deleting the error rule granted a peer permission to recover", reply, err)
 	}
 }
 

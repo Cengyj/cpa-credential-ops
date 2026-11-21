@@ -8,96 +8,181 @@ import (
 
 type excludedCredentialIDs struct{}
 
-func (en *Engine) inventoryContextLocked(ctx context.Context) context.Context {
-	return en.runInventoryContextLocked(ctx, nil)
-}
+// Inventory must include suspended entries so every normal refresh can observe
+// CPA enablement. Suppression applies to model execution, never state reads.
+func (en *Engine) inventoryContextLocked(ctx context.Context) context.Context { return ctx }
 
-func (en *Engine) runInventoryContextLocked(ctx context.Context, manualSubject *CredentialDisposition) context.Context {
-	ids := make(map[string]bool)
-	for id, d := range en.managed {
-		if d != manualSubject && errorPolicyDisabled(d).Code != "" {
-			ids[id] = true
+// Reconcile confirmed ordinary suspensions against current CPA state before
+// applying scope or recovery policy. Unknown writes and independent pauses stay
+// protected; an observation never writes a credential or starts a model call.
+func (en *Engine) reconcileCurrentTargetsLocked(ctx context.Context, targets []Target, ids []string) map[string]error {
+	failures := make(map[string]error)
+	for _, t := range targets {
+		if ids != nil && !contains(ids, t.AuthID) {
+			continue
+		}
+		d := en.managed[t.AuthID]
+		if d == nil || d.State != "disabled" || disabledObject(t) {
+			continue
+		}
+		if !ruleSubjectEnabled(t) || !t.identityVerified && !t.catalogVerified {
+			failures[t.AuthID] = rejectScope("blocked: current CPA identity cannot be verified", "identity_conflict", "CPA 当前对象身份或运行状态无法核实，请检查目录连接。")
+			continue
+		}
+		h, ok := en.host.(managedHost)
+		if !ok || t.IsProvider && !en.Capabilities().ManagementSession {
+			failures[t.AuthID] = &scopeRejection{"management_session_required: background management connection is not ready", sessionSkip()}
+			continue
+		}
+		if d.Snapshot.ProviderMechanism == "group_disabled" {
+			if err := en.observeEnabledProviderGroupLocked(ctx, targets, d); err != nil {
+				failures[t.AuthID] = err
+			}
+			continue
+		}
+		snapshot, err := h.CredentialSnapshot(ctx, t.AuthID, t.AuthIndex)
+		if err == nil && snapshot.Disabled {
+			err = &scopeRejection{"blocked: credential runtime and snapshot disagree", snapshotRuntimeConflict(t, true)}
+		}
+		if err == nil {
+			err = en.observeEnabledTargetLocked(t, snapshot, d, false)
+		}
+		if err != nil {
+			failures[t.AuthID] = err
 		}
 	}
-	return context.WithValue(ctx, excludedCredentialIDs{}, ids)
+	return failures
 }
 
-// Only an explicitly selected manual subject may be verified against its old
-// error suspension. Scheduled work and dependent credentials stay excluded.
-func (en *Engine) runDispositionLocked(c RunConfig, manual bool) (*CredentialDisposition, error) {
-	var subject *CredentialDisposition
+// Missing runtime entries can reflect a reload. Only a file-specific CPA 404
+// proves file removal. Preserve the old record and authority on ambiguous or
+// failed reads, so a returning disabled entry cannot silently regain probes.
+func (en *Engine) observeMissingEntriesLocked(ctx context.Context, targets []Target, providersVerified bool) error {
+	present := make(map[string]bool, len(targets))
+	unresolvedGroups := make(map[string]bool)
+	for _, t := range targets {
+		present[t.AuthID] = true
+		if t.ProviderGroupID != "" && (disabledObject(t) || t.identityConflict || !t.identityVerified) {
+			unresolvedGroups[t.ProviderGroupID] = true
+		}
+	}
+	var files []*CredentialDisposition
+	confirmed := make(map[string]bool)
+	for id, d := range en.managed {
+		if d.State != "disabled" || present[id] || d.Snapshot.AuthID == "" || d.Snapshot.AuthIndex == "" {
+			continue
+		}
+		if d.Snapshot.ProviderMechanism != "" {
+			// A rotated key also disappears from CPA's content-derived IDs.
+			// Retain the old source while the configured group remains disabled
+			// or unverified; absence alone must not turn it into a recoverable
+			// manual disable. This does not transfer ownership to a new ID.
+			confirmed[id] = providersVerified && !unresolvedGroups[d.Snapshot.ProviderGroupID]
+		} else {
+			files = append(files, d)
+		}
+	}
+	if h, ok := en.host.(interface {
+		removedCredentials(context.Context, []*CredentialDisposition, int) ([]*CredentialDisposition, error)
+	}); ok && en.Capabilities().ManagementSession && len(files) != 0 {
+		removed, err := h.removedCredentials(ctx, files, max(1, en.cfg.Workers))
+		if err == nil {
+			for _, d := range removed {
+				confirmed[d.AuthID] = true
+			}
+		}
+	}
+	update := changes()
+	for id := range confirmed {
+		if !confirmed[id] {
+			continue
+		}
+		d := en.managed[id]
+		next := *d
+		next.State, next.UpdatedAt = "entry_missing", en.now()
+		update.dispositions = append(update.dispositions, &next)
+		en.cancelManagedRuns(update, id, "")
+		update.audits = append(update.audits, en.audit("credential_entry_missing", d.RuleID, d.RunID, d.ActionID,
+			"CPA confirmed the previous entry locator is absent; history retained without granting a new entry recovery authority"))
+	}
+	if len(update.dispositions) == 0 {
+		return nil
+	}
+	return en.commitLocked(update)
+}
+
+func currentTargetError(failures map[string]error, ids []string) error {
+	for _, id := range ids {
+		if err := failures[id]; err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Call only after reconciling current CPA state. Remaining error sources
+// describe a still-disabled object and cannot authorize a model probe.
+func (en *Engine) runDispositionLocked(c RunConfig, manual bool) error {
+	if hold := en.loginWaitLocked(c); hold != nil {
+		code, reason := hold.reason()
+		return rejectScope("blocked: "+reason, code, reason)
+	}
 	for _, id := range dependencies(c) {
 		d := en.managed[id]
 		if !activeDisposition(d) {
 			continue
 		}
 		if cause := errorPolicyCause(d); cause != "" {
-			if manual && id == c.AuthID && d.ActionID != "" && d.Snapshot.Disabled && (d.Operation == "" || d.Operation == disableCredential) {
-				subject = d
-				continue
-			}
-			return nil, fmt.Errorf("blocked: %s，凭证已按错误策略停用。", cause)
+			return fmt.Errorf("blocked: %s，凭证已按错误策略停用。", cause)
 		}
 		if manual && d.State != "disabled" {
-			return nil, errors.New("blocked: 凭证存在未解除的处置记录，请在质量运维中核对。")
+			return errors.New("blocked: 凭证存在未解除的处置记录，请在质量运维中核对。")
 		}
 	}
-	return subject, nil
+	return nil
 }
 
-func (en *Engine) frozenDispositionLocked(f Frozen) (*CredentialDisposition, error) {
-	d, err := en.runDispositionLocked(f.RunConfig, f.RuleID == "")
-	if err != nil {
-		return nil, err
+func (en *Engine) frozenDispositionLocked(f Frozen) error {
+	if err := en.runDispositionLocked(f.RunConfig, f.RuleID == ""); err != nil {
+		return err
 	}
-	if d == nil && f.ManualPolicyActionID != "" || d != nil && d.ActionID != f.ManualPolicyActionID {
-		return nil, errors.New("blocked: 凭证的处置记录在测试提交后发生了变化，请重新核对。")
+	if f.ManualPolicyActionID != "" {
+		return errors.New("blocked: 旧测试依赖已经失效的处置记录，请重新提交当前凭证测试。")
 	}
-	return d, nil
+	return nil
 }
 
-func (en *Engine) verifyManualSubjectLocked(ctx context.Context, c RunConfig, targets []Target, d *CredentialDisposition) (string, error) {
-	if d == nil {
-		return "", nil
-	}
-	if en.localPause(c) != "" {
-		return "", errors.New("blocked: 凭证仍受质量暂停保护，禁止检测。")
-	}
+func (en *Engine) currentManualAccountLocked(ctx context.Context, c RunConfig, targets []Target) (string, error) {
 	for _, t := range targets {
 		if t.AuthID != c.AuthID {
 			continue
 		}
-		if t.ManualDisabled || t.RuntimeStatus == "disabled" {
-			return "", fmt.Errorf("blocked: %s，CPA 当前仍停用此凭证。", errorPolicyCause(d))
-		}
-		if !t.identityVerified || !t.catalogVerified || !ruleSubjectEnabled(t) || !t.EffectiveAvailable || t.RuntimeStatus != "active" && !(t.IsProvider && t.RuntimeStatus == "registered") ||
-			t.Provider != c.Provider || t.AuthID != d.Snapshot.AuthID || t.AuthIndex != d.Snapshot.AuthIndex || t.Provider != d.Snapshot.Provider {
-			break
-		}
-		for _, model := range c.Models {
-			if !contains(t.Models, model) {
-				return "", errors.New("blocked: CPA 当前凭证没有注册所选模型，请刷新模型目录。")
-			}
-		}
-		if t.IsProvider && d.Snapshot.ProviderMechanism != "" {
+		if t.IsProvider {
 			h, ok := en.host.(managedHost)
 			if !ok {
-				break
+				return "", errors.New("blocked: current provider configuration cannot be verified")
 			}
-			now, err := h.CredentialSnapshot(ctx, t.AuthID, t.AuthIndex)
-			if err == nil && !now.Disabled && sameCredential(now, d.Snapshot) && now.ProviderGroupID == d.Snapshot.ProviderGroupID {
-				return now.Fingerprint, nil
+			snapshot, err := h.CredentialSnapshot(ctx, t.AuthID, t.AuthIndex)
+			if err != nil {
+				return "", err
 			}
-			break
+			if snapshot.Disabled {
+				return "", errors.New("blocked: CPA current provider is disabled")
+			}
+			return snapshot.Fingerprint, nil
 		}
 		if h, ok := en.host.(interface {
 			verifyEnabledManualFile(context.Context, Target, *CredentialDisposition) (string, error)
 		}); ok {
-			return h.verifyEnabledManualFile(ctx, t, d)
+			return h.verifyEnabledManualFile(ctx, t, nil)
 		}
-		break
 	}
-	return "", errors.New("blocked: 无法核实 CPA 当前已启用同一凭证及其模型目录，请检查凭证状态。")
+	return "", errors.New("blocked: current CPA credential cannot be verified")
+}
+
+func groupTargetBlocked(records map[string]*CredentialDisposition, t Target) bool {
+	d := groupGuard(records, t)
+	return d != nil && (d.State != "disabled" || disabledObject(t))
 }
 
 func (en *Engine) terminalDependencyLocked(c RunConfig) bool {
@@ -131,7 +216,7 @@ func errorPolicyCause(d *CredentialDisposition) string {
 	}
 }
 
-// A confirmed error suspension remains terminal for rules until explicitly acknowledged.
+// A confirmed error suspension excludes probes until CPA enablement is observed.
 func errorPolicyDisabled(d *CredentialDisposition) ScopeSkipDetail {
 	cause := errorPolicyCause(d)
 	if cause == "" {

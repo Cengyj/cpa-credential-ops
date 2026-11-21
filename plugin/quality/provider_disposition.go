@@ -12,12 +12,85 @@ func groupGuard(records map[string]*CredentialDisposition, t Target) *Credential
 	if t.ProviderGroupID == "" {
 		return nil
 	}
+	var confirmed *CredentialDisposition
 	for _, d := range records {
 		if activeDisposition(d) && d.Snapshot.ProviderMechanism == "group_disabled" && d.Snapshot.ProviderGroupID == t.ProviderGroupID {
-			return d
+			if d.State != "disabled" {
+				return d
+			}
+			confirmed = d
 		}
 	}
-	return nil
+	return confirmed
+}
+
+// A group enablement is observed as one local transition. Check the complete
+// current group independently of the old recovery plan. Unmatched historical
+// routes keep their records; they never grant new members recovery authority.
+func (en *Engine) observeEnabledProviderGroupLocked(ctx context.Context, targets []Target, old *CredentialDisposition) error {
+	h, ok := en.host.(managedHost)
+	if !ok || !en.Capabilities().ManagementSession {
+		return errors.New("management_session_required: background management connection is not ready")
+	}
+	byID := make(map[string]Target, len(targets))
+	for _, t := range targets {
+		if _, duplicate := byID[t.AuthID]; duplicate {
+			return errors.New("blocked: provider catalog contains duplicate identities")
+		}
+		byID[t.AuthID] = t
+	}
+	anchor, present := byID[old.AuthID]
+	if !present || !anchor.identityVerified || anchor.identityConflict || !ruleSubjectEnabled(anchor) {
+		return errors.New("blocked: current provider group identity cannot be verified")
+	}
+	current, err := h.CredentialSnapshot(ctx, anchor.AuthID, anchor.AuthIndex)
+	if err != nil {
+		return err
+	}
+	if current.Disabled || len(current.ProviderMembers) == 0 || !sameCredentialEntry(current, old.Snapshot) || !contains(current.ProviderMembers, anchor.AuthID) {
+		return errors.New("blocked: current provider group identity or enablement cannot be verified")
+	}
+	for _, d := range en.managed {
+		if activeDisposition(d) && d.Snapshot.ProviderGroupID == current.ProviderGroupID && d.State != "disabled" {
+			return errors.New("blocked: provider group contains an unconfirmed credential action")
+		}
+	}
+	update := changes()
+	for _, id := range current.ProviderMembers {
+		t, present := byID[id]
+		if !present || !t.identityVerified || t.identityConflict || !ruleSubjectEnabled(t) ||
+			t.QualityPaused || t.RetainedPause || en.localPause(RunConfig{AuthID: id}) != "" || t.ProviderGroupID != current.ProviderGroupID {
+			return errors.New("blocked: current provider group enablement cannot be verified for every current member")
+		}
+		s, err := h.CredentialSnapshot(ctx, id, t.AuthIndex)
+		if err != nil {
+			return err
+		}
+		if s.Disabled || !sameProviderGroupPlan(s, current) {
+			return errors.New("blocked: provider group identity, membership or enablement changed during the read")
+		}
+		d := en.managed[id]
+		if !activeDisposition(d) {
+			continue
+		}
+		if d.State != "disabled" || !sameCredentialEntry(s, d.Snapshot) {
+			return errors.New("blocked: current provider entry has an unresolved association")
+		}
+		next := *d
+		next.State, next.UpdatedAt = "externally_enabled", en.now()
+		update.dispositions = append(update.dispositions, &next)
+		en.cancelManagedRuns(update, id, "")
+		for ruleID, r := range en.rules {
+			if ruleID == d.RuleID || usesCredential(r.RunConfig, id) {
+				copy := cloneRule(r)
+				copy.FailCount, copy.EvidenceSignature = 0, ""
+				update.rules[ruleID] = copy
+			}
+		}
+	}
+	update.audits = append(update.audits, en.audit("credential_external_enable", old.RuleID, old.RunID, old.ActionID,
+		"CPA enablement confirmed for the complete current provider group; matching ordinary sources retired without a CPA write"))
+	return en.commitLocked(update)
 }
 
 func providerWriteAllowed(r *Rule, s CredentialSnapshot) bool {
@@ -77,7 +150,7 @@ func sameProviderGroupPlan(a, b CredentialSnapshot) bool {
 
 // Even an early upstream error requires authority over every affected route.
 // Read back exact membership and identities immediately before journaling.
-func (en *Engine) providerWriteSnapshots(ctx context.Context, h managedHost, expected CredentialSnapshot, r *Rule) ([]CredentialSnapshot, bool) {
+func (en *Engine) providerWriteSnapshots(ctx context.Context, h managedHost, expected CredentialSnapshot, r *Rule, errorUpgrade bool) ([]CredentialSnapshot, bool) {
 	targets, err := en.host.Targets(ctx)
 	if err != nil {
 		return nil, false
@@ -95,8 +168,11 @@ func (en *Engine) providerWriteSnapshots(ctx context.Context, h managedHost, exp
 		if !contains(ids, t.AuthID) {
 			continue
 		}
-		if seen[t.AuthID] || !t.IsProvider || t.AuthIndex == "" || t.ProviderGroupID != expected.ProviderGroupID ||
-			t.identityConflict || t.QualityPaused || t.RetainedPause || en.localPause(RunConfig{AuthID: t.AuthID}) != "" {
+		if seen[t.AuthID] || !t.IsProvider || providerBindingProblem(t) != nil || t.ProviderGroupID != expected.ProviderGroupID ||
+			t.QualityPaused || t.RetainedPause || en.localPause(RunConfig{AuthID: t.AuthID}) != "" {
+			return nil, false
+		}
+		if t.AuthID == expected.AuthID && r.subjectBindingProblem(t, targets) != nil {
 			return nil, false
 		}
 		seen[t.AuthID] = true
@@ -108,10 +184,10 @@ func (en *Engine) providerWriteSnapshots(ctx context.Context, h managedHost, exp
 			return nil, false
 		}
 		if d := en.managed[t.AuthID]; activeDisposition(d) {
-			if d.RuleID != r.ID || d.State != "disabled" || errorPolicyDisabled(d).Code != "" || !sameSnapshot(s, d.Snapshot) {
+			if d.State != "disabled" || errorPolicyDisabled(d).Code != "" || !sameCredentialEntry(s, d.Snapshot) || !errorUpgrade && answerOwner(d) != r.ID {
 				return nil, false
 			}
-		} else if groupGuard(en.managed, t) != nil {
+		} else if groupTargetBlocked(en.managed, t) {
 			return nil, false
 		}
 		current = append(current, s)
@@ -135,8 +211,8 @@ func (en *Engine) decideProviderLocked(run *Run, r *Rule, c *changeSet, verdict,
 	}
 	prior := en.managed[snapshot.AuthID]
 	restore := snapshot.Disabled && condition == "" && verdict == "correct" && canRecoverDisabled(r, prior)
-	errorOnOwned := snapshot.Disabled && condition != "" && activeDisposition(prior) && prior.State == "disabled" && prior.RuleID == r.ID
-	if !restore && !errorOnOwned && (snapshot.Disabled || operation != disableCredential || condition == "" && verdict != "incorrect") {
+	errorOnDisabled := snapshot.Disabled && condition != "" && operation == disableCredential
+	if !restore && !errorOnDisabled && (snapshot.Disabled || operation != disableCredential || condition == "" && verdict != "incorrect") {
 		status := "observe_only"
 		if snapshot.Disabled {
 			status = "credential_kept_disabled"
@@ -151,7 +227,7 @@ func (en *Engine) decideProviderLocked(run *Run, r *Rule, c *changeSet, verdict,
 		finish("management_session_required")
 		return
 	}
-	members, ok := en.providerWriteSnapshots(en.ctx, h, snapshot, r)
+	members, ok := en.providerWriteSnapshots(en.ctx, h, snapshot, r, errorOnDisabled)
 	if !ok {
 		finish("credential_changed")
 		return
@@ -160,21 +236,20 @@ func (en *Engine) decideProviderLocked(run *Run, r *Rule, c *changeSet, verdict,
 		finish("catalog_action_unconfirmed")
 		return
 	}
-	if errorOnOwned {
+	if errorOnDisabled {
+		actionID := ID()
 		for _, s := range members {
-			d := en.managed[s.AuthID]
-			if !activeDisposition(d) || d.ActionID != prior.ActionID {
-				finish("credential_action_attention")
-				return
+			next := CredentialDisposition{AuthID: s.AuthID, RuleID: r.ID, RuleRevision: r.Revision, ActionID: actionID, RunID: run.ID,
+				State: "disabled", Operation: disableCredential, Snapshot: s, CreatedAt: en.now(), UpdatedAt: en.now()}
+			if old := en.managed[s.AuthID]; activeDisposition(old) {
+				next = *old
+				next.AnswerOwnerRuleID = answerOwner(old)
 			}
-		}
-		for _, s := range members {
-			next := *en.managed[s.AuthID]
-			next.UpstreamCondition, next.CatalogMissingModel, next.UpdatedAt = condition, run.Config.CatalogMissingModel, en.now()
-			next.TriggerAuthID, next.TriggerRunID = run.Config.AuthID, run.ID
+			en.setErrorSource(&next, run, condition)
 			c.dispositions = append(c.dispositions, &next)
+			en.cancelManagedRuns(c, s.AuthID, run.ID)
 		}
-		c.audits = append(c.audits, en.audit("error_policy_disabled", r.ID, run.ID, prior.ActionID, "Confirmed upstream condition during provider recovery; disabled state retained"))
+		c.audits = append(c.audits, en.audit("error_policy_disabled", r.ID, run.ID, actionID, "Confirmed upstream condition on a disabled provider; original answer owners retained; no CPA write"))
 		finish("credential_kept_disabled")
 		return
 	}
@@ -190,6 +265,13 @@ func (en *Engine) decideProviderLocked(run *Run, r *Rule, c *changeSet, verdict,
 		d := &CredentialDisposition{AuthID: s.AuthID, RuleID: r.ID, RuleRevision: r.Revision, ActionID: actionID,
 			RunID: run.ID, TriggerAuthID: run.Config.AuthID, TriggerRunID: run.ID, State: state, Operation: operation, Snapshot: s, Models: slices.Clone(r.Models),
 			UpstreamCondition: condition, CatalogMissingModel: run.Config.CatalogMissingModel, CreatedAt: now, UpdatedAt: now}
+		if condition != "" {
+			en.setErrorSource(d, run, condition)
+		} else if !restore {
+			d.AnswerOwnerRuleID = r.ID
+		} else {
+			d.AnswerOwnerRuleID = answerOwner(previous[s.AuthID])
+		}
 		c.dispositions = append(c.dispositions, d)
 		if !restore {
 			en.cancelManagedRuns(c, s.AuthID, run.ID)
@@ -200,7 +282,7 @@ func (en *Engine) decideProviderLocked(run *Run, r *Rule, c *changeSet, verdict,
 	if err := en.commitLocked(c); err != nil {
 		return
 	}
-	if restore && activeDisposition(prior) && sameSnapshot(snapshot, prior.Snapshot) {
+	if restore && activeDisposition(prior) && sameCredentialEntry(snapshot, prior.Snapshot) {
 		snapshot.ProviderExclusionSource = prior.Snapshot.ProviderExclusionSource
 	}
 	en.mu.Unlock()
@@ -251,31 +333,44 @@ func (en *Engine) decideProviderLocked(run *Run, r *Rule, c *changeSet, verdict,
 	_ = en.commitLocked(update)
 }
 
-func (en *Engine) acknowledgeProviderGroupLocked(rule *Rule, disposition *CredentialDisposition, targets []Target) error {
+func (en *Engine) acknowledgeProviderGroupLocked(ctx context.Context, rule *Rule, disposition *CredentialDisposition, targets []Target) error {
 	members := disposition.Snapshot.ProviderMembers
+	seen := make(map[string]bool)
+	var current *CredentialSnapshot
 	for _, t := range targets {
-		if t.ProviderGroupID == disposition.Snapshot.ProviderGroupID && (!t.identityVerified || t.ManualDisabled || t.QualityPaused || t.RetainedPause || !ruleSubjectEnabled(t)) {
-			return errors.New("blocked: first verify the whole provider group in CPA")
+		if t.ProviderGroupID != disposition.Snapshot.ProviderGroupID {
+			continue
 		}
+		s, err := en.acknowledgedTargetSnapshot(ctx, t)
+		if err != nil {
+			return err
+		}
+		if seen[t.AuthID] || s.ProviderMechanism != "group_disabled" || s.ProviderGroupID != t.ProviderGroupID || len(s.ProviderMembers) == 0 || !contains(s.ProviderMembers, s.AuthID) || current != nil && !sameProviderGroupPlan(s, *current) {
+			return errors.New("blocked: current provider group identity or membership cannot be verified")
+		}
+		current = &s
+		seen[t.AuthID] = true
+	}
+	if current != nil && len(seen) != len(current.ProviderMembers) {
+		return errors.New("blocked: first verify every current provider group member in CPA")
 	}
 	update := changes()
 	for _, id := range members {
 		d := en.managed[id]
 		_, busy := en.busyAuth[id]
-		if d == nil || busy || d.ActionID != disposition.ActionID || d.RuleID != rule.ID || !activeDisposition(d) {
+		if d == nil || busy || d.ActionID != disposition.ActionID || d.RuleID != disposition.RuleID || !activeDisposition(d) || rule == nil && !en.orphanedHandlingLocked(d) {
 			return errors.New("conflict: provider group ownership changed")
 		}
 		next := *d
 		next.State, next.UpdatedAt = "acknowledged", en.now()
 		update.dispositions = append(update.dispositions, &next)
+		if rule == nil {
+			en.cancelManagedRuns(update, id, "")
+		}
 	}
-	next := cloneRule(rule)
-	next.Enabled, next.SchedulingEnabled = false, false
-	next.Revision++
-	resetRule(next)
-	next.Status = ruleStatus(next)
-	update.rules[next.ID] = next
-	en.cancelRuleChangesLocked(update, next.ID, "credential_handling_acknowledged")
-	update.audits = append(update.audits, en.audit("credential_handling_acknowledged", next.ID, "", disposition.ActionID, "Operator released local handling for the complete provider group; rule stopped"))
+	if rule != nil {
+		en.cancelRuleChangesLocked(update, rule.ID, "credential_handling_acknowledged")
+	}
+	update.audits = append(update.audits, en.audit("credential_handling_acknowledged", disposition.RuleID, "", disposition.ActionID, "Operator released local handling for the complete provider group; rule settings preserved"))
 	return en.commitLocked(update)
 }

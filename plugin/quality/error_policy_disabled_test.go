@@ -75,14 +75,22 @@ func TestErrorPolicySuspensionsSkipEveryScope(t *testing.T) {
 				len(f.engine.runs) != 1 || len(f.engine.queue) != 0 || f.disabledProbes != 0 || f.probes != 1 || len(f.patches) != 1 {
 				t.Fatal("timer replayed a probe or lost the reason", timer, err, f.probes, f.patches)
 			}
-			// External changes alone do not authorize polling a terminal credential.
+			// Normal dispatch observes CPA enablement and retires the old source.
+			// Fresh evidence can still trigger the current policy in a later round.
 			entry := f.entries["one"]
 			entry.Status, entry.Disabled = "active", false
 			entry.UpdatedAt = entry.UpdatedAt.Add(time.Second)
 			f.entries["one"] = entry
 			f.changedContent = true
-			assertErrorPolicySkip(t, f, owner, "")
-			assertErrorPolicySkip(t, f, all, "")
+			for _, current := range []*Rule{owner, all} {
+				rows, err = f.round(t, current)
+				if err != nil || len(rows) != 1 || rows[0].Status != "completed" || rows[0].ActionStatus != "observe_only" || f.entries["one"].Disabled {
+					t.Fatal("CPA enablement did not resume current rule selection", rows, err)
+				}
+			}
+			if activeDisposition(f.engine.managed["one"]) || len(f.patches) != 1 {
+				t.Fatal("enablement replayed the old error or retained old recovery authority")
+			}
 		})
 	}
 }

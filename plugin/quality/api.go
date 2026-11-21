@@ -3,6 +3,7 @@ package quality
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -11,16 +12,20 @@ import (
 )
 
 func (en *Engine) Handle(ctx context.Context, req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
-	if strings.HasPrefix(req.Path, "/v0/management/plugins/model-quality/") {
-		if h, ok := en.host.(*NativeHost); ok && h.Management != nil {
-			h.Management.authorize(req.Headers)
-		}
-	}
+
 	path := strings.TrimPrefix(req.Path, "/v0/management/plugins/model-quality")
 	var result any
 	var err error
 	status := 200
+	headers := http.Header{"Content-Type": {"application/json; charset=utf-8"}, "Cache-Control": {"no-store"}, "X-Content-Type-Options": {"nosniff"}}
 	switch req.Method + " " + path {
+	case "GET /connection", "PUT /connection", "DELETE /connection":
+		native, ok := en.host.(*NativeHost)
+		if !ok || native.Management == nil {
+			err = fmt.Errorf("unavailable: backend management adapter unavailable")
+		} else {
+			result, err = native.Management.handleConnection(ctx, req)
+		}
 	case "GET /targets":
 		var items []Target
 		coverage := &providerInventoryStatus{Verified: true}
@@ -245,10 +250,25 @@ func (en *Engine) Handle(ctx context.Context, req pluginapi.ManagementRequest) p
 		err = fmt.Errorf("not_found: route")
 	}
 	if err != nil {
+		var verify *connectionVerificationError
+		if errors.As(err, &verify) {
+			if delay := verify.retryAfterHeader(); delay != "" {
+				headers.Set("Retry-After", delay)
+			}
+		}
 		code, mappedStatus := classifyError(err)
 		status = mappedStatus
 		msg := scrubError(err)
-		result = map[string]any{"error": map[string]string{"code": code, "message": msg}}
+		source := "business"
+		switch {
+		case strings.HasPrefix(code, "management_"), strings.HasPrefix(code, "connection_"):
+			source = "backend_management"
+		case code == "sdk_unavailable":
+			source = "sdk"
+		case code == "unavailable":
+			source = "plugin"
+		}
+		result = map[string]any{"error": map[string]any{"code": code, "message": msg, "source": source, "outcome_unknown": code == "management_uncertain" || code == "connection_save_unknown"}}
 	} else if result == nil {
 		result = map[string]bool{"ok": true}
 	}
@@ -257,7 +277,7 @@ func (en *Engine) Handle(ctx context.Context, req pluginapi.ManagementRequest) p
 		status = 500
 		body = []byte(`{"error":{"code":"serialization_error"}}`)
 	}
-	return pluginapi.ManagementResponse{StatusCode: status, Headers: http.Header{"Content-Type": {"application/json; charset=utf-8"}, "Cache-Control": {"no-store"}, "X-Content-Type-Options": {"nosniff"}}, Body: body}
+	return pluginapi.ManagementResponse{StatusCode: status, Headers: headers, Body: body}
 }
 
 func (en *Engine) settingsResponse() any {

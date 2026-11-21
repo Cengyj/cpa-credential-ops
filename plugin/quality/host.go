@@ -50,7 +50,13 @@ func (h *NativeHost) Targets(ctx context.Context) ([]Target, error) {
 		Files []pluginapi.HostAuthFileEntry `json:"files"`
 	}
 	if err := h.call(ctx, "host.auth.list", struct{}{}, &listed); err != nil {
-		return nil, err
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		return nil, fmt.Errorf("sdk_unavailable: CPA credential inventory callback failed")
+	}
+	if listed.Files == nil {
+		return nil, fmt.Errorf("sdk_unavailable: CPA did not return a credential inventory")
 	}
 	var catalog pluginapi.HostAuthModelsResponse
 	if err := h.call(ctx, "host.auth.models", pluginapi.HostAuthModelsRequest{}, &catalog); err != nil {
@@ -58,6 +64,9 @@ func (h *NativeHost) Targets(ctx context.Context) ([]Target, error) {
 			return nil, ctx.Err()
 		}
 		catalog.Credentials = nil
+	}
+	if _, scheduled := ctx.Value(scheduledInventoryGeneration{}).(uint64); scheduled && catalog.Credentials == nil {
+		return nil, fmt.Errorf("unavailable: CPA SDK model directory is not ready")
 	}
 	models := make(map[string]pluginapi.HostAuthModels, len(catalog.Credentials))
 	catalogIDs := make(map[string]int, len(catalog.Credentials))
@@ -91,6 +100,7 @@ func (h *NativeHost) Targets(ctx context.Context) ([]Target, error) {
 	}
 	if status, ok := ctx.Value(providerInventoryStatusKey{}).(*providerInventoryStatus); ok {
 		status.Verified = configErr == nil
+		status.Reason = providerDirectoryFailureReason(configErr)
 	}
 	routes := routesByIndex(configRoutes)
 	out := make([]Target, 0, len(listed.Files))
@@ -129,11 +139,13 @@ func (h *NativeHost) Targets(ctx context.Context) ([]Target, error) {
 			hasEntry && (entry.ID != item.ID || entry.AuthIndex != item.AuthIndex) || !hasEntry && catalogIDs[item.ID] > 0 ||
 			item.Source == "file" && routes[item.AuthIndex].family != ""
 		if item.Source != "file" && providerFamily(item.ID, item.Provider) != "" {
-			t := configuredTarget(pluginapi.HostAuthModels{ID: item.ID, AuthIndex: item.AuthIndex, Provider: item.Provider, Models: entry.Models}, routes[item.AuthIndex])
-			applyProviderRuntime(&t, item)
-			if conflict {
-				t.identityConflict, t.identityVerified, t.catalogVerified, t.EffectiveAvailable = true, false, false, false
-				t.Reasons = []string{"identity_conflict"}
+			route := routes[item.AuthIndex]
+			if conflict || hasEntry && entry.Provider != item.Provider {
+				route.conflict = true
+			}
+			t := configuredTarget(pluginapi.HostAuthModels{ID: item.ID, AuthIndex: item.AuthIndex, Provider: item.Provider, Models: entry.Models}, route)
+			if !t.identityConflict {
+				applyProviderRuntime(&t, item)
 			}
 			out = append(out, t)
 			continue
@@ -169,10 +181,10 @@ func (h *NativeHost) Targets(ctx context.Context) ([]Target, error) {
 		out = append(out, t)
 	}
 	for _, r := range configRoutes {
-		if seen[r.id] || excluded[r.id] || inventoryIndices[r.index] > 0 {
+		if seen[r.id] || excluded[r.id] {
 			continue
 		}
-		if r.missingIndex && !r.disabled {
+		if inventoryIndices[r.index] > 0 || r.missingIndex && !r.disabled {
 			r.conflict = true
 		}
 		t := configuredTarget(pluginapi.HostAuthModels{ID: r.id, AuthIndex: r.index, Provider: r.executor}, r)
@@ -186,6 +198,12 @@ func (h *NativeHost) Targets(ctx context.Context) ([]Target, error) {
 		}
 		seen[r.id] = true
 		out = append(out, t)
+	}
+	if configErr != nil {
+		reason := providerDirectoryFailureReason(configErr)
+		for i := range out {
+			markProviderDirectoryUnavailable(&out[i], reason)
+		}
 	}
 	return out, nil
 }
@@ -205,7 +223,7 @@ func (h *NativeHost) pinnedTarget(ctx context.Context, id, index string) (Target
 			if len(catalog.Credentials) == 1 {
 				entry := catalog.Credentials[0]
 				if entry.ID == id && entry.AuthIndex == index && providerFamily(id, entry.Provider) != "" {
-					return configuredTarget(entry, h.configuredRoutes(ctx)[index]), nil
+					return h.configuredTargetForEntry(ctx, entry), nil
 				}
 			}
 			r, readErr := h.pinnedConfiguredRoute(ctx, id, index)
@@ -221,7 +239,7 @@ func (h *NativeHost) pinnedTarget(ctx context.Context, id, index string) (Target
 	}
 	verified := current.Auth.ID == id && current.Auth.AuthIndex == index
 	if verified && entry.ID == id && entry.AuthIndex == index && current.Auth.Source != "file" && current.Auth.Provider == entry.Provider && providerFamily(id, entry.Provider) != "" {
-		t := configuredTarget(entry, h.configuredRoutes(ctx)[index])
+		t := h.configuredTargetForEntry(ctx, entry)
 		applyProviderRuntime(&t, current.Auth)
 		return t, nil
 	}
@@ -258,11 +276,23 @@ func runtimeTarget(item pluginapi.HostAuthFileEntry, catalog pluginapi.HostAuthM
 	}
 	t.EffectiveAvailable = len(t.Reasons) == 0
 	t.identityConflict = catalog.AuthIndex != "" && (item.AuthIndex != catalog.AuthIndex || item.ID != catalog.ID || catalog.Provider != provider)
-	if verified && provider != "" && item.ID == catalog.ID && item.AuthIndex == catalog.AuthIndex && provider == catalog.Provider {
-		t.catalogVerified = catalog.Models != nil
+	if verified && provider != "" && item.ID == catalog.ID && item.AuthIndex == catalog.AuthIndex && provider == catalog.Provider && validCatalogModels(catalog.Models) {
+		t.catalogVerified = true
 		t.Models = append(t.Models, catalog.Models...)
 	}
 	return t
+}
+
+func validCatalogModels(models []string) bool {
+	if models == nil {
+		return false
+	}
+	for _, model := range models {
+		if model == "" || strings.TrimSpace(model) != model {
+			return false
+		}
+	}
+	return true
 }
 func (h *NativeHost) Actions(ctx context.Context) ([]Action, error) {
 	if err := ctx.Err(); err != nil {
@@ -358,6 +388,7 @@ func (h *NativeHost) Execute(ctx context.Context, e Execution) (s Sample) {
 	collector := newCollector(limit)
 	var err error
 	if req.Stream {
+		collector = newNativeStreamCollector(limit)
 		var opened pluginapi.HostModelStreamResponse
 		err = h.call(ctx, "host.model.execute_stream", req, &opened)
 		if opened.StreamID != "" {
@@ -387,10 +418,6 @@ func (h *NativeHost) Execute(ctx context.Context, e Execution) (s Sample) {
 				}
 				var chunk pluginapi.HostModelStreamReadResponse
 				if err = h.call(ctx, "host.model.stream_read", pluginapi.HostModelStreamReadRequest{StreamID: opened.StreamID}, &chunk); err != nil {
-					break
-				}
-				if len(chunk.Payload) > limit {
-					err = fmt.Errorf("fragment exceeds response limit")
 					break
 				}
 				if chunk.Error != "" {
@@ -449,6 +476,9 @@ func (h *NativeHost) Execute(ctx context.Context, e Execution) (s Sample) {
 	if collector.finish != "stop" {
 		s.ExecutionStatus = "incomplete"
 		s.Reason = "missing or truncated completion"
+		if collector.finish == "length" {
+			s.Reason = "response output token limit reached"
+		}
 		return s
 	}
 	if strings.TrimSpace(s.Output) == "" {

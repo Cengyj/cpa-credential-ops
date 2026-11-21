@@ -7,7 +7,7 @@ import (
 	"time"
 )
 
-const Version = "0.29.37"
+const Version = "0.31.0"
 
 const maxRuleModels = 50
 const maxManualModels = 16
@@ -84,19 +84,21 @@ type Judge struct {
 	TemplateVersion string `json:"template_version"`
 }
 type RunConfig struct {
-	ReviewStandard  string     `json:"review_standard,omitempty"`
-	ControlAuthID   string     `json:"control_auth_id,omitempty"`
-	ControlProvider string     `json:"control_provider,omitempty"`
-	AuthID          string     `json:"auth_id"`
-	Provider        string     `json:"provider"`
-	Models          []string   `json:"models"`
-	QuestionID      string     `json:"question_id"`
-	Prompt          string     `json:"prompt,omitempty"`
-	Seed            int64      `json:"seed,omitempty"`
-	Samples         int        `json:"samples"`
-	Parameters      Parameters `json:"parameters"`
-	Judge           Judge      `json:"judge"`
-	IdempotencyKey  string     `json:"idempotency_key,omitempty"`
+	ExpectedObjectType string     `json:"expected_object_type,omitempty"`
+	ExpectedAuthIndex  string     `json:"expected_auth_index,omitempty"`
+	ReviewStandard     string     `json:"review_standard,omitempty"`
+	ControlAuthID      string     `json:"control_auth_id,omitempty"`
+	ControlProvider    string     `json:"control_provider,omitempty"`
+	AuthID             string     `json:"auth_id"`
+	Provider           string     `json:"provider"`
+	Models             []string   `json:"models"`
+	QuestionID         string     `json:"question_id"`
+	Prompt             string     `json:"prompt,omitempty"`
+	Seed               int64      `json:"seed,omitempty"`
+	Samples            int        `json:"samples"`
+	Parameters         Parameters `json:"parameters"`
+	Judge              Judge      `json:"judge"`
+	IdempotencyKey     string     `json:"idempotency_key,omitempty"`
 }
 type Question struct {
 	ID      string `json:"id"`
@@ -206,6 +208,7 @@ type Rule struct {
 	ObjectTypes               []string          `json:"object_types,omitempty"`
 	TargetGroup               string            `json:"target_group,omitempty"`
 	TargetAuthIndex           string            `json:"target_auth_index,omitempty"`
+	TargetObjectType          string            `json:"target_object_type,omitempty"`
 	AuthorizedGroups          []string          `json:"authorized_groups,omitempty"`
 	LegacyScope               bool              `json:"legacy_scope,omitempty"`
 	LegacyProviderObservation bool              `json:"legacy_provider_observation,omitempty"`
@@ -213,10 +216,13 @@ type Rule struct {
 	UpstreamErrorActions      map[string]string `json:"upstream_error_actions,omitempty"`
 	AutoRestore               bool              `json:"auto_restore,omitempty"`
 	timerActive               bool
+	timerWaitReason           string
+	expectedTargetObjectType  string
 	TargetScope               string                `json:"target_scope,omitempty"`
 	LastScopeBatch            string                `json:"last_scope_batch,omitempty"`
 	LastManualSkips           []string              `json:"last_manual_skips,omitempty"`
 	LastScopeDispatch         *ScopeDispatchSummary `json:"last_scope_dispatch,omitempty"`
+	PendingSchedule           *pendingRuleSchedule  `json:"pending_schedule,omitempty"`
 	IntentRevision            uint64                `json:"intent_revision,omitempty"`
 	Status                    string                `json:"status"`
 	BlockedAuthID             string                `json:"blocked_auth_id,omitempty"`
@@ -247,6 +253,7 @@ type Rule struct {
 type Target struct {
 	providerProbeModels  map[string]bool
 	providerFamilyName   string
+	reasoningModelIDs    map[string]string
 	ProviderGroupID      string `json:"provider_group_id,omitempty"`
 	ProviderDisableUnit  string `json:"provider_disable_unit,omitempty"`
 	ProviderProbeReason  string `json:"provider_probe_reason,omitempty"`
@@ -258,6 +265,7 @@ type Target struct {
 	catalogVerified      bool
 	Email                string           `json:"email,omitempty"`
 	CredentialHandling   string           `json:"credential_handling,omitempty"`
+	HandlingStateReason  string           `json:"handling_state_reason,omitempty"`
 	ErrorPolicyBlock     *ScopeSkipDetail `json:"error_policy_block,omitempty"`
 	RuntimeStatus        string           `json:"runtime_status,omitempty"`
 	RetainedPause        bool             `json:"retained_pause,omitempty"`

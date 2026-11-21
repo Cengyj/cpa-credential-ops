@@ -50,10 +50,34 @@ func (en *Engine) runByReceipt(key string) (*Run, error) {
 }
 
 func (en *Engine) validateManual(c *RunConfig) error {
+	if c.ExpectedObjectType != "" && c.ExpectedObjectType != objectOAuth && c.ExpectedObjectType != objectProvider || len(c.ExpectedAuthIndex) > 512 {
+		return fmt.Errorf("invalid_request: invalid manual target binding")
+	}
 	if len(c.Models) > maxManualModels {
 		return fmt.Errorf("models out of bounds")
 	}
 	return en.validateConfig(c, false)
+}
+
+func (c RunConfig) verifyManualSubject(targets []Target, kind, index string) error {
+	if kind == "" && index == "" {
+		return nil
+	}
+	found := false
+	for _, t := range targets {
+		if t.AuthID != c.AuthID {
+			continue
+		}
+		if found || t.identityConflict || t.Provider != c.Provider || kind != "" && objectType(t) != kind || index != "" && t.AuthIndex != index {
+			found = false
+			break
+		}
+		found = true
+	}
+	if !found {
+		return fmt.Errorf("blocked: 原绑定的测试对象类型、提供方或索引已变化，请重新选择测试对象。")
+	}
+	return nil
 }
 
 func (en *Engine) validateConfig(c *RunConfig, scoped bool) error {
@@ -127,10 +151,10 @@ func (en *Engine) Submit(ctx context.Context, c RunConfig) (*Run, error) {
 func (en *Engine) submit(ctx context.Context, c RunConfig, ruleID string, scheduledRevision uint64) (*Run, error) {
 	en.mu.Lock()
 	defer en.mu.Unlock()
-	return en.submitLocked(ctx, c, ruleID, scheduledRevision, en.host.Targets)
+	return en.submitLocked(ctx, c, ruleID, scheduledRevision, en.host.Targets, nil)
 }
 
-func (en *Engine) submitLocked(ctx context.Context, c RunConfig, ruleID string, scheduledRevision uint64, inventory func(context.Context) ([]Target, error)) (*Run, error) {
+func (en *Engine) submitLocked(ctx context.Context, c RunConfig, ruleID string, scheduledRevision uint64, inventory func(context.Context) ([]Target, error), occurrence *scheduledRule) (*Run, error) {
 	if en.closed || en.fault != nil {
 		return nil, fmt.Errorf("unavailable: plugin is stopping or persistence failed")
 	}
@@ -181,10 +205,6 @@ func (en *Engine) submitLocked(ctx context.Context, c RunConfig, ruleID string, 
 	if prior != nil {
 		return cloneRun(prior), nil
 	}
-	manualSubject, err := en.runDispositionLocked(c, rule == nil)
-	if err != nil {
-		return nil, err
-	}
 	if err := en.storageAdmission(); err != nil {
 		return nil, err
 	}
@@ -195,16 +215,30 @@ func (en *Engine) submitLocked(ctx context.Context, c RunConfig, ruleID string, 
 	if queueFull && (rule == nil || en.Capabilities().QualityPause) {
 		return nil, fmt.Errorf("queue_full: retry later")
 	}
-	targets, e := inventory(en.runInventoryContextLocked(ctx, manualSubject))
+	targets, e := inventory(en.inventoryContextLocked(ctx))
 	if e != nil {
 		return nil, fmt.Errorf("host targets unavailable: %w", e)
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	manualAccount, err := en.verifyManualSubjectLocked(ctx, c, targets, manualSubject)
-	if err != nil {
+	if rule == nil {
+		if err := c.verifyManualSubject(targets, c.ExpectedObjectType, c.ExpectedAuthIndex); err != nil {
+			return nil, err
+		}
+	}
+	if err := currentTargetError(en.reconcileCurrentTargetsLocked(ctx, targets, dependencies(c)), dependencies(c)); err != nil {
 		return nil, err
+	}
+	if err := en.runDispositionLocked(c, rule == nil); err != nil {
+		return nil, err
+	}
+	var manualAccount string
+	if d := en.managed[c.AuthID]; rule == nil && d != nil && d.State == "externally_enabled" {
+		manualAccount, err = en.currentManualAccountLocked(ctx, c, targets)
+		if err != nil {
+			return nil, err
+		}
 	}
 	subject := Target{AuthID: c.AuthID, Provider: c.Provider}
 	subjectIndex := -1
@@ -256,7 +290,7 @@ func (en *Engine) submitLocked(ctx context.Context, c RunConfig, ruleID string, 
 		}
 	}
 	if managedRule(rule) && subjectIndex >= 0 && !isProviderTarget(subject) && !en.Capabilities().ManagementSession {
-		return reject(fmt.Errorf("management_session_required: reconnect the authenticated plugin panel"), sessionSkip())
+		return reject(fmt.Errorf("management_session_required: background management connection is not ready"), sessionSkip())
 	}
 	targets, managed, e = en.managedTargetsLocked(ctx, rule, targets, false)
 	if e != nil {
@@ -349,10 +383,7 @@ func (en *Engine) submitLocked(ctx context.Context, c RunConfig, ruleID string, 
 	}
 	now := en.now()
 	r := &Run{ID: ID(), Status: "queued", Source: "manual_test", CreatedAt: now, ActionStatus: "not_applicable", Samples: []Sample{}, Config: Frozen{RunConfig: c, Question: q, IdentityVersion: target.IdentityVersion, PayloadConfigVersion: target.PayloadConfigVersion}}
-	if manualSubject != nil {
-		r.Config.ManualPolicyActionID = manualSubject.ActionID
-		r.Config.ManualAccountFingerprint = manualAccount
-	}
+	r.Config.ManualAccountFingerprint = manualAccount
 	if rule != nil {
 		r.Source = "scheduled_probe"
 		r.Config.RuleID = rule.ID
@@ -372,8 +403,12 @@ func (en *Engine) submitLocked(ctx context.Context, c RunConfig, ruleID string, 
 		}
 	}
 	r.CredentialEmail = target.Email
-	if rule == nil && isProviderTarget(*target) {
+	if rule == nil {
+		// Freeze the admitted kind even when an older client only sent the ID.
+		r.Config.ExpectedObjectType = objectType(*target)
 		r.Config.SubjectIndex = target.AuthIndex
+	}
+	if rule == nil && isProviderTarget(*target) {
 		r.Config.ProviderName = target.ProviderName
 		if r.Config.ProviderName == "" {
 			r.Config.ProviderName = target.Provider
@@ -388,6 +423,11 @@ func (en *Engine) submitLocked(ctx context.Context, c RunConfig, ruleID string, 
 		r.Config.BatchID = ID()
 	}
 	r.Config.Fingerprint = fingerprint(r.Config)
+	// Snapshot verification can outlive the request after the directory read.
+	// Check again at the durable admission boundary before workers can own it.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if rule != nil && !en.Capabilities().QualityPause {
 		if managed == nil || !managed.Disabled {
 			if model := firstMissingModel(*target, c.Models); model != "" {
@@ -395,6 +435,17 @@ func (en *Engine) submitLocked(ctx context.Context, c RunConfig, ruleID string, 
 			}
 		}
 		return en.recordFixedAdmissionLocked(rule, r)
+	}
+	if occurrence != nil {
+		c := changes()
+		c.runs[r.ID] = r
+		en.consumeOccurrence(c, cloneRule(rule), occurrence)
+		if err := en.commitLocked(c); err != nil {
+			return nil, err
+		}
+		en.queue <- r.ID
+		en.notifyWorkersLocked()
+		return cloneRun(r), nil
 	}
 	if e = en.store.Write(func(tx *bolt.Tx) error {
 		if e := put(tx, "runs", r.ID, r); e != nil {

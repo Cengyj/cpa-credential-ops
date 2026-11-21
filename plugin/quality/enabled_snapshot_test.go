@@ -36,8 +36,8 @@ func TestActiveCredentialWithChangedFingerprintCanRun(t *testing.T) {
 			}
 			r.Name = "Same test, renamed"
 			r, err = f.engine.SaveRule(ctx, *r, true)
-			if err != nil || f.engine.managed["one"].State != "disabled" || f.probes != before {
-				t.Fatal("editing the rule changed ownership or probed", err)
+			if err != nil || f.engine.managed["one"].State != "externally_enabled" || f.probes != before {
+				t.Fatal("editing the rule failed to observe CPA enablement without probing", err)
 			}
 			for i := 1; i <= 2; i++ {
 				rows, err = f.round(t, r)

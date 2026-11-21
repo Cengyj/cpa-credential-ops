@@ -159,6 +159,9 @@ func (m *Manager) ImportConverted(ctx context.Context, item conversion.Item, gua
 			return result, errors.New("saved_not_adopted")
 		}
 		result.AuthID, result.State, result.CredentialEnabled = actual.ID, "committed", !disabled
+		result.AuthIndex = actual.Index
+		result.Name = actual.FileName
+		result.IdentityVersion = loginHash("identity", actual.ID, principal.Key())
 		if err := m.receipt(result); err != nil {
 			result.State = "commit_unknown"
 			return result, errors.New("commit_unknown")

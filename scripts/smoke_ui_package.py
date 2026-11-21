@@ -2,6 +2,8 @@
 import argparse
 import base64
 import hashlib
+from http.client import parse_headers
+from io import BytesIO
 import json
 import secrets
 import subprocess
@@ -10,6 +12,7 @@ import time
 import uuid
 import zipfile
 from pathlib import Path
+from release_support import validate_package_ui, verify_public_assets
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -26,14 +29,34 @@ def digest(data):
     return hashlib.sha256(data).hexdigest()
 
 
+def check_backend_connection(phase, get, fetch, prefix):
+    path = prefix + '/connection'
+    assert get(path)[0] == 401
+    if phase == 'load':
+        state = fetch(path)
+        assert state['state'] == 'unconfigured' and state['can_migrate']
+        status, body = get(path, True, {'revision': state['revision'], 'mode':'configure'}, method='PUT')
+        assert status == 200 and json.loads(body)['state'] == 'ready', (status, body)
+    else:
+        until = time.monotonic() + 30
+        while time.monotonic() < until:
+            state = fetch(path)
+            if state['state'] == 'ready' and state['source'] == 'saved':
+                break
+            time.sleep(.2)
+        else:
+            raise AssertionError('Backend did not restore its verified connection')
+
+
 def check(package, output, quality_scope=False, provider_targets=False, provider_fixture=None):
     manifest = json.loads((package / 'build-manifest.json').read_bytes())
+    revalidates = validate_package_ui(manifest, ROOT)
     archive = package / f'model-quality-v{manifest["plugin_version"]}-linux-arm64.zip'
     assert digest(archive.read_bytes()) == manifest['checksums'][archive.name]
     name = 'mq-ui-check-' + uuid.uuid4().hex[:12]
     key = secrets.token_urlsafe(32)
 
-    def get(route, auth=False, payload=None, idempotency=None, method=None):
+    def get(route, auth=False, payload=None, idempotency=None, method=None, *, headers=False, etag=None, if_match=None):
         args = ['run', '--rm', '--pull=never', '--network', f'container:{name}', '-i', CURL, 'curl', '-qsS', '--noproxy', '*', '--max-time', '5', '-w', '\n%{http_code}']
         # Send the disposable token through stdin, not process arguments.
         if auth:
@@ -44,8 +67,17 @@ def check(package, output, quality_scope=False, provider_targets=False, provider
             args.extend(['-X', method])
         if idempotency:
             args.extend(['--header', 'Idempotency-Key: ' + idempotency])
+        if headers:
+            args.extend(['--dump-header', '-'])
+        if etag:
+            args.extend(['--header', 'If-None-Match: ' + etag])
+        if if_match:
+            args.extend(['--header', 'If-Match: ' + if_match])
         raw = docker(*args, 'http://127.0.0.1:18379' + route, input=(f'Authorization: Bearer {key}\n'.encode() if auth else b''), stderr=subprocess.PIPE)
         body, status = raw.rsplit(b'\n', 1)
+        if headers:
+            head, body = body.split(b'\r\n\r\n', 1)
+            return int(status), body, parse_headers(BytesIO(head.split(b'\r\n', 1)[1] + b'\r\n\r\n'))
         return int(status), body
 
     def fetch(route):
@@ -98,6 +130,7 @@ def check(package, output, quality_scope=False, provider_targets=False, provider
                 assert entry['metadata']['name'] == 'Credential Ops'
                 assert entry['metadata']['github_repository'] == 'https://github.com/Cengyj/cpa-credential-ops'
                 assert get(PREFIX + '/settings')[0] == 401
+                assert get('/v0/resource/plugins/model-quality/connection')[0] == 404
                 assert get(PREFIX + '/runs/history', method='DELETE')[0] == 401
                 if not provider_targets or phase == 'load':
                     status, cleared = get(PREFIX + '/runs/history', True, method='DELETE')
@@ -107,6 +140,8 @@ def check(package, output, quality_scope=False, provider_targets=False, provider
                 runtime = capabilities['runtime']
                 assert runtime['runtime_version'] == manifest['runtime_version']
                 converted = False
+                if not provider_targets:
+                    check_backend_connection(phase, get, fetch, PREFIX)
                 if quality_scope:
                     assert get(PREFIX + '/rules/scheduling', payload={'expected': False, 'enabled': True}, method='PUT')[0] == 401
                     settings = fetch(PREFIX + '/settings')
@@ -273,15 +308,25 @@ ThreadingHTTPServer(('127.0.0.1',18887),Mock).serve_forever()"""
                     converted = True
                 assert not fetch(PREFIX + '/login/accounts')['items']
                 assert not fetch(PREFIX + '/login/jobs')['items']
-                hashes = {}
-                for resource, expected in manifest['ui_source_sha256'].items():
-                    status, data = get('/v0/resource/plugins/model-quality/' + resource)
-                    assert status == 200 and digest(data) == expected == digest((ROOT / 'plugin/ui' / resource).read_bytes()), resource
-                    hashes[resource] = expected
+                for resource in ('/settings', '/login/accounts'):
+                    status, body, headers = get(PREFIX + resource, True, headers=True, etag='*')
+                    assert status == 200 and json.loads(body) is not None and headers.get('Cache-Control') == 'no-store', resource
+                hashes = manifest['ui_source_sha256']
+                verify_public_assets(hashes, revalidates, lambda path, tag=None: get(path, headers=True, etag=tag))
+                if tuple(map(int, manifest['plugin_version'].split('.'))) >= (0, 30, 11):
+                    index = '/v0/resource/plugins/model-quality/index.html'
+                    current = f'W/"{hashes["index.html"]}"'
+                    for prerequisite, expected in ((current, 412), ('"old-package"', 412), ('*', 304)):
+                        status, body, headers = get(index, headers=True, etag=current, if_match=prerequisite)
+                        assert status == expected and not body and headers.get('ETag') == current
                 phases.append({'phase': phase, 'registered': True, 'effective_enabled': True, 'version': entry['metadata']['version'], 'runtime': runtime['runtime_version'], 'ui_source_sha256': hashes, 'unauthenticated_status': 401, 'accounts': 0, 'jobs': 0, 'synthetic_conversion_uploaded': converted, **({'synthetic_conversion_rows': len(receipts), 'conversion_result': expected_conversion} if converted else {}), 'scope_verified': quality_scope, 'rule_history_filter': quality_scope, **({'mock_calls':total_calls, 'models':registered_models, 'requested_to_wire':observed} if quality_scope and phase == 'load' else {})})
-            report = {'image': HOST, 'network': 'none', 'ui': manifest['ui_version'], 'zip_sha256': digest(archive.read_bytes()), 'phases': phases}
+            report = {'image': HOST, 'network': 'none', 'ui': manifest['ui_version'], 'zip_sha256': digest(archive.read_bytes()), 'phases': phases,
+                      'all_public_assets_revalidated': revalidates, 'management_cache_control': 'no-store'}
             if provider_targets:
                 report['provider_targets'] = provider_report
+            logs = subprocess.run(['docker','logs',name], check=True, capture_output=True)
+            assert key.encode() not in logs.stdout + logs.stderr
+            report['management_key_absent_from_host_logs'] = True
             output.write_text(json.dumps(report, indent=2) + '\n')
             print('Isolated CPA verified registration, six embedded assets, authentication, runtime, and restart.')
         except BaseException:

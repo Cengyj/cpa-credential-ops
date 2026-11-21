@@ -107,6 +107,7 @@ func TestManualDeletionOnlyRemovesMarkerAndExplicitClearPreservesRecovery(t *tes
 		}
 	}
 	f.fileStatus = 0
+	f.verifyManagement(t)
 	// A replacement with the same filename must also keep the record.
 	f.entries["replacement"] = pluginapi.HostAuthFileEntry{ID: "replacement", AuthIndex: "replacement", Name: gone.Snapshot.Name}
 	if err := check(); err != nil || en.managed["one"] != gone {
@@ -212,7 +213,7 @@ func TestCleanupPreservesUncertainAndHistoricalOwnership(t *testing.T) {
 	}
 }
 
-func TestMarkerCheckOnlyAfterOwnerRound(t *testing.T) {
+func TestObservedRemovalRetainsHistoricalMarkerWithoutRecoveryAuthority(t *testing.T) {
 	f := managementTestFixture(t)
 	en, ctx := f.engine, context.Background()
 	r := f.rule(t, disableCredential, true, true)
@@ -246,8 +247,8 @@ func TestMarkerCheckOnlyAfterOwnerRound(t *testing.T) {
 	}
 	task := en.nextRunnableLocked()
 	en.executeTask(task)
-	if err := en.checkFinishedRounds(ctx); err != nil || en.managed["one"] != nil {
-		t.Fatal("round completion missed cleanup", err)
+	if err := en.checkFinishedRounds(ctx); err != nil || en.managed["one"] == nil || en.managed["one"].State != "entry_missing" || activeDisposition(en.managed["one"]) {
+		t.Fatal("round completion lost removed-entry history or retained recovery authority", err)
 	}
 	delete(f.entries, "two")
 	delete(f.entries, "three")
@@ -255,7 +256,12 @@ func TestMarkerCheckOnlyAfterOwnerRound(t *testing.T) {
 	if err != nil || receipt.Count != 0 {
 		t.Fatal(receipt, err)
 	}
-	if err := en.checkFinishedRounds(ctx); err != nil || len(en.managed) != 0 {
-		t.Fatal("empty round missed cleanup", err)
+	if err := en.checkFinishedRounds(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range en.managed {
+		if d.State != "entry_missing" || activeDisposition(d) {
+			t.Fatal("empty verified directory retained recovery authority", d)
+		}
 	}
 }

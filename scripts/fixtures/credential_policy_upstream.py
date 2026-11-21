@@ -49,7 +49,8 @@ class Upstream(BaseHTTPRequestHandler):
             record.write(json.dumps(entry) + '\n')
 
         if isinstance(outcome, dict):
-            self.respond('application/json', json.dumps({'error': outcome['error']}).encode(), outcome['status'])
+            self.respond('application/json', json.dumps({'error': outcome['error']}).encode(),
+                         outcome['status'], outcome.get('headers'))
             return
         if outcome == 'timeout':
             self.send_error(504)
@@ -58,6 +59,26 @@ class Upstream(BaseHTTPRequestHandler):
             choice = {'message': {'role': 'assistant', 'content': outcome}, 'finish_reason': 'stop'}
             body = json.dumps({'model': model, 'choices': [choice]}).encode()
             self.respond('application/json', body)
+            return
+        if outcome in ('duplicate_status_wrong', 'duplicate_status_correct', 'completion_after_done',
+                       'incomplete_details_wrong', 'incomplete_details_correct', 'joined_ids_wrong', 'joined_ids_correct'):
+            answer = '4' if outcome.endswith('_correct') else '5'
+            response = {'status': 'completed', 'model': model, 'output': [
+                {'type': 'message', 'status': 'completed', 'content': [{'type': 'output_text', 'text': answer}]}]}
+            if outcome.startswith('incomplete_details_'):
+                response['incomplete_details'] = {'reason': 'max_output_tokens'}
+            if outcome.startswith('joined_ids_'):
+                response['id'] = 'different-response'
+            raw = json.dumps({'type': 'response.completed', 'response': response})
+            if outcome.startswith('duplicate_status_'):
+                raw = raw.replace('"status": "completed"', '"status": "completed", "status": "incomplete"', 1)
+            body = ('data: ' + raw + '\n\n').encode()
+            if outcome == 'completion_after_done':
+                body = b'data: [DONE]\n\n' + body
+            if outcome.startswith('joined_ids_'):
+                created = {'type': 'response.created', 'response': {'id': 'first-response', 'model': model, 'status': 'in_progress'}}
+                body = ('data: ' + json.dumps(created) + '\n\n').encode() + body
+            self.respond('text/event-stream', body)
             return
         if outcome == 'truncated':
             events = [{'type': 'response.output_text.delta', 'delta': '4'}]
@@ -89,10 +110,12 @@ class Upstream(BaseHTTPRequestHandler):
         body = ''.join('data: ' + json.dumps(event) + '\n\n' for event in events).encode()
         self.respond('text/event-stream', body)
 
-    def respond(self, media_type, body, status=200):
+    def respond(self, media_type, body, status=200, headers=None):
         self.send_response(status)
         self.send_header('Content-Type', media_type)
         self.send_header('Content-Length', str(len(body)))
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(body)
 

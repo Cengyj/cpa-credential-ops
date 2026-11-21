@@ -139,14 +139,7 @@ func (en *Engine) executeTask(task *executionTask) {
 		en.mu.Unlock()
 	}()
 	if f.CatalogMissingModel != "" {
-		en.mu.Lock()
-		terminal := en.terminalDependencyLocked(f.RunConfig)
-		en.mu.Unlock()
-		if terminal {
-			en.finish(id, fmt.Errorf("blocked: credential already disabled by error policy"))
-			return
-		}
-		en.finish(id, ctx.Err())
+		en.finish(id, en.checkExecution(ctx, id, f))
 		return
 	}
 	phases := []bool{false}

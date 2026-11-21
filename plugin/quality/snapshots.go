@@ -65,6 +65,11 @@ func cloneRule(rule *Rule) *Rule {
 	out.UpstreamErrorActions = maps.Clone(rule.UpstreamErrorActions)
 	out.LastManualSkips = slices.Clone(rule.LastManualSkips)
 	out.LastScopeDispatch = cloneScopeDispatch(rule.LastScopeDispatch)
+	if rule.PendingSchedule != nil {
+		pending := *rule.PendingSchedule
+		pending.Accepted = slices.Clone(pending.Accepted)
+		out.PendingSchedule = &pending
+	}
 	return &out
 }
 

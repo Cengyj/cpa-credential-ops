@@ -41,7 +41,7 @@ func TestSecurityWithMissingCPABinding(t *testing.T) {
 			}
 			var oldID string
 			var oldEntry account.Entry
-			opts.Prepare = func(_ context.Context, id, identity string) error {
+			opts.Prepare = func(_ context.Context, id, identity, _ string) error {
 				if mode == "quality_block" && id == oldID {
 					return errors.New("quality_authority_unavailable")
 				}

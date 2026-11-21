@@ -98,9 +98,17 @@ func (s *Service) uploadConversion(ctx context.Context, raw []byte) (any, error)
 			}
 			return s.checkUploadPlans(&auth.Auth{Provider: "codex", Metadata: item.Credential}, auth.LoginSnapshot{}, nil)
 		}
+		prepared := ""
+		commitID := "conversion:" + conversion.Identity(item)
 		result, uploadErr := s.opts.Manager.ImportConverted(ctx, item, guard, func(ctx context.Context, id, identity string) error {
-			return owner.Prepare(ctx, id, identity, "conversion:"+conversion.Identity(item))
+			prepared = id
+			return owner.Prepare(ctx, id, identity, commitID)
 		})
+		if prepared != "" {
+			if finishErr := s.finishCredentialWrite(prepared, commitID, result); finishErr != nil && uploadErr == nil {
+				uploadErr = errors.New("quality_reconciliation_pending")
+			}
+		}
 		row := map[string]any{"index": index, "filename": item.Filename, "auth_id": result.AuthID, "code": SafeCode(uploadErr)}
 		switch {
 		case result.State == auth.ConversionAlreadyPresent || result.State == auth.ConversionPreviouslyUploaded:

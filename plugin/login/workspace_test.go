@@ -122,7 +122,11 @@ func TestReauthorizationRefusesUnreadableOrReplacedWorkspaceBeforeRuntime(t *tes
 			r.Intent, r.TargetAuthID, r.ExpectedIdentityVersion, r.ProxyURL = "reauthorize", first.TargetAuthID, snapshot.IdentityVersion, "direct"
 			armed.Store(true)
 			_, err = s.Start(r)
-			if err == nil || err.Error() != "identity_changed" || runtimeCalls.Load() != 1 || h.saves != 1 {
+			code := "identity_changed"
+			if mode == "unreadable" {
+				code = "storage_unavailable"
+			}
+			if err == nil || err.Error() != code || runtimeCalls.Load() != 1 || h.saves != 1 {
 				t.Fatalf("changed workspace started an unpinned login: %v", err)
 			}
 		})

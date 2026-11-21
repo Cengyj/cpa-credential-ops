@@ -15,7 +15,7 @@ const portIndex = process.argv.indexOf('--port');
 const requestedPort = portIndex < 0 ? 0 : Number(process.argv[portIndex + 1]);
 if (!Number.isInteger(requestedPort) || requestedPort < 0 || requestedPort > 65535) throw new Error('Invalid --port');
 const staticFiles = new Set(['index.html', 'app.js', 'client.js', 'login.js', 'view.js', 'style.css']);
-let accounts, jobs, credentials, logs, recoveries, settings, sequence, injections, calls, receipts;
+let accounts, jobs, credentials, logs, recoveries, settings, sequence, injections, calls, receipts, connection;
 let qualityTargets, questions, qualityRuns, qualityRules, qualityActions, qualityAudits, qualitySettings;
 const timers = new Set();
 const active = new Set(['queued', 'running', 'waiting_browser', 'exchanging', 'validating', 'committing', 'cancelling']);
@@ -39,6 +39,7 @@ function uploadExcluded(job) {
 
 function seed() {
   sequence = 500;
+  connection = { revision: 1, state: 'ready', configured: true, can_migrate: false, source: 'saved' };
   injections = []; calls = []; receipts = new Map();
   credentials = new Map(); logs = new Map(); recoveries = new Map();
   settings = { revision: 1, inspection_enabled: false, auto_relogin_enabled: false, interval_minutes: 15, login_proxy_url: 'socks5h://host.docker.internal:1080', cpa_upload_excluded_plans: [] };
@@ -349,6 +350,17 @@ const server = http.createServer(async (req, res) => {
     }
     const reply = (data, status = 200) => send(res, data, status, delay);
     if (!url.pathname.startsWith(loginPrefix + '/')) {
+      if (route === '/connection') {
+        if (req.method === 'GET') return reply(connection);
+        if (body.revision !== connection.revision) return reply({ code: 'connection_conflict' }, 409);
+        if (req.method === 'PUT' && ['configure', 'migrate'].includes(body.mode)) {
+          if (body.mode === 'migrate' && !connection.can_migrate) return reply({ code: 'connection_conflict' }, 409);
+          connection = { revision: connection.revision + 1, state: 'ready', configured: true, can_migrate: false, source: 'saved' };
+        } else if (req.method === 'DELETE') {
+          connection = { revision: connection.revision + 1, state: 'unconfigured', configured: false, can_migrate: false };
+        } else return reply({ code: 'invalid_request' }, 400);
+        return reply(connection);
+      }
       if (req.method === 'POST' && route === '/rules/scope-preview') {
         const selected = qualityTargets.filter(t => body.object_types?.includes('oauth') &&
           (body.target_scope === 'single' ? t.auth_id === body.auth_id : body.target_scope === 'all_credentials' || !t.manual_disabled));

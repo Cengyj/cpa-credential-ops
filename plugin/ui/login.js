@@ -20,6 +20,10 @@ const reasons = {
   unsupported_login_target: '此凭证来源不支持重新授权。',
   unsupported_login_store: '当前 CPA 不支持保存此类凭证。',
   quality_authority_unavailable: 'CPA 状态尚未就绪，暂时无法导入凭证。',
+  quality_reconciliation_pending: '凭证提交已确认，规则等待本地回执核对。',
+  retained_quality_pause: '此凭证保留历史独立质量暂停，当前授权写入受保护。',
+  credential_handling_pending: '此凭证仍有待核对的处置写入，请先核对原处置结果。',
+  quality_credential_restricted: 'CPA 当前条目仍受质量处置限制，请查看凭证状态和处置记录。',
   home_controlled: '当前 Home 管理模式不支持此操作。',
   runtime_invalid: '登录服务校验失败，请检查插件安装。',
   runtime_failed: '登录请求未完成，请查看最后一个请求的结果。',
@@ -167,7 +171,7 @@ function saveWorkflowPreference(workflow, choices) {
 }
 
 // Authentication inputs remain in this workbench only until its request is sent.
-export function createLoginWorkbench({ request, connected, onCommitted }) {
+export function createLoginWorkbench({ request, connected, visible = () => !document.hidden && navigator.onLine !== false, onCommitted }) {
   const $ = id => document.getElementById(id);
   const state = { open: false, epoch: 0, capabilities: null, targets: [], jobs: [], selected: '', job: null, candidate: null, vault: null, timer: null, busy: new Set(), urls: new Map(), detailSignature: '', storageRead: 0, detailRead: 0, jobsRead: 0, view: 'accounts', accounts: [], accountSettings: null, accountRead: 0, accountsAvailable: false, accountSignature: '', accountEditing: null, accountStarting: '', accountDetailFailed: false, settingsDirty: false, settingsDraftRevision: null, accountDetailRead: 0, accountDetailLoading: false, accountQuery: '', accountFilter: 'all', accountPage: 0, jobSignature: '', revealJob: false, accountsLoaded: false, jobsAvailable: false, bootstrapReady: false, readErrors: new Map(), nextReadAt: 0, readFailures: 0 };
   const get = path => request(path);
@@ -918,6 +922,7 @@ export function createLoginWorkbench({ request, connected, onCommitted }) {
     });
   }
   function renderAccounts() {
+    $('login-workbench').toggleAttribute('data-accounts-loaded', state.accountsLoaded);
     const count = state.accounts.length;
     const filtered = filteredAccounts();
     const pages = Math.max(1, Math.ceil(filtered.length / 20));
@@ -929,7 +934,7 @@ export function createLoginWorkbench({ request, connected, onCommitted }) {
     for (const option of $('account-status-filter').options) option.textContent = `${filterLabels[option.value]} · ${state.accountsLoaded ? totals[option.value] : '—'}`;
     $('account-status-filter').value = state.accountFilter;
     let message = '';
-    if (state.readErrors.has('账号列表')) message = state.accountsLoaded ? '显示上次读取的账号，正在等待重新读取。' : '账号列表读取失败，正在等待重新读取。';
+    if (state.readErrors.has('账号列表')) message = (state.accountsLoaded ? '显示上次读取的账号，正在等待重新读取。' : '账号列表读取失败，正在等待重新读取。') + state.readErrors.get('账号列表');
     else if (state.readErrors.has('巡检设置')) message = '巡检设置暂未刷新，部分操作暂不可用。';
     $('account-list-summary').textContent = message;
     $('account-list-summary').hidden = !message;
@@ -1251,14 +1256,15 @@ export function createLoginWorkbench({ request, connected, onCommitted }) {
 
   function setReadError(name, error) {
     if (isDiscarded(error)) return;
-    if (error) state.readErrors.set(name, true);
+    if (error) state.readErrors.set(name, error.status === 403 ? 'CPA 拒绝了页面访问（403）。' : error.status === 429 ? 'CPA 正在限流（429）。' : '');
     else state.readErrors.delete(name);
     renderReadStatus();
     updateControls();
   }
   function renderReadStatus() {
     const failed = [...state.readErrors.keys()];
-    const message = failed.length ? `${failed.join('、')}暂未刷新，正在等待重新读取。` : '';
+    const reasons = [...new Set(state.readErrors.values())].join('');
+    const message = failed.length ? `${failed.join('、')}暂未刷新，正在等待重新读取。${reasons}` : '';
     for (const id of ['login-history-read-note', 'login-settings-read-note']) {
       $(id).hidden = !failed.length;
       $(id).textContent = message;
@@ -1851,11 +1857,11 @@ export function createLoginWorkbench({ request, connected, onCommitted }) {
   }
   function schedule(delay = pollDelay()) {
     clearTimeout(state.timer);
-    if (!state.open || !connected() || document.hidden || navigator.onLine === false) return;
+    if (!state.open || !connected() || !visible()) return;
     state.timer = setTimeout(() => { reload(); }, delay);
   }
   function resumeReads(initialAccounts) {
-    if (!state.open || !connected()) return;
+    if (!state.open || !connected() || !visible()) return;
     if (refreshCycle?.epoch === state.epoch) return refreshCycle.promise;
     const remaining = state.nextReadAt - performance.now();
     if (!initialAccounts && remaining > 0 && state.accountsAvailable && state.jobsAvailable && state.bootstrapReady && !state.readErrors.size) {
@@ -2017,12 +2023,11 @@ export function createLoginWorkbench({ request, connected, onCommitted }) {
     $(id).addEventListener('cancel', event => { event.preventDefault(); closeAccountSurface(true); });
     $(id).addEventListener('close', () => { if (!$(id).open && state.view === view) closeAccountSurface(false, true); });
   }
-  document.addEventListener('visibilitychange', () => {
-    if (document.hidden) clearTimeout(state.timer);
-    else resumeReads();
-  });
-  addEventListener('online', () => { if (!document.hidden) resumeReads(); });
-  addEventListener('offline', () => { clearTimeout(state.timer); if (state.open && connected()) setReadError('网络连接', new Error('offline')); });
+  function syncVisibility() {
+    if (visible()) return resumeReads();
+    clearTimeout(state.timer);
+    if (state.open && connected() && navigator.onLine === false) setReadError('网络连接', new Error('offline'));
+  }
   for (const id of ['account-security-logout', 'account-security-reauthorize', 'account-security-upload']) $(id).addEventListener('change', () => {
     if (!securityAction) return;
     renderSecurityPlan();
@@ -2294,7 +2299,7 @@ export function createLoginWorkbench({ request, connected, onCommitted }) {
       if (taskLogs.follow) viewport.scrollTop = viewport.scrollHeight;
     } else if (['copy', 'export'].includes(action)) void exportTaskLog(action);
   });
-  return { open, close, readInitialAccounts: readAccountList, refresh: () => { state.bootstrapReady = false; return reload(); }, reset: () => close({ reset: true, focus: false }) };
+  return { open, close, syncVisibility, refresh: () => { state.bootstrapReady = false; return reload(); }, reset: () => close({ reset: true, focus: false }) };
 }
 
 function phaseLabel(phase) {
@@ -2370,7 +2375,7 @@ function securityProgress(job) {
 }
 
 function reasonLabel(reason) {
-  return ({ cpa_plan_excluded: '套餐命中上传排除设置，暂不上传 CPA', not_inference_verified: '此授权尚未经过模型测试', quality_paused: '质量暂停继续生效', operator_disabled: '人工禁用继续生效', manual_disabled: '人工禁用继续生效', native_cooldown: 'CPA 冷却继续生效', rules_stopped: '相关检测规则保持停止', new_credential_disabled: '新凭证默认人工禁用' })[reason] || '其他凭证限制继续生效';
+  return ({ cpa_plan_excluded: '套餐命中上传排除设置，暂不上传 CPA', not_inference_verified: '此授权尚未经过模型测试', quality_paused: '质量暂停继续生效', operator_disabled: '人工禁用继续生效', manual_disabled: '人工禁用继续生效', native_cooldown: 'CPA 冷却继续生效', rules_stopped: '相关检测规则保持停止', credential_write_isolation: '保存期间相关检测等待，确认同一条目后按当前规则许可继续', new_credential_disabled: '新凭证默认人工禁用' })[reason] || '其他凭证限制继续生效';
 }
 
 export function validImportTOTP(value) {

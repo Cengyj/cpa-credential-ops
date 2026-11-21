@@ -8,12 +8,13 @@
 
 ```text
 <plugin-data-dir>/
+  management/connection.json
   quality.db
   accounts/
     credential-login.db
     login-receipts.db
   login-runtime/
-    2.1.0-<os>-<arch>-<archive-sha12>/
+    2.2.1-<os>-<arch>-<archive-sha12>/
       manifest.json
       bin/login-runtime
       来源与许可材料
@@ -27,7 +28,7 @@
 | 凭证提交收据和不确定结果 | `accounts/login-receipts.db`，不用于反复重放 token 写入 |
 | 手动测试、回答、质量观察规则、设置、审计 | `quality.db`，bbolt 中保存 JSON |
 | 正式 OAuth token | 账号登录成功后自动通过官方 `host.auth.save` 写入 CPA 自己的凭证目录 |
-| CPA 管理密钥 | 成功连接后存入当前浏览器的 `localStorage`，不写入插件数据库 |
+| CPA 管理密钥 | 后台配置保存在 `management/connection.json`，当前浏览器的页面访问密钥另存插件自己的 `localStorage`，两处均为明文 |
 | Go＋Sobek 程序 | `login-runtime/`；没有账号密码和 token |
 
 bbolt/Gob 是存储及序列化格式，不是加密。账号和 2FA 可由程序直接读取。账号目录要求 `0700`、数据库 `0600`；权限控制并非加密。CPA 原有管理密钥 bcrypt 校验保持官方行为，不涉及插件账号加密。
@@ -35,6 +36,8 @@ bbolt/Gob 是存储及序列化格式，不是加密。账号和 2FA 可由程�
 HMAC 元数据用于去重、幂等和限流指纹，不是存储加密密钥；与数据库一同保留。账号明文、OAuth token 和 CPA 管理密钥是三类独立数据，删除其中一种不等于删除其他内容。
 
 ## 保存与登录
+
+凭证更新期间的规则等待、按提交收据恢复和身份冲突处理见[重新授权与检测规则](CREDENTIAL_REAUTH_RULES_CN.md)。
 
 导入 `账号----密码----2FA长期密钥` 后，通过受鉴权的插件 `/login/accounts/import` 保存到账号库。导入本身不发起登录。编辑账号带 revision，旧页面不能覆盖已有新版本。
 
@@ -52,9 +55,17 @@ HMAC 元数据用于去重、幂等和限流指纹，不是存储加密密钥；
 model-quality:management-key:/v0/management/plugins/model-quality
 ```
 
-浏览器按协议、域名和端口隔离这个值。成功连接后明文保存；刷新或重新打开会读取它并恢复连接。请求使用 Authorization header，不把密钥放入 URL、Cookie 或导出文件。账号密码、2FA 和未保存导入文本不存入浏览器 localStorage。
+浏览器按协议、域名和端口隔离这个值，鉴权成功后在插件自己的 localStorage 中明文保存。刷新或重新打开时用它恢复当前浏览器的管理访问。请求通过 Authorization 头发送密钥，URL、Cookie 和诊断导出均不含密钥。账号密码、2FA 和未保存导入文本不存入浏览器 localStorage。
 
-主动断开或该密钥返回 401 时清除；临时网络错误保留。浏览器禁用本地存储时会提示并降级为本页面内存连接。清除浏览器站点数据只会清掉浏览器密钥，不删除插件账号库。官方 CPA 外层管理页面有自己的登录存储，插件不读取它。
+从 CPA 侧栏返回插件时，当前标签页在 `sessionStorage` 中记住所选工作区。重新载入页面时，浏览器用已保存的密钥向官方 CPA 鉴权，读取后台状态和工作区数据。旧版浏览器保存的密钥可通过一次带版本条件的迁移请求建立后台配置。退出当前浏览器会清除本站点的插件访问身份，其他标签页同步退出。后台密钥由独立配置操作更新或清除。插件不读取父页面登录存储。
+
+## 后台管理配置与数据卷
+
+`data_dir/management/` 是专用的 0700 目录，`connection.json` 是 0600 的明文 JSON。模式 1 记录回环地址、配置修订、状态及用于管理鉴权的密钥。显式清除或确认失效会用无密钥的记录替换原文件。写入使用同目录临时文件、文件同步、原子更名和目录同步。目录权限异常、内容损坏、版本无法识别或已保存地址发生变化时，状态接口返回诊断代码，保留其他业务存储。更新失败的响应说明重启恢复配置未能确认。备份与数据卷需要与原文件同等保护。
+
+本机 Docker 的容器目录为 `/CLIProxyAPI/plugin-data/model-quality`。替换容器时把原数据卷挂回相同位置，并保持 `data_dir` 和回环地址一致。默认回环地址为 `http://127.0.0.1:8317`，通过 `MODEL_QUALITY_CPA_URL` 可指定其他环回 IP 和端口。容器内填写 CPA 监听端口。使用 HTTPS 时沿用正常证书验证。
+
+初次部署也可以显式注入 `MODEL_QUALITY_MANAGEMENT_KEY`。仅在没有本地记录时读取该环境变量，随后通过相同的正式鉴权检查。已保存的配置、清除标记和失效标记优先。部署来源的有效密钥仅驻留内存，显式面板更新会建立优先的本地记录。没有记录时，重建进程会重新读取部署环境；已有失效标记后请显式提交新密钥。插件不扫描 CPA 配置、父页面存储或凭证目录寻找密钥。账号密码、TOTP、OAuth 凭证和提供商配置的使用边界见下文与[后台连接和恢复](BACKGROUND_CONNECTION_CN.md)。
 
 ## 重启、升级和备份
 

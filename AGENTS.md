@@ -67,8 +67,10 @@ network errors, refusal, truncation, cancellation and unknown answers do not.
 An owned disabled credential can be probed through the existing management
 API-call channel. Optional recovery requires every selected model and sample to
 pass and the stored credential snapshot to remain unchanged. Never temporarily
-enable a credential for testing. Management authorization stays in process memory;
-never hardcode or persist the panel key. Uncertain mutations are not replayed.
+enable a credential for testing. Since 2026-11-21, explicitly verified loopback management authorization
+is saved to the plugin's private management directory for browser-free restart.
+Ordinary authenticated reads never install a key. Keep the key out of quality
+settings, source, public resources, task records, logs, and exports. Uncertain mutations are not replayed.
 Document CPA's lack of atomic conditional status/delete operations. Verification
 uses only isolated fake credentials and upstreams; deploying this plugin does not
 authorize real-account actions or model calls.

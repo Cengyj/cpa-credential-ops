@@ -27,10 +27,8 @@ func TestVisibleTargetsSeparatesLiveAvailabilityFromHistoricalError(t *testing.T
 		t.Fatal(targets, err)
 	}
 	current := targets[0]
-	history := current.ErrorPolicyBlock
-	if !current.EffectiveAvailable || current.ManualDisabled || current.CredentialHandling != "disabled" ||
-		history == nil || history.Code != "error_policy_disabled" || history.Model != "old-model" || history.Reason != "CPA 注册目录缺少所选模型" {
-		t.Fatalf("lost or conflated the live and historical states: %+v, %+v", current, history)
+	if !current.EffectiveAvailable || current.ManualDisabled || current.CredentialHandling != "disabled" || current.ErrorPolicyBlock != nil || current.HandlingStateReason == "" {
+		t.Fatalf("current enabled state was replaced by a historical disabled claim: %+v", current)
 	}
 	if targets[1].ErrorPolicyBlock != nil || targets[2].ErrorPolicyBlock != nil {
 		t.Fatal("non-error and acknowledged dispositions must not appear as error suspensions")

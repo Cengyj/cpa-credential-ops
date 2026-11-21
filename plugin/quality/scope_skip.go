@@ -11,6 +11,8 @@ type ScopeSkipDetail struct {
 	NotExecuted bool   `json:"not_executed,omitempty"`
 	RunID       string `json:"run_id,omitempty"`
 	AuthID      string `json:"auth_id"`
+	ObjectType  string `json:"object_type,omitempty"`
+	AuthIndex   string `json:"auth_index,omitempty"`
 	Email       string `json:"email,omitempty"`
 	Code        string `json:"code"`
 	Model       string `json:"model,omitempty"`
@@ -52,14 +54,19 @@ func preflightStatus(code string) string {
 	switch code {
 	case "unsupported_provider", "unsupported_file", "native_routing_required", "snapshot_unavailable":
 		return "failed"
-	case "identity_conflict", "identity_missing", "provider_mismatch", "handling_blocked", "ownership_changed", "quality_paused", "snapshot_runtime_conflict", "management_session_required", "runtime_unavailable", "credential_missing":
+	case "identity_conflict", "identity_missing", "bound_origin_changed", "provider_mismatch", "handling_blocked", "ownership_changed", "quality_paused", "snapshot_runtime_conflict", "management_session_required", "runtime_unavailable", "credential_missing":
 		return "blocked"
 	}
 	return ""
 }
 
 func queueCatalogRun(run *Run, model string) {
-	run.PreflightDetail = &ScopeSkipDetail{Code: "missing_model", Model: model, Reason: "CPA 已核实该凭证没有注册所选模型。", AuthID: run.Config.AuthID, Email: run.CredentialEmail, RunID: run.ID}
+	detail := &ScopeSkipDetail{Code: "missing_model", Model: model, Reason: "CPA 已核实该凭证没有注册所选模型。", ObjectType: objectOAuth, AuthID: run.Config.AuthID, Email: run.CredentialEmail, RunID: run.ID}
+	if run.Config.ProviderObservation {
+		detail.ObjectType, detail.AuthIndex = objectProvider, run.Config.SubjectIndex
+		detail.Reason = "CPA 已核实该供应商路由没有注册所选模型。"
+	}
+	run.PreflightDetail = detail
 	run.Config.CatalogMissingModel = model
 	run.Config.Fingerprint = ""
 	run.Config.Fingerprint = fingerprint(run.Config)
@@ -73,6 +80,9 @@ func ruleSubjectEnabled(t Target) bool {
 }
 
 func providerRouteProblem(t Target, models []string) *scopeRejection {
+	if problem := providerBindingProblem(t); problem != nil {
+		return problem
+	}
 	if !ruleSubjectEnabled(t) || !t.EffectiveAvailable || t.RuntimeStatus != "active" && t.RuntimeStatus != "registered" || len(t.Models) == 0 {
 		return rejectScope("blocked: provider target is unavailable", "provider_unavailable", "CPA 未能核实可用的供应商凭证与模型目录。")
 	}
@@ -124,7 +134,7 @@ func (en *Engine) recordFixedAdmissionLocked(rule *Rule, run *Run) (*Run, error)
 }
 
 func sessionSkip() ScopeSkipDetail {
-	return ScopeSkipDetail{Code: "management_session_required", Reason: "凭证管理会话不可用，需重新连接已鉴权的插件面板。"}
+	return ScopeSkipDetail{Code: "management_session_required", Reason: "后台管理会话尚未就绪，请查看后台连接状态。"}
 }
 
 func queueSkip() ScopeSkipDetail {
@@ -161,6 +171,12 @@ func rejectScope(legacy, code, reason string) *scopeRejection {
 
 func (d *ruleDispatch) skip(t Target, detail ScopeSkipDetail) {
 	detail.AuthID, detail.Email = t.AuthID, t.Email
+	if detail.ObjectType == "" {
+		detail.ObjectType = objectType(t)
+	}
+	if detail.ObjectType == objectProvider {
+		detail.AuthIndex = t.AuthIndex
+	}
 	d.SkipDetails = append(d.SkipDetails, detail)
 	d.Skipped++
 }

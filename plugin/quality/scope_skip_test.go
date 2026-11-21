@@ -3,11 +3,14 @@ package quality
 import (
 	"context"
 	"errors"
+	"net/http"
 	"net/url"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
 
 func TestScopeDispatchPersistsEveryCountedSkip(t *testing.T) {
@@ -32,16 +35,20 @@ func TestScopeDispatchPersistsEveryCountedSkip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	targets, err := f.host.Targets(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for i := range targets {
-		if targets[i].AuthID == "partial" {
-			targets[i].Models = []string{"a"}
+	base := f.host.Call
+	f.host.Call = func(method string, in, out any) error {
+		if err := base(method, in, out); err != nil || method != "host.auth.models" {
+			return err
 		}
+		rows := out.(*pluginapi.HostAuthModelsResponse).Credentials
+		for i := range rows {
+			if rows[i].ID == "partial" {
+				rows[i].Models = []string{"a"}
+			}
+		}
+		return nil
 	}
-	receipt, err := f.engine.dispatchWithInventory(ctx, r.ID, r.Revision, false, func(context.Context) ([]Target, error) { return targets, nil })
+	receipt, err := f.engine.dispatchRule(ctx, r.ID, r.Revision, false)
 	if err != nil || receipt.Count != 2 || receipt.Skipped != 1 || len(receipt.SkipDetails) != 1 || receipt.BatchID == "" {
 		t.Fatal(receipt, err)
 	}
@@ -168,7 +175,7 @@ func TestScheduledZeroMatchPersistsSkipDetails(t *testing.T) {
 	entry := f.entries["one"]
 	entry.Disabled, entry.Status = true, "disabled"
 	f.entries["one"] = entry
-	snap.Disabled, snap.UpdatedAt = true, snap.UpdatedAt.Add(-time.Second)
+	snap.Disabled, snap.AuthIndex = true, "removed-entry-index"
 	en.managed["one"] = &CredentialDisposition{AuthID: "one", RuleID: r.ID, State: "disabled", Models: r.Models, Snapshot: snap}
 	en.Tick(r.NextRun)
 	var saved Rule
@@ -177,7 +184,7 @@ func TestScheduledZeroMatchPersistsSkipDetails(t *testing.T) {
 	}
 	summary := saved.LastScopeDispatch
 	if summary == nil || summary.Matched != 0 || summary.Skipped != 1 || len(summary.Details) != 1 ||
-		summary.Details[0].Code != "snapshot_changed" || !strings.Contains(summary.Details[0].Reason, "运行更新时间") ||
+		summary.Details[0].Code != "identity_conflict" || !strings.Contains(summary.Details[0].Reason, "唯一关联") ||
 		!saved.NextRun.After(r.NextRun) || len(en.runs) != 1 || f.probes != 0 || len(f.patches) != 0 {
 		t.Fatal("unexpected scheduled scan", summary, saved.NextRun, r.NextRun)
 	}
@@ -292,22 +299,22 @@ func TestScheduledKnownCredentialsWithoutManagementSession(t *testing.T) {
 			if scope == scopeAll {
 				want = 2
 			}
-			if len(f.engine.runs) != want || f.engine.rules[r.ID].LastScopeDispatch.Matched != want || f.engine.rules[r.ID].LastScopeDispatch.Skipped != 0 || !f.engine.rules[r.ID].NextRun.After(r.NextRun) {
-				t.Fatal("missing scheduled round", f.engine.rules[r.ID].LastScopeDispatch)
+			waiting := f.engine.ruleForDisplayLocked(f.engine.rules[r.ID])
+			if len(f.engine.runs) != 0 || waiting.LastScopeDispatch != nil || waiting.timerWaitReason == "" || !f.engine.rules[r.ID].NextRun.Equal(r.NextRun) {
+				t.Fatal("background authorization outage consumed a due round", f.engine.rules[r.ID].LastScopeDispatch)
 			}
 			f.engine.rules, f.engine.runs = map[string]*Rule{}, map[string]*Run{}
 			if err := f.engine.load(); err != nil {
 				t.Fatal(err)
 			}
 			saved := f.engine.rules[r.ID]
-			for _, run := range f.engine.runs {
-				detail := run.PreflightDetail
-				if detail == nil || detail.Code != "management_session_required" || run.Status != "blocked" || !run.Config.Scheduled || run.Config.ScopeBatchID != saved.LastScopeBatch || run.Config.ManagedProbe != nil || len(run.Samples) != 0 {
-					t.Fatal("missing session result after restart", run)
-				}
-			}
-			if len(f.engine.queue) != 0 || f.probes != 0 || f.nativeCalls != 0 || len(f.patches) != 0 || f.deletes != 0 || f.host.Management.ready() {
+			if !saved.NextRun.Equal(r.NextRun) || !f.engine.timerAllowed(saved) || len(f.engine.queue) != 0 || f.probes != 0 || f.nativeCalls != 0 || len(f.patches) != 0 || f.deletes != 0 || f.host.Management.ready() {
 				t.Fatal("sessionless trigger used or restored management authority")
+			}
+			f.host.Management.authorize(http.Header{"Authorization": {"Bearer offline-management-only"}})
+			f.engine.Tick(r.NextRun)
+			if len(f.engine.runs) != want || !f.engine.rules[r.ID].NextRun.After(r.NextRun) {
+				t.Fatal("verified backend did not recover the overdue round")
 			}
 		})
 	}

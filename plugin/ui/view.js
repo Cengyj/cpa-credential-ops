@@ -7,15 +7,70 @@ export const escapeHTML = (value) =>
 export const items = (data) => (Array.isArray(data) ? data : data?.items || []);
 export const targetID = (target) => target.auth_id || target.id;
 export const providerTargetName = target => `供应商 · ${[target.provider_name || target.provider, target.auth_index || targetID(target)].filter(Boolean).join(' · ')}`;
-export const frozenProviderLabel = config => config?.provider_name ? [config.provider_name, config.subject_auth_index].filter(Boolean).join(' · ') : '';
+function frozenProviderName(config, recordedLabel) {
+  const index = config.subject_auth_index;
+  let name = config.provider_name;
+  // Older records kept a display label instead of the structured name. Only
+  // normalize it when this record's frozen route index confirms its suffix.
+  if (!name && index && typeof recordedLabel === 'string') {
+    const prefix = '供应商 · ', suffix = ` · ${index}`;
+    if (recordedLabel.startsWith(prefix) && recordedLabel.endsWith(suffix)) {
+      name = recordedLabel.slice(prefix.length, -suffix.length).trim();
+    }
+  }
+  return name || '';
+}
+
+export function frozenProviderLabel(config = {}, recordedLabel = '') {
+  const name = frozenProviderName(config, recordedLabel);
+  if (!name && !config.provider_observation) return '';
+  if (!name && recordedLabel) return recordedLabel;
+  return [name || '供应商（名称未记录）', config.subject_auth_index || config.auth_id].filter(Boolean).join(' · ');
+}
+
+const historySubjectTerms = {
+  provider: ['供应商', '路由 ID'], provider_group: ['供应商配置组', '配置组 ID'],
+  oauth: ['凭证', '凭证 ID'], unknown: ['对象', '对象 ID'],
+};
+
+export function frozenRunIdentity(run = {}) {
+  const config = run.config || {};
+  const detail = run.preflight_detail || run.skip_detail;
+  const id = config.auth_id || detail?.auth_id || '';
+  const matchingDetail = !detail?.auth_id || detail.auth_id === id ? detail : null;
+  const recordedLabel = run.credential_email || matchingDetail?.email || '';
+  const routeLabel = frozenProviderLabel(config, recordedLabel);
+  const index = config.subject_auth_index || matchingDetail?.auth_index || '';
+  let type = matchingDetail?.object_type;
+  if (!Object.hasOwn(historySubjectTerms, type)) {
+    // An older missing-row diagnostic has no verified subject from this occurrence.
+    if (routeLabel) type = 'provider';
+    else if (matchingDetail?.code === 'group_missing') type = 'provider_group';
+    else if (!recordedLabel && ['provider_directory_unavailable', 'credential_missing', 'unverified_inventory_entry'].includes(matchingDetail?.code)) type = 'unknown';
+    else type = 'oauth';
+  }
+  const [noun, idLabel] = historySubjectTerms[type];
+  return { id, index, type, noun, idLabel, supplier: type === 'provider' || type === 'provider_group',
+    name: type === 'provider' ? frozenProviderName(config, recordedLabel) : '',
+    label: (type === 'provider' ? routeLabel : recordedLabel) || id || '对象未记录' };
+}
+
+export function qualityIdentityLabel(identity) {
+  if (identity.type === 'provider') return `供应商路由 · ${identity.index || identity.id || '标识未记录'}`;
+  if (identity.type === 'provider_group' || identity.type === 'unknown') return `${identity.noun} · ${identity.id || '标识未记录'}`;
+  return identity.label;
+}
 export function availableModels(target) {
   return [...new Set((target?.models || []).map(entry => typeof entry === 'string' ? entry : entry.id || entry.model).filter(Boolean))];
 }
+export function targetRuntimeReady(target) {
+  return target?.effective_available === true && !target.manual_disabled &&
+    (target.is_provider ? ['registered', 'active'] : ['active']).includes(target.runtime_status);
+}
 export function providerRouteReady(target, models = []) {
   const catalog = availableModels(target);
-  return !!(targetID(target) && target.auth_index && target.provider) && target.effective_available === true &&
-    !target.manual_disabled && !target.quality_paused && !target.retained_pause &&
-    ['registered', 'active'].includes(target.runtime_status) && catalog.length > 0 && models.every(model => catalog.includes(model));
+  return !!(target && targetID(target) && target.auth_index && target.provider) && targetRuntimeReady(target) &&
+    !target.quality_paused && !target.retained_pause && catalog.length > 0 && models.every(model => catalog.includes(model));
 }
 
 export function ruleTargetType(target) {
@@ -33,12 +88,23 @@ export function ruleObjectTypes(rule, targets) {
   return [rule.target_group || ruleTargetType(target) === 'provider' ? 'provider' : 'oauth'];
 }
 
+export function resolveRuleBinding(rule, targets) {
+  const config = rule.config || rule;
+  const id = config.auth_id, provider = config.provider, index = rule.target_auth_index;
+  const type = rule.target_object_type || (!rule.legacy_scope && rule.object_types?.length === 1 ? rule.object_types[0] : '');
+  const target = id && targets.find(t => targetID(t) === id && (!provider || t.provider === provider) &&
+    (!index || t.auth_index === index) && (!type || ruleTargetType(t) === type));
+  const object = type === 'provider' ? '供应商路由' : type === 'oauth' ? '凭证' : '对象';
+  const pendingLabel = [object, id, index !== id && index, '原绑定待核实'].filter(Boolean).join(' · ');
+  return { id, provider, index, type, target, pendingLabel };
+}
+
 export function ruleScopeDescription(rule, targets) {
   const types = ruleObjectTypes(rule, targets).map(type => ({oauth:'OAuth 账户',provider:'AI 提供商'})[type]).filter(Boolean).join('、');
-  const config = rule.config || rule;
-  const group = rule.target_group && targets.find(t => t.provider_group_id === rule.target_group);
-  const target = targets.find(t => targetID(t) === config.auth_id);
-  const selected = rule.target_group ? `${group?.provider_name || rule.target_group}（配置组）` : target?.is_provider ? providerTargetName(target) : target?.email || config.auth_id;
+  const group = rule.target_group && targets.find(t => ruleTargetType(t) === 'provider' && t.provider_group_id === rule.target_group);
+  const { target, id, pendingLabel } = resolveRuleBinding(rule, targets);
+  const selected = rule.target_group ? `${group?.provider_name || rule.target_group}（配置组）`
+    : target ? target.is_provider ? providerTargetName(target) : target.email || id : id && pendingLabel;
   const scope = dynamicScopeLabel(rule.target_scope) || `指定对象 · ${selected || '目录待核实'}`;
   return [types, scope].filter(Boolean).join(' · ');
 }
@@ -70,13 +136,15 @@ const auditLabels = {
   disable_pending: '正在暂停凭证', delete_pending: '正在移除凭证', restore_pending: '正在恢复凭证',
   credential_suspended: '已暂停凭证', credential_removed: '已移除凭证', credential_restored: '整轮通过，已恢复凭证',
   credential_action_uncertain: '处置结果待核对', credential_external_enable: '已识别 CPA 人工启用',
-  credential_external_change: '已识别 CPA 当前凭证变更', credential_handling_acknowledged: '人工处理已核对，规则已停止',
+  credential_external_change: '已识别 CPA 当前凭证变更', credential_handling_acknowledged: '人工处理已核对，规则设置保持不变',
 
   scope_dispatched: '匹配动态检测范围',
   observation_completed: '观察完成', settings_saved: '设置已保存',
   rule_created: '规则已创建', rule_updated: '规则已更新', rule_saved: '规则已保存',
   rule_schedule_state: '规则调度已变更', rule_schedule_invalid: '检测周期无效，未执行', rule_deleted: '规则已删除',
   credential_login_prepare: '凭证登录前检查', legacy_ownership_retained: '历史暂停归属已保留',
+  credential_login_result: '凭证更新协调结果',
+  credential_binding_changed: '新条目需要核对规则绑定',
   pause_requested: '已请求质量暂停', pause_uncertain: '质量暂停结果待核对',
   credential_paused: '凭证已质量暂停', manual_release_requested: '已请求人工解除',
   manual_release: '已人工解除自身暂停', reconciled_pause: '暂停归属已核对',
@@ -102,6 +170,14 @@ const reasonLabels = {
   'invalid integer': '整数格式无效，无法判定',
   'refusal is not quality evidence': '模型拒答，不作为答题质量失败证据',
   'missing or truncated completion': '回答未完整结束或已截断，不作为答题质量失败证据',
+  'response limit exceeded': '响应数据超过采集上限，本次接收已停止。',
+  'output limit exceeded': '回答正文超过输出上限，本次接收已停止。',
+  'response answer limit exceeded': '回答正文超过输出上限，本次接收已停止。',
+  'response frame limit exceeded': '单个响应帧超过采集上限，本次接收已停止。',
+  'response transport limit exceeded': '流式响应累计数据超过传输上限，本次接收已停止。',
+  'response output token limit reached': '回答达到输出 token 上限，未能完整生成。',
+  'incomplete SSE frame': '流式响应在单帧接收完成前结束，回答可能不完整。',
+  'premature stream EOF': '流式响应提前结束，未确认回答完整完成。',
   'judge budget exhausted': '独立判题预算不足，无法判定',
   'judge execution failed': '独立判题执行失败，无法判定',
   'invalid judge JSON': '独立判题未返回有效 JSON，无法判定',
@@ -114,7 +190,13 @@ const reasonLabels = {
   'invalid judge verdict': '独立判题结论格式无效，无法判定',
   'all selected models explicitly failed complete comparable rounds; manual release required': '所有选定模型在完整、可比较的连续轮次中明确答错，须人工解除暂停',
 };
-export const reasonLabel = (reason) => reasonLabels[reason] || reason || '未提供说明';
+export function reasonLabel(reason) {
+  if (reasonLabels[reason]) return reasonLabels[reason];
+  if (typeof reason === 'string' && /(?:^|:\s*)(?:context deadline exceeded|i\/o timeout|net\/http: timeout awaiting response headers|Client\.Timeout exceeded while awaiting headers)(?:$|\s*\()/.test(reason)) {
+    return '请求超时，本次接收已停止。';
+  }
+  return reason || '未提供说明';
+}
 export function manualIssueLabel(reason) {
   const message = reason?.replace(/^blocked:\s*/, '');
   if (message?.endsWith('，CPA 当前仍停用此凭证。')) return 'CPA 当前仍停用此凭证，无法开始智商测试。';
@@ -146,6 +228,10 @@ export const statusLabels = {
   interrupted: '已中断',
   detecting: '检测中',
   awaiting_release: '等待人工解除',
+  credential_update_pending: '等待凭证更新',
+  credential_update_failed: '等待重新授权成功',
+  credential_write_unknown: '凭证写入待核对',
+  credential_identity_conflict: '授权条目身份待核对',
   credential_paused: '凭证已暂停',
   blocked: '受阻',
   skipped: '未执行',
@@ -161,7 +247,7 @@ export const statusLabels = {
   catalog_action_unconfirmed: '目录或凭证资格未能再次确认，未执行处置',
   credential_changed: '凭证已变更，未处理',
   provider_config_conflict: '提供商配置已变化，本次写入已终止',
-  management_session_required: '管理会话待连接',
+  management_session_required: '后台管理授权待就绪',
   disable_pending: '正在暂停凭证',
   delete_pending: '正在移除凭证',
   restore_pending: '正在恢复凭证',
@@ -199,6 +285,11 @@ export function questionTestSelection(question, prompt) {
 
 export function copyRunConfig(source) {
   const config = {};
+  // Retain only identity evidence available in this saved manual run.
+  const kind = source.expected_object_type || (source.provider_observation || source.provider_name ? 'provider' : '');
+  const index = source.subject_auth_index || source.expected_auth_index;
+  if (kind) config.expected_object_type = kind;
+  if (index) config.expected_auth_index = index;
   for (const key of [
     'auth_id',
     'provider',
@@ -230,19 +321,15 @@ export function credentialBlock(config, targets, { manual = false } = {}) {
     if (!target) return `${role}凭证当前不可发现，请刷新并核对状态。`;
     if (target.quality_paused || target.retained_pause)
       return `${role}凭证已被质量暂停，禁止所有复测。仅管理员手动解除后才可再次检测。`;
+    if (target.handling_state_reason) return target.handling_state_reason;
     const policy = target.error_policy_block?.code === 'error_policy_disabled';
     if (manual && target.credential_handling && !['disabled', 'restored', 'acknowledged', 'externally_enabled'].includes(target.credential_handling)) {
       return '当前凭证状态尚未确认，无法开始智商测试。请刷新后重试。';
     }
-    if (policy) {
-      if (!manual || role !== '目标') return `${role}凭证已有错误策略停用记录，规则、对照和判题均已停止使用此凭证。`;
-      if (target.manual_disabled || target.runtime_status === 'disabled') {
-        return target.is_provider ? 'CPA 当前仍停用此供应商路由，无法开始智商测试。' : 'CPA 当前仍停用此凭证，无法开始智商测试。';
-      }
-      if (!target.is_provider && (target.runtime_status !== 'active' || target.effective_available !== true))
-        return 'CPA 当前未确认此凭证可用于模型调用，请刷新并核对运行状态。';
+    if (target.manual_disabled || target.runtime_status === 'disabled') {
+      if (policy) return `${role}${target.is_provider ? '供应商路由' : '凭证'}当前仍在 CPA 停用，停用期间退出答题和恢复复检。`;
+      return `${role}${target.is_provider ? '供应商' : '凭证'}已在 CPA 停用。`;
     }
-    if (target.manual_disabled) return target.is_provider ? `${role}供应商已在 CPA 停用。` : `${role}凭证已人工禁用，请先处理人工禁用状态。`;
     if (target.is_provider && !providerRouteReady(target)) {
       const reasons = target.reasons || [];
       if (reasons.includes('provider_models_unavailable')) return `${role}供应商在 CPA 暂无已注册模型。`;
@@ -251,13 +338,13 @@ export function credentialBlock(config, targets, { manual = false } = {}) {
       if (reasons.includes('identity_conflict')) return `${role}供应商的路由标识不一致，请刷新并核对密钥索引。`;
       return `${role}供应商的 CPA 原生路由尚未确认，请刷新后重试。`;
     }
-    if (policy) {
+    if (policy && role === '目标') {
       const models = availableModels(target);
       const missing = config.models?.find(model => !models.includes(model));
       if (missing) return `CPA 当前目录没有所选模型 ${missing}，请选择已注册的模型。`;
       if (!config.models?.length || !models.length) return '请从已注册的模型中选择本次测试模型。';
     }
-    if (target.effective_available === false) return `${role}凭证当前不可用。`;
+    if (target.effective_available === false) return `${role}凭证当前不可用，请核对 CPA 运行状态。`;
   }
   return '';
 }
@@ -277,12 +364,59 @@ export function holdsPause(rule, targets) {
   );
 }
 
+export const previewLimit = 1024 * 1024;
+
+function previewCandidate(raw, explicit = false) {
+  const source = raw.trim();
+  if (/^(?:<style\b[^>]*>[\s\S]*?<\/style\s*>\s*)+<svg\b/i.test(source)) return { kind: 'html', source };
+  const root = /(?:^|\n)[\t ]*(<!doctype\s+html\b[^>]*>|<html\b[^>]*>|<svg\b[^>]*>)/i.exec(source);
+  if (root) {
+    const start = root.index + root[0].indexOf('<');
+    const kind = /^<svg\b/i.test(root[1]) ? 'svg' : 'html';
+    const rest = source.slice(start);
+    if (kind === 'svg' && !explicit && !/\b(?:viewBox|width|height|xmlns)\s*=|<(?:g|path|circle|rect|ellipse|line|polyline|polygon|text|defs|symbol|use)\b/i.test(rest)) return null;
+    const closing = new RegExp(`</${kind}\\s*>`, 'gi');
+    let end = 0;
+    for (const match of rest.matchAll(closing)) end = match.index + match[0].length;
+    return { kind, source: end ? rest.slice(0, end) : rest };
+  }
+  const fragment = /^<(?:style|body|head|main|div|section|article|p|table|h[1-6]|svg)\b/i.test(source);
+  if (fragment && (explicit || /^<style\b[\s\S]*?<\/style\s*>\s*<svg\b/i.test(source))) return { kind: 'html', source };
+  return null;
+}
+
+// Extract only standalone markup; surrounding explanations remain in the saved source.
+export function previewSource(raw) {
+  if (typeof raw !== 'string' || !raw.trim()) return null;
+  const fences = /(?:^|\n)[\t ]{0,3}(`{3,}|~{3,})([\w-]*)[\t ]*\r?\n/g;
+  const outside = [];
+  let cursor = 0, match;
+  while ((match = fences.exec(raw))) {
+    outside.push(raw.slice(cursor, match.index));
+    const rest = raw.slice(fences.lastIndex);
+    const closing = new RegExp(`(?:^|\\n)[\\t ]{0,3}${match[1][0]}{${match[1].length},}[\\t ]*(?=\\r?\\n|$)`).exec(rest);
+    const content = closing ? rest.slice(0, closing.index) : rest;
+    const language = match[2].toLowerCase();
+    if (['', 'html', 'svg', 'xml'].includes(language)) {
+      const candidate = previewCandidate(content.replace(/^\s*<\?xml\b[\s\S]*?\?>\s*/i, ''), language !== '');
+      if (candidate) return candidate;
+    }
+    cursor = closing ? fences.lastIndex + closing.index + closing[0].length : raw.length;
+    fences.lastIndex = cursor;
+  }
+  outside.push(raw.slice(cursor));
+  return previewCandidate(outside.join('\n').replace(/^\s*<\?xml\b[\s\S]*?\?>\s*/i, ''));
+}
+
 export function safePreview(raw) {
-  if (raw.length > 1024 * 1024) throw new Error('预览超过 1 MiB 上限。');
-  const fenced = raw.trim().match(/^```(?:html|svg|xml)?\s*\n([\s\S]*?)\n```$/i);
-  const parsed = new DOMParser().parseFromString(fenced ? fenced[1] : raw, 'text/html');
+  if (raw.length > previewLimit) throw new Error('预览超过 1 MiB 上限。');
+  const source = previewSource(raw)?.source || raw;
+  // Template contents are inert, including resource loading, until sanitized nodes are connected.
+  const template = document.createElement('template');
+  template.innerHTML = source;
+  const parsed = template.content;
   parsed
-    .querySelectorAll('script,iframe,frame,frameset,object,embed,base,meta,link,form')
+    .querySelectorAll('script,iframe,frame,frameset,object,embed,base,meta,link,form,template,noscript')
     .forEach((node) => node.remove());
   parsed.querySelectorAll('a,area,map').forEach((node) => node.replaceWith(...node.childNodes));
   parsed.querySelectorAll('animate,set,animateTransform,animateMotion').forEach((node) => {
@@ -293,8 +427,22 @@ export function safePreview(raw) {
     )
       node.remove();
   });
+  const svgNamespace = 'http://www.w3.org/2000/svg';
+  const identifiers = new Map(), reusableShapes = new WeakMap();
+  for (const node of parsed.querySelectorAll('[id]')) identifiers.set(node.id, identifiers.has(node.id) ? null : node);
+  const localUse = (node, reference) => {
+    if (node.namespaceURI !== svgNamespace || node.localName !== 'use' || !/^#[A-Za-z_][\w.:-]{0,127}$/.test(reference)) return false;
+    const root = node.ownerSVGElement;
+    if (!root) return false;
+    const target = identifiers.get(reference.slice(1));
+    if (!target || target.namespaceURI !== svgNamespace || target.ownerSVGElement !== root) return false;
+    if (!reusableShapes.has(target)) reusableShapes.set(target,
+      ['g', 'path', 'circle', 'ellipse', 'rect', 'line', 'polyline', 'polygon', 'symbol', 'defs', 'text'].includes(target.localName) && !target.querySelector('use,foreignObject'));
+    return reusableShapes.get(target);
+  };
   for (const node of parsed.querySelectorAll('*')) {
     for (const attribute of [...node.attributes]) {
+      if (['href', 'xlink:href'].includes(attribute.name.toLowerCase()) && localUse(node, attribute.value)) continue;
       if (
         /^on/i.test(attribute.name) ||
         [
@@ -308,12 +456,30 @@ export function safePreview(raw) {
           'poster',
           'background',
           'srcdoc',
+          'autofocus',
+          'contenteditable',
+          'tabindex',
         ].includes(attribute.name.toLowerCase())
       )
         node.removeAttribute(attribute.name);
     }
+    if (['button', 'input', 'select', 'textarea'].includes(node.localName)) node.setAttribute('disabled', '');
   }
-  return `<!doctype html><html><head><meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'none'; connect-src 'none'; img-src data:; media-src 'none'; style-src 'unsafe-inline'; font-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'"><meta name="referrer" content="no-referrer"><style>body{margin:16px;font-family:system-ui}svg{max-width:100%}</style>${parsed.head.innerHTML}</head><body>${parsed.body.innerHTML}</body></html>`;
+  const rootAttributes = tag => {
+    const opening = new RegExp(`<${tag}\\b(?:[^>"']|"[^"]*"|'[^']*')*>`, 'i').exec(source)?.[0];
+    const holder = document.createElement('template');
+    holder.innerHTML = (opening ? opening.replace(new RegExp(`^<${tag}\\b`, 'i'), '<div') : '<div>') + '</div>';
+    const root = holder.content.firstElementChild;
+    root.style.setProperty('overflow', tag === 'html' ? 'auto' : 'visible', 'important');
+    root.style.setProperty('height', 'auto', 'important');
+    root.style.setProperty('max-height', 'none', 'important');
+    if (tag === 'body') root.style.setProperty('min-width', 'min-content', 'important');
+    return [...root.attributes]
+      .filter(attribute => ['id', 'class', 'lang', 'dir', 'style'].includes(attribute.name.toLowerCase()))
+      .map(attribute => ` ${attribute.name}="${escapeHTML(attribute.value)}"`).join('');
+  };
+  const layout = '<style>html{height:auto!important;max-height:none!important;overflow:auto!important}body{height:auto!important;max-height:none!important;min-width:min-content!important;overflow:visible!important}body>svg{display:block}body>svg[viewBox]{max-width:100%;height:auto}html,body{overscroll-behavior:auto}</style>';
+  return `<!doctype html><html${rootAttributes('html')}><head><meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'none'; connect-src 'none'; img-src data:; media-src 'none'; style-src 'unsafe-inline'; font-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'"><meta name="referrer" content="no-referrer"><style>body{margin:16px;font-family:system-ui}svg{max-width:100%}</style></head><body${rootAttributes('body')}>${template.innerHTML}${layout}</body></html>`;
 }
 // Evidence rendering keeps execution, verdict, and comparability independent.
 const evidenceValue = (value, fallback = '未知') =>
@@ -327,15 +493,16 @@ const judgeName = (mode) => ({ deterministic: '标准答案判定', manual: '人
 const reviewName = (verdict) => ({ correct: '正确', incorrect: '错误', unknown: '无法判断' })[verdict] || '未评审';
 const completedSample = (sample) => !!sample.execution_status && !['pending', 'queued', 'running', 'cancelling', 'canceling'].includes(sample.execution_status);
 const sampleModel = sample => sample.model || sample.request_model || '模型未知';
+export const isPartialAnswer = sample => !sample || sampleExecutionStatus(sample) !== 'completed';
 
 function answerVerdict(sample) {
-  if (sample.execution_status !== 'completed' || sample.error) return '';
+  if (sampleExecutionStatus(sample) !== 'completed') return '';
   return sample.review || (['correct', 'incorrect'].includes(sample.quality_verdict) ? sample.quality_verdict : sample.answer_match) || 'unknown';
 }
 
 function answerTag(sample) {
   const verdict = answerVerdict(sample);
-  if (!verdict) return statusTag(sample.error && sample.execution_status === 'completed' ? 'failed' : sample.execution_status);
+  if (!verdict) return statusTag(sampleExecutionStatus(sample));
   if (verdict === 'correct') return tag('答案正确', 'good');
   if (verdict === 'incorrect') return tag('答案错误', 'warn');
   return tag('未判定');
@@ -373,8 +540,12 @@ function recordedSampleCoverage(run) {
   return { planned, finished: slots.size };
 }
 
+function roundCompletedCleanly(run) {
+  return run.status === 'completed' && !run.error && !run.block_reason && !run.cancel_requested && !run.upstream_condition;
+}
+
 function fullyJudgedRound(run, { planned, finished }, judged) {
-  return run.status === 'completed' && !run.pruned_samples && planned > 0 && finished === planned &&
+  return roundCompletedCleanly(run) && !run.pruned_samples && planned > 0 && finished === planned &&
     run.samples.length === planned && judged === planned;
 }
 
@@ -386,7 +557,7 @@ export function renderHistoryResult(run) {
   for (const sample of samples) {
     if (!completedSample(sample)) continue;
     const verdict = answerVerdict(sample);
-    const result = verdict || (['completed', 'error'].includes(sample.execution_status) ? 'failed' : sample.execution_status);
+    const result = verdict || sampleExecutionStatus(sample);
     counts.set(result, (counts.get(result) || 0) + 1);
   }
   const facts = [];
@@ -421,7 +592,9 @@ export function renderHistoryResult(run) {
   if (!visual && !preview.text) return outcome;
   const ordinal = Number.isInteger(preview.index) && preview.index >= 0 ? `回答 ${preview.index + 1}` : '回答摘录';
   const label = run.config?.models?.length > 1 && preview.model ? `${preview.model} · ${ordinal}` : ordinal;
-  const excerpt = visual ? `${preview.kind.toUpperCase()} 作品，打开记录可预览` : preview.text + (preview.truncated ? '…' : '');
+  const previewSample = samples.find(sample => sampleModel(sample) === preview.model && sample.index === preview.index);
+  const partial = previewSample && isPartialAnswer(previewSample);
+  const excerpt = visual ? `${preview.kind.toUpperCase()} ${partial ? '部分作品' : '作品'}，打开记录可预览` : preview.text + (preview.truncated ? '…' : '');
   const prefix = coverage.planned === 1 && samples.length <= 1 && !run.pruned_samples && preview.index === 0 ? '' : `<span class="history-excerpt-label">${escapeHTML(label)} · </span>`;
   return `<span class="history-excerpt">${prefix}<bdi class="history-excerpt-text" dir="auto">${escapeHTML(excerpt)}</bdi></span>` + outcome;
 }
@@ -451,13 +624,20 @@ export function formatSampleUsage(sample) {
   return total == null || !Number.isFinite(Number(total)) || Number(total) < 0 ? '用量未知' : `${Number(total).toLocaleString('zh-CN')} token`;
 }
 
-function qualitySampleOutcome(sample) {
+const unjudgedExecutionStates = new Set(['refused', 'incomplete', 'empty', 'cancelled', 'interrupted', 'pending', 'queued', 'running', 'cancelling', 'canceling', 'skipped', 'blocked', 'failed']);
+
+function sampleExecutionStatus(sample) {
   const status = sample.execution_status;
-  if (status === 'completed' && !sample.error) {
+  if (unjudgedExecutionStates.has(status)) return status;
+  return sample.error || sample.upstream_condition || status === 'error' ? 'failed' : status;
+}
+
+function qualitySampleOutcome(sample) {
+  const status = sampleExecutionStatus(sample);
+  if (status === 'completed') {
     return ['correct', 'incorrect'].includes(sample.quality_verdict) ? sample.quality_verdict : 'unknown';
   }
-  if (['refused', 'incomplete', 'empty', 'cancelled', 'interrupted', 'pending', 'queued', 'running', 'cancelling', 'canceling', 'skipped', 'blocked'].includes(status)) return status;
-  return sample.error || ['failed', 'error'].includes(status) ? 'failed' : 'unknown';
+  return unjudgedExecutionStates.has(status) ? status : 'unknown';
 }
 
 function qualityCounts(samples) {
@@ -468,9 +648,13 @@ function qualityCounts(samples) {
 }
 
 function credentialHandlingLabel(run) {
-  if (run.config?.provider_observation && ['observe_only', 'provider_observation', 'not_applicable'].includes(run.action_status)) return '供应商仅观察';
-  if (run.status === 'skipped' && run.skip_detail?.code === 'error_policy_disabled') return '保持暂停，本轮未改写';
-  if (run.action_status === 'observe_only') return active(run) ? '检测中，尚未处理' : '未处理凭证';
+  const noAction = ['observe_only', 'provider_observation', 'not_applicable'].includes(run.action_status);
+  if (run.status === 'skipped' && run.skip_detail?.code === 'error_policy_disabled' && (!run.action_status || noAction)) return '保持暂停，本轮未改写';
+  if (noAction) {
+    if (run.status === 'skipped') return '本轮未执行，未处置';
+    return active(run) ? '检测中，尚未处置' : '本轮未处置';
+  }
+  if (run.action_status === 'credential_suspended' && (run.config?.provider_observation || run.config?.provider_name)) return '已暂停';
   if (run.action_status === 'credential_action_uncertain') {
     const intent = { disable_credential: '停用', delete_credential: '移除', restore_credential: '恢复' }[run.credential_action];
     if (intent) return `${intent}结果待核对`;
@@ -480,8 +664,12 @@ function credentialHandlingLabel(run) {
 
 const probePaths = {provider_native_probe:'提供商 · CPA 原生路由',provider_config_probe:'提供商配置定向探测',cpa_management_probe:'CPA 管理接口定向探测'};
 function recordedProbePath(run) {
-  const paths = [...new Set((run.samples || []).map(sample => probePaths[sample.evidence?.path]).filter(Boolean))];
-  return paths.length ? paths.join('、') : run.config?.provider_name ? 'AI 提供商' : run.config?.provider_observation ? '提供商 · CPA 原生路由' : '';
+  const paths = (run.samples || []).map(sample => sample.evidence?.path).filter(path => Object.hasOwn(probePaths, path));
+  return [...new Set(paths)].map(path => probePaths[path]).join('、');
+}
+
+function hasRecordedSamples(run) {
+  return run.pruned_samples > 0 || (run.samples || []).some(sample => completedSample(sample) && sample.execution_status !== 'skipped');
 }
 
 export const upstreamConditions = Object.freeze({
@@ -532,6 +720,13 @@ function admissionEvidence(run) {
     (run.cancel_requested || run.status === 'cancelled' ? 'cancelled' : ''));
   const catalogResult = catalog && !stopped;
   const checked = catalogResult && ['completed', 'skipped'].includes(run.status);
+  const identity = frozenRunIdentity(run);
+  const object = identity.type === 'provider' ? '供应商路由' : identity.noun;
+  let reason = detail?.reason;
+  if (object !== '凭证') {
+    if (reason === 'CPA 已核实该凭证没有注册所选模型。') reason = `CPA 已核实该${object}没有注册所选模型。`;
+    if (reason === '当前目录没有这份规则绑定的凭证。') reason = `当前目录中找不到规则绑定的${object}。`;
+  }
   return {
     id: detail?.auth_id || run.config?.auth_id, email: detail?.email || run.credential_email,
     model: detail?.model || catalogModel,
@@ -539,22 +734,23 @@ function admissionEvidence(run) {
     catalogResult,
     result: catalogResult ? 'CPA 目录未注册所选模型' : suspended ? '已按错误规则暂停，未重复检测' : '未发起模型请求',
     explanation: catalogResult ? 'CPA 目录未注册所选模型，本次未请求上游。' : suspended ? '本轮未重复答题。' : '未发起模型请求',
-    source: catalog || detail?.code === 'missing_model' ? 'CPA 凭证模型目录' : suspended ? '已确认的错误策略暂停' : preflight ? '当前凭证状态检查' : '范围调度准入',
+    source: catalog || detail?.code === 'missing_model' ? `CPA ${object}模型目录` : suspended ? '已确认的错误策略暂停' : preflight ? `当前${object}状态检查` : '范围调度准入',
     reasonLabel: stopped ? '未执行原因' : catalog || preflight ? '检查结果' : '跳过原因',
-    reason: stopped ? reasonLabel(stopped) : detail?.reason || (catalog ? '凭证目录中缺少所选模型。' : '原因未记录'),
+    reason: stopped ? reasonLabel(stopped) : reason || (catalog ? `${object}目录中缺少所选模型。` : '原因未记录'),
   };
 }
 
 function sampleStates(sample) {
-  const status = sample.execution_status;
-  const tone = ['failed', 'error'].includes(status) ? 'bad' :
+  const status = sampleExecutionStatus(sample);
+  const tone = status === 'failed' ? 'bad' :
     ['running', 'queued', 'incomplete', 'refused', 'empty'].includes(status) ? 'warn' : 'neutral';
   return `<span class="sample-state"><span class="sample-state-label">执行</span>${tag(statusLabels[status] || status || '未知', tone)}</span>
-    <span class="sample-state"><span class="sample-state-label">答案</span>${verdictTag(sample.quality_verdict)}</span>`;
+    <span class="sample-state"><span class="sample-state-label">答案</span>${verdictTag(qualitySampleOutcome(sample))}</span>`;
 }
 
-function renderFrozenConditions(run, credentialLabel, credentialName) {
+function renderFrozenConditions(run, credentialLabel) {
   const config = run.config || {};
+  const identity = frozenRunIdentity(run);
   const question = config.question || {};
   const parameters = config.parameters || {};
   const judge = config.judge || {};
@@ -562,9 +758,9 @@ function renderFrozenConditions(run, credentialLabel, credentialName) {
   const promptText = question.prompt || config.prompt;
   if (run.source === 'manual_test' && judge.mode === 'manual') {
     const verdict = renderManualVerdict(run);
-    const verdictLabel = run.pruned_samples > 0 || run.status !== 'completed' ? '留存回答判定' : '整体判定';
+    const verdictLabel = run.pruned_samples > 0 || !roundCompletedCleanly(run) ? '留存回答判定' : '整体判定';
     const settings = [
-      [config.provider_name ? '供应商' : '凭证', credentialLabel], ['模型', config.models?.join(' / ')],
+      [identity.noun, credentialLabel], ['模型', config.models?.join(' / ')],
       ['题目', questionName], ['回答数量', config.samples],
       ...(['logic', 'random'].includes(question.kind) && question.answer != null && question.answer !== '' ? [['标准答案', question.answer]] : []),
       ['思考强度', parameters.reasoning_effort || '未指定'],
@@ -577,10 +773,11 @@ function renderFrozenConditions(run, credentialLabel, credentialName) {
       <details class="answer-test-prompt"><summary>查看本次题面</summary><pre class="condition-text">${escapeHTML(evidenceValue(promptText, '题面未记录'))}</pre></details>`;
   }
   return `<div class="condition-overview">${evidenceFacts([
-    [config.provider_name ? '目标供应商' : '目标凭证', credentialLabel], ['提供方', config.provider],
+    [`目标${identity.noun}`, credentialLabel], ['提供方', config.provider],
+    ...(identity.type === 'provider' ? [['供应商名称', identity.name || '本轮未记录供应商名称']] : []),
     ['检测模型', config.models?.join(' / ')], ['每模型样本', config.samples],
     ['题目', questionName], ['判题方式', judgeName(judge.mode)],
-    ['请求思考强度', parameters.reasoning_effort || '未指定'],
+    [hasRecordedSamples(run) ? '请求思考强度' : '计划思考强度', parameters.reasoning_effort || '未指定'],
     ...(parameters.max_tokens == null ? [] : [['输出上限', `${parameters.max_tokens} token`]]),
     ...(parameters.temperature == null ? [] : [['Temperature', parameters.temperature]]),
     ['流式请求', evidenceBoolean(parameters.stream, '启用', '关闭')],
@@ -591,10 +788,11 @@ function renderFrozenConditions(run, credentialLabel, credentialName) {
     <p class="field-note">参考答案用于判题，不发送给被测模型。</p>
   </details>
   <details class="evidence-section"><summary>检测身份与关联记录</summary>${evidenceFacts([
-    ['凭证身份版本', config.identity_version], ['冻结指纹', config.fingerprint],
+    [identity.idLabel, identity.id], ...(identity.type === 'provider_group' ? [] : [['路由索引', identity.index]]),
+    [`${identity.noun}身份版本`, config.identity_version], ['冻结指纹', config.fingerprint],
     ['最终载荷配置版本', config.payload_config_version], ...(config.scope_batch_id ? [['范围批次', config.scope_batch_id]] : []), ...(config.batch_id ? [['对照批次', config.batch_id]] : []),
-    ['对照凭证', credentialName(config.control_auth_id) || '未配置'], ['对照身份', config.control_identity],
-    ['判题凭证', credentialName(judge.auth_id) || '未配置'], ['判题模型', judge.model || '未配置'],
+    ['对照凭证 ID', config.control_auth_id || '未配置'], ['对照身份', config.control_identity],
+    ['判题凭证 ID', judge.auth_id || '未配置'], ['判题模型', judge.model || '未配置'],
     ['判题身份', config.judge_identity], ['随机种子', config.seed ?? question.seed],
     ['关联规则', config.rule_id || '无'], ['规则版本', config.rule_revision],
     ['判题模板', judge.template_version],
@@ -606,7 +804,8 @@ export function renderSampleEvidence(sample = {}, manual = false, credentialLabe
   const evidence = sample.evidence || {};
   const copy = { ...sample };
   delete copy.output;
-  const explanation = manual && sample.review ? '历史人工评审' : manual && ['correct', 'incorrect'].includes(sample.answer_match) ? '按本次题目的标准答案核对' : reasonLabel(sample.reason || sample.error);
+  const verdict = manual && answerVerdict(sample);
+  const explanation = sample.error ? reasonLabel(sample.error) : verdict && sample.review ? '历史人工评审' : verdict && ['correct', 'incorrect'].includes(sample.answer_match) ? '按本次题目的标准答案核对' : reasonLabel(sample.reason);
   const response = upstreamResponse(sample.upstream_condition, sample.error);
   const findings = evidenceFacts([
     ['判题 / 执行说明', explanation],
@@ -615,7 +814,7 @@ export function renderSampleEvidence(sample = {}, manual = false, credentialLabe
   const route = evidenceFacts([
     ['选择的模型', sample.model || sample.request_model],
     ['请求模型', evidence.requested_model], ['宿主解析模型', evidence.resolved_model],
-    ['上游响应标记', sample.response_model], [supplier ? '固定供应商' : '固定凭证', credentialLabel], ['执行路径', probePaths[evidence.path] || evidence.path],
+    ['上游响应标记', sample.response_model], [supplier ? '固定供应商' : '固定凭证', credentialLabel], ['执行路径', Object.hasOwn(probePaths, evidence.path) ? probePaths[evidence.path] : evidence.path],
   ]) + '<p class="field-note">上游返回的模型名称不构成身份认证。</p>';
   const metrics = [
     ['总耗时', duration(sample.total_ms)], ['首字时间（TTFT）', duration(sample.ttft_ms)],
@@ -636,9 +835,8 @@ export function renderSampleEvidence(sample = {}, manual = false, credentialLabe
     ])}</details>${evidenceJSON(copy)}`;
   if (!manual) return `<div class="evidence-verdict sample-statuses">${sampleStates(sample)}</div>${findings}
     <h3>模型与执行路径</h3>${route}<h3>耗时与用量</h3>${evidenceFacts([...metrics, ...review])}${diagnostics}`;
-  const verdict = answerVerdict(sample);
   const hasReview = sample.review || sample.review_note || sample.judge_usage;
-  return `<section class="answer-evidence-result"><div class="evidence-verdict sample-statuses">${statusTag(sample.execution_status)}${verdict ? `<span data-verdict="${escapeHTML(verdict)}">${answerTag(sample)}</span>` : ''}</div>${findings}</section>
+  return `<section class="answer-evidence-result"><div class="evidence-verdict sample-statuses">${statusTag(sampleExecutionStatus(sample))}${verdict ? `<span data-verdict="${escapeHTML(verdict)}">${answerTag(sample)}</span>` : ''}</div>${findings}</section>
     <section class="answer-evidence-metrics" aria-label="耗时与用量">${evidenceFacts(metrics)}</section>
     <section class="answer-evidence-route"><h3>模型与执行路径</h3>${route}</section>
     ${hasReview ? `<details class="evidence-section"><summary>判题与评审</summary>${evidenceFacts(review)}</details>` : ''}${diagnostics}`;
@@ -652,7 +850,7 @@ function answerStatusIcon(tone) {
 
 function readingStatus(sample) {
   const verdict = answerVerdict(sample);
-  const failed = ['failed', 'error'].includes(sample.execution_status) || (sample.execution_status === 'completed' && sample.error);
+  const failed = sampleExecutionStatus(sample) === 'failed';
   const tone = verdict || (failed ? 'failed' : 'neutral');
   return `<div class="sample-statuses answer-status" data-verdict="${escapeHTML(tone)}">${answerStatusIcon(tone)}${answerTag(sample)}</div>`;
 }
@@ -668,7 +866,11 @@ function renderAnswer(sample, recordIndex, ordinal, isActive, { control, simple,
   const number = Number.isInteger(ordinal) && ordinal >= 0 ? ordinal + 1 : null;
   const label = single ? '模型回答' : `${control ? '对照 · ' : ''}${simple ? '回答' : '样本'}${number === null ? '（序号未知）' : ' ' + number}`;
   const output = sample.output || '';
-  const isHTML = /<(?:html|svg|!doctype)/i.test(output);
+  const preview = previewSource(output);
+  const isHTML = !!preview;
+  const inlinePreview = reading && isHTML && completedSample(sample) && output.length <= previewLimit;
+  const previewTooLarge = isHTML && output.length > previewLimit;
+  const partial = !!output.trim() && isPartialAnswer(sample);
   const isCode = isHTML || /^\s*(?:```|~~~|\/\/|#!|(?:const|let|var|function|import|class|def|package)\s|<\?xml)/m.test(output);
   const short = (reading || qualityDetail) && !isCode && output.length <= 24 && !!output.trim() &&
     !/[\r\n]/.test(output.trim()) && output.split(/\r\n|\r|\n/).length <= 2;
@@ -681,9 +883,9 @@ function renderAnswer(sample, recordIndex, ordinal, isActive, { control, simple,
   const idPrefix = qualityDetail ? 'quality-' : '';
   const statusHTML = qualityDetail ? qualitySampleStatus(sample) : simple ? readingStatus(sample) : `<div class="sample-statuses">${sampleStates(sample)}</div>`;
   const actions = control ? '' : `<div class="sample-actions" data-part="actions">
-    ${output.length > 1500 || output.split("\n").length > 12 ? `<button class="text-button" data-expand-sample="${recordIndex}" aria-expanded="false">展开完整回答</button>` : ''}
+    ${!inlinePreview && (output.length > 1500 || output.split("\n").length > 12) ? `<button class="text-button" data-expand-sample="${recordIndex}" data-partial-output="${partial}" aria-expanded="false">${partial ? '展开已接收内容' : '展开完整回答'}</button>` : ''}
     <button class="text-button" data-copy-sample="${recordIndex}" ${!output ? 'disabled' : ''}>复制原文</button>
-    ${isHTML ? `<button class="text-button" data-preview-sample="${recordIndex}">预览 HTML / SVG</button>` : ''}
+    ${isHTML && !previewTooLarge ? `<button class="text-button" data-preview-sample="${recordIndex}">${inlinePreview ? partial ? '放大部分作品' : '放大作品' : partial ? '预览部分 HTML / SVG' : '预览 HTML / SVG'}</button>` : ''}
     <button class="text-button" data-evidence-sample="${recordIndex}">${simple ? '执行详情' : '条件详情'}</button>
   </div>`;
   const reviewHTML = simple ? (sample.review ? `<details class="review-disclosure" data-part="review"><summary>历史人工评审</summary><p>${escapeHTML(reviewName(sample.review))}${sample.review_note ? ` · ${escapeHTML(sample.review_note)}` : ''}</p></details>` : '') : control ? `<details class="evidence-section" data-part="review"><summary>对照条件详情</summary>${renderSampleEvidence(sample)}</details>` :
@@ -699,9 +901,13 @@ function renderAnswer(sample, recordIndex, ordinal, isActive, { control, simple,
     </details>`;
   const reason = sample.error || (!simple || sample.reason !== 'manual assessment required' ? sample.reason : '');
   const response = upstreamResponse(sample.upstream_condition, sample.error);
-  const reasonText = [response, reason && !(response && upstreamHTTPStatus.test(reason)) ? reasonLabel(reason) : ''].filter(Boolean).join(' · ');
+  const reasonText = [response, reason && !(response && upstreamHTTPStatus.test(reason)) ? reasonLabel(reason) : '',
+    partial ? `当前为已接收的部分内容，${isHTML ? '作品' : '回答'}可能不完整。` : ''].filter(Boolean).join(' · ');
   const sampleNumber = reading || number === null ? '' : `<span class="sample-number" aria-hidden="true">${String(number).padStart(2, '0')}</span>`;
   const answer = `<pre class="answer-text ${isCode ? 'answer-code' : 'answer-prose'}${(reading || qualityDetail) && !output ? ' answer-empty' : ''}${qualityDetail && short ? ' quality-short-answer' : ''}" data-part="output" tabindex="0" aria-label="${escapeHTML([model, label, annotation].filter(Boolean).join(' '))}${reading ? '' : ' 回答'}">${escapeHTML(output || (pending ? pendingText : missingText))}</pre>`;
+  const artwork = inlinePreview ? `<iframe class="answer-preview" data-inline-preview="${recordIndex}" data-part="preview" title="${escapeHTML(`${model} ${label} · ${partial ? '部分作品' : '作品'}预览，可滚动查看`)}" sandbox="" referrerpolicy="no-referrer" tabindex="0"></iframe>
+    <details class="answer-source" data-source-sample="${recordIndex}" data-part="source"><summary>查看原文</summary>${answer}</details>` : answer;
+  const previewNote = previewTooLarge ? '<p class="field-note" data-part="preview-note">作品超过 1 MiB 预览上限，可查看或复制原文。</p>' : '';
   const referenceHTML = showReference ? `<dl class="answer-reference" data-part="reference"><dt>标准答案</dt><dd>${escapeHTML(question.answer)}</dd></dl>` : '';
   const usage = formatSampleUsage(sample);
   const measurements = [['总耗时', duration(sample.total_ms)], ['首字时间', duration(sample.ttft_ms)], ['用量', (reading || qualityDetail) && usage === '用量未知' ? '未知' : usage]];
@@ -711,7 +917,7 @@ function renderAnswer(sample, recordIndex, ordinal, isActive, { control, simple,
     : visible.length ? `<div class="sample-meta" data-part="meta">${visible.map(([key, value]) => `<span>${key} <strong>${escapeHTML(value)}</strong></span>`).join('')}</div>` : '';
   return `<article class="sample${reading ? ' answer-sample' : ''}${control ? ' control-sample' : ''}" data-key="${control ? 'control' : 'record'}:${recordIndex}" data-model="${escapeHTML(model)}" data-sample="${number === null ? '' : ordinal}">
     <div class="sample-heading" data-part="heading"><span class="sample-model-label" title="${escapeHTML(model)}">${escapeHTML(model)}</span><h4 class="sample-title">${sampleNumber}<span>${label}</span></h4>${annotation ? tag(annotation, 'warn') : ''}${statusHTML}</div>
-    ${reading ? `<div class="answer-body${short ? ' short-answer' : ''}" data-part="body">${answer}${referenceHTML}</div>` : answer}
+    ${reading ? `<div class="answer-body${short ? ' short-answer' : ''}" data-part="body">${artwork}${previewNote}${referenceHTML}</div>` : answer + previewNote}
     <p class="sample-reason${reasonText ? '' : ' hidden'}" data-part="reason">${escapeHTML(reasonText)}</p>
     <div class="sample-footer" data-part="footer">${metrics}
     ${actions}</div>${reviewHTML}</article>`;
@@ -737,11 +943,12 @@ function renderAbsentSample(model, ordinal, isActive, pruned, unlocated, { simpl
   return `<article class="sample sample-pending" data-key="slot:${ordinal}" data-model="${escapeHTML(model)}" data-sample="${ordinal}"><div class="sample-heading" data-part="heading"><span class="sample-model-label" title="${escapeHTML(model)}">${escapeHTML(model)}</span><h4 class="sample-title"><span class="sample-number" aria-hidden="true">${String(ordinal + 1).padStart(2, '0')}</span><span>${simple ? '回答' : '样本'} ${ordinal + 1}</span></h4>${tag(status, isActive || pruned || unlocated ? 'neutral' : 'warn')}</div><p class="empty-line" data-part="pending">${reason}</p></article>`;
 }
 
-export function renderRunEvidence(run = {}, credentialName = id => id, { qualityDetail = false } = {}) {
+export function renderRunEvidence(run = {}, { qualityDetail = false } = {}) {
   const config = run.config || {};
   const skip = admissionEvidence(run);
-  const supplier = frozenProviderLabel(config);
-  const credentialLabel = supplier || skip?.email || run.credential_email || credentialName(skip?.id || config.auth_id);
+  const identity = frozenRunIdentity(run);
+  const supplier = identity.supplier;
+  const credentialLabel = qualityDetail || run.source !== 'manual_test' ? qualityIdentityLabel(identity) : identity.label;
   const samples = run.samples || [];
   const manual = run.source === 'manual_test';
   const simple = manual && config.judge?.mode === 'manual';
@@ -764,15 +971,15 @@ export function renderRunEvidence(run = {}, credentialName = id => id, { quality
   const questionHeader = manual
     ? `<h3 class="answer-question">${escapeHTML(questionTitle(config.question, config.question_id))}</h3>
       <div class="answer-run-byline"><span class="answer-run-model"><svg class="control-icon" viewBox="0 0 20 20" aria-hidden="true"><path d="m10 2.5 6.5 3.7v7.6L10 17.5l-6.5-3.7V6.2L10 2.5ZM3.8 6.3l6.2 3.6 6.2-3.6M10 10v7"/></svg><span class="sr-only">模型 </span><bdi class="run-model">${escapeHTML(models.join(' / ') || '模型未记录')}</bdi></span>
-        ${supplier ? `<span class="answer-run-supplier">供应商 <bdi>${escapeHTML(supplier)}</bdi></span>` : ''}
+        ${supplier ? `<span class="answer-run-supplier">供应商 <bdi>${escapeHTML(credentialLabel)}</bdi></span>` : ''}
         <span class="answer-run-time"><svg class="control-icon" viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="7.2"/><path d="M10 5.6v4.7l3 1.8"/></svg><span class="sr-only">测试时间 </span>${timestamp === '未知' ? '时间未记录' : `<time datetime="${escapeHTML(run.created_at)}">${escapeHTML(timestamp)}</time>`}</span>
         ${run.status !== 'completed' ? statusTag(run.status) : ''}</div>` : '';
   const operationSummary = simple || skip ? '' : `<div class="run-state-line">${manual ? '' : statusTag(run.status)}<strong>${run.pruned_samples ? `保留 ${samples.length} 份结果` : `${completed} / ${planned} 样本已结束`}</strong><span>${verdictSummary}</span></div>
-    <div class="run-context-line"><span>${supplier ? '供应商' : '凭证'} <strong>${escapeHTML(evidenceValue(credentialLabel))}</strong></span>${manual ? '' : `<span>${escapeHTML(questionTitle(config.question, config.question_id))}</span>`}${reference ? `<span>标准答案 <strong>${escapeHTML(reference)}</strong></span>` : ''}<span>请求强度 ${escapeHTML(config.parameters?.reasoning_effort || '未指定')}</span>${manual ? '' : `<span>凭证处理 · ${escapeHTML(credentialHandlingLabel(run))}</span>`}</div>`;
+    <div class="run-context-line"><span>${identity.noun} <strong>${escapeHTML(evidenceValue(credentialLabel))}</strong></span>${manual ? '' : `<span>${escapeHTML(questionTitle(config.question, config.question_id))}</span>`}${reference ? `<span>标准答案 <strong>${escapeHTML(reference)}</strong></span>` : ''}<span>${hasRecordedSamples(run) ? '请求强度' : '计划强度'} ${escapeHTML(config.parameters?.reasoning_effort || '未指定')}</span>${manual ? '' : `<span>本轮处置 · ${escapeHTML(credentialHandlingLabel(run))}</span>`}</div>`;
   const metaHTML = questionHeader + operationSummary + issueHTML;
   if (skip) return {
     metaHTML: manual ? metaHTML : skip.status,
-    conditionsHTML: renderFrozenConditions(run, credentialLabel, credentialName),
+    conditionsHTML: renderFrozenConditions(run, credentialLabel),
     samplesHTML: '', completed: 0, planned: 0,
   };
   const retained = samples.map((sample, i) => ({ sample, recordIndex: pruned + i }));
@@ -800,28 +1007,30 @@ export function renderRunEvidence(run = {}, credentialName = id => id, { quality
   const controlHTML = run.controls?.length ? `<details class="control-results" data-key="controls"><summary>同批对照 · ${run.controls.length} 份结果</summary><p class="field-note">只有身份不同、同题、同模型映射、同有效条件的通过样本才构成有效对照。</p><div class="comparison-grid">${run.controls.map((sample, index) => `<section class="model-result" data-key="${escapeHTML(`control-model:${index}:${sample.model || '模型未知'}`)}"><div class="model-heading" data-part="model-heading"><h3>${escapeHTML(sample.model || '模型未知')}</h3><span>对照凭证</span></div>${renderAnswer(sample, index, sample.index ?? index, isActive, { control: true, qualityDetail })}</section>`).join('')}</div></details>` : '';
   return {
     metaHTML,
-    conditionsHTML: renderFrozenConditions(run, credentialLabel, credentialName),
+    conditionsHTML: renderFrozenConditions(run, credentialLabel),
     samplesHTML: `<div class="comparison-grid${simple ? ` question-test-results${models.length === 1 ? ' single-question' : ''}` : ''}" data-key="models">${groups || '<p class="empty-line">本轮没有记录模型或样本。</p>'}</div>${controlHTML}`,
     completed,
     planned,
   };
 }
 
-export function renderQualityDetail(run, rules, credentialName) {
+export function renderQualityDetail(run, rules) {
   const config = run.config || {};
   const ruleID = run.rule_id || config.rule_id;
   const ruleName = rules.find(rule => rule.id === ruleID)?.name || ruleID || '规则检测';
-  const { conditionsHTML, samplesHTML, completed, planned } = renderRunEvidence(run, credentialName, { qualityDetail: true });
+  const { conditionsHTML, samplesHTML, completed, planned } = renderRunEvidence(run, { qualityDetail: true });
   const skip = admissionEvidence(run);
-  const label = frozenProviderLabel(config) || skip?.email || run.credential_email || credentialName(skip?.id || config.auth_id) || '对象未记录';
-  const path = recordedProbePath(run);
+  const identity = frozenRunIdentity(run);
+  const label = qualityIdentityLabel(identity);
+  const path = skip?.source || recordedProbePath(run);
   const stamp = date(run.created_at);
   const header = `<header class="quality-detail-identity" data-key="identity"><strong><bdi>${escapeHTML(label)}</bdi></strong>
-    ${skip?.id && skip.id !== label ? `<code>${escapeHTML(skip.id)}</code>` : ''}
+    ${identity.type === 'provider' ? `<div class="quality-detail-name">${escapeHTML(identity.name || '本轮未记录供应商名称')}</div>` : ''}
+    ${identity.id && identity.id !== label ? `<code>${escapeHTML(identity.id)}</code>` : ''}
     <div class="quality-detail-byline"><span><span class="sr-only">检测规则 </span>${escapeHTML(ruleName)}</span>
       ${config.recovery_check ? '<span>恢复复检</span>' : ''}${path ? `<span>${escapeHTML(path)}</span>` : ''}
       ${stamp === '未知' ? '<span>时间未记录</span>' : `<time datetime="${escapeHTML(run.created_at)}">${escapeHTML(stamp)}</time>`}</div></header>`;
-  const handling = evidenceFact('凭证处理', credentialHandlingLabel(run));
+  const handling = evidenceFact('本轮处置', credentialHandlingLabel(run));
   const note = (title, value) => evidenceFact(title, value, 'quality-detail-note');
   const issue = run.error || run.block_reason || run.reason;
   const conflict = run.action_status === 'provider_config_conflict' ? note('配置写入', '快照或路由集合变化时会停止写入。若提交时 ETag 已过期，CPA 返回 HTTP 412，本次操作结束。') : '';
@@ -838,10 +1047,10 @@ export function renderQualityDetail(run, rules, credentialName) {
   }
 
   const samples = run.samples || [];
-  const answered = samples.filter(sample => sample.execution_status === 'completed' && !sample.error);
+  const answered = samples.filter(sample => sampleExecutionStatus(sample) === 'completed');
   const executionCounts = new Map();
   for (const sample of samples) {
-    if (!completedSample(sample) || (sample.execution_status === 'completed' && !sample.error)) continue;
+    if (!completedSample(sample) || sampleExecutionStatus(sample) === 'completed') continue;
     const state = statusLabels[qualitySampleOutcome(sample)] || '执行状态未知';
     executionCounts.set(state, (executionCounts.get(state) || 0) + 1);
   }
@@ -895,9 +1104,8 @@ const restrictionList = (reasons, fallback) =>
     ? `<ul class="restriction-list">${reasons.map((reason) => `<li>${escapeHTML(restrictionText(reason))}</li>`).join('')}</ul>`
     : `<p class="field-note">${escapeHTML(fallback)}</p>`;
 
-function nextRuleTime(rule) {
+function ruleTime(stamp = '') {
   // Keep the offset of this occurrence, including DST, independent of the browser zone.
-  const stamp = rule.next_run_local || rule.next_run || rule.next_run_at || '';
   const match = /^(\d{4}-\d\d-\d\d)T(\d\d:\d\d:\d\d)(?:\.\d+)?(Z|[+-]\d\d:\d\d)$/.exec(stamp);
   if (!match || stamp.startsWith('0001-')) return '时间待确认';
   return `${match[1]} ${match[2]} · UTC${match[3] === 'Z' ? '' : match[3]}`;
@@ -912,27 +1120,42 @@ export function ruleState(rule, targets) {
   return rule.timer_active ? 'timed' : 'manual';
 }
 
+export const ruleScheduleEnabled = rule => typeof rule.scheduling_enabled === 'boolean' ? rule.scheduling_enabled : rule.timer_active;
+
 export function dynamicScopeLabel(scope) {
   return scope === 'all_credentials' ? '全部' : scope === 'all_enabled' ? '仅已启用' : '';
 }
 
-function handlingRecord(record, name, canAcknowledge) {
-  const upstream = record.upstream_condition;
-  const catalogModel = record.catalog_missing_model;
+function handlingRecord(record, name, canAcknowledge, ruleID = '') {
+  const source = record.error_source;
+  const upstream = source?.condition || record.upstream_condition;
+  const catalogModel = source?.catalog_missing ? source.model : record.catalog_missing_model;
   const resolved = record.state === 'disabled' || record.state === 'deleted';
   const evidence = catalogModel ? `CPA 注册目录缺少 ${catalogModel}` : upstream && upstreamLabel(upstream);
-  const status = record.state === 'disabled' ? (evidence ? '已按错误规则暂停，退出后续检测' : '已暂停凭证') : record.state === 'deleted' ? '已移除凭证' : '处置待核对';
-  const confirmedCondition = evidence && resolved;
-  const summary = [record.email || name(record.auth_id), evidence, status].filter(Boolean).map(escapeHTML).join(' · ');
-  const check = `<button type="button" class="text-button" data-handling-ack="${escapeHTML(record.action_id)}" ${canAcknowledge ? '' : 'disabled title="请刷新核对规则与目录"'}>核对人工处理</button>`;
-  const followup = confirmedCondition && record.state === 'deleted' ? '。后续检测无需人工标记。' : '';
-  return `<div data-key="handling:${escapeHTML(record.action_id)}"><span>${summary}${followup}</span>${confirmedCondition ? `<details><summary>已在 CPA 手动变更</summary>${check}</details>` : check}</div>`;
+  const ended = ['restored', 'acknowledged', 'externally_enabled'].includes(record.state);
+  const owner = record.answer_owner_rule_id || (!evidence && record.state === 'disabled' ? record.rule_id : '');
+  const status = record.state === 'disabled' ? (evidence ? '已按错误规则停用，退出答题和恢复复检' : '已因答错停用，恢复归属保留')
+    : record.state === 'deleted' ? '已移除凭证' : ended ? '本次处置关联已结束' : '处置待核对';
+  const summary = [record.email || name(record.auth_id), evidence, source?.rule_id && `错误来源规则 ${source.rule_id}`,
+    source?.model && `触发模型 ${source.model}`, source?.created_at && `错误记录于 ${date(source.created_at)}`,
+    owner && `${ended ? '原答错恢复归属' : '答错恢复归属'} ${owner}`, status].filter(Boolean).map(escapeHTML).join(' · ');
+  const check = `<button type="button" class="text-button" data-handling-ack="${escapeHTML(record.action_id)}" data-handling-auth="${escapeHTML(record.auth_id)}" data-handling-rule="${escapeHTML(ruleID)}" ${canAcknowledge ? '' : 'disabled title="请刷新核对规则与目录"'}>核对人工处理</button>`;
+  const followup = record.state === 'disabled' ? '。在 CPA 手动启用后，正常状态读取会自动结束旧关联。' : record.state === 'deleted' ? '。不会自动重建凭证。' : '';
+  return `<div data-key="handling:${escapeHTML(JSON.stringify([record.action_id, record.auth_id]))}"><span>${summary}${followup}</span>${resolved || ended ? '' : check}</div>`;
+}
+
+export function renderOrphanedHandling(records, name, { expanded, canAcknowledge, readError }) {
+  if (!records.length) return '';
+  const note = readError ? `<p class="field-note" role="status">${escapeHTML(readError)}</p>` : '';
+  return `<div class="rule-activity-tools" data-key="orphaned-handling"><details data-orphaned-handling><summary>已删除规则的待核对处置（${records.length}）</summary>
+    ${note}<div class="quality-handling-records">${expanded ? records.map(record => handlingRecord(record, name, canAcknowledge)).join('') : ''}</div></details></div>`;
 }
 
 export function renderScopeSkipDetails(dispatch) {
   const details = dispatch.details || dispatch.skip_details;
   const renderList = (rows, label) => `<ul class="scope-skip-list" tabindex="0" aria-label="${label}">${rows.map(row => {
-    const identity = row.email || row.provider_name || row.auth_id || '对象标识未记录';
+    const subject = frozenRunIdentity({ skip_detail: row });
+    const identity = subject.type === 'oauth' ? row.email || row.provider_name || row.auth_id || '对象标识未记录' : qualityIdentityLabel(subject);
     const id = row.auth_id && identity !== row.auth_id ? `<code>${escapeHTML(row.auth_id)}</code>` : '';
     const link = row.run_id ? `<button type="button" class="text-button small" data-run="${escapeHTML(row.run_id)}" aria-label="查看 ${escapeHTML(row.auth_id || identity)} 的详情">详情</button>` : '';
     return `<li><div><strong>${escapeHTML(identity)}</strong>${id}${link}</div><p>${row.model ? `<code>${escapeHTML(row.model)}</code> · ` : ''}${escapeHTML(row.reason || row.code || '原因未记录')}</p></li>`;
@@ -982,8 +1205,10 @@ export function renderRuleActivityContext(rule, name, { dispatchOpen, handlingOp
     dispatch = `<details class="scope-dispatch" data-part="legacy-skips" data-skip-rule="${escapeHTML(rule.id)}"><summary>上轮跳过 ${skipped.length} 个手动禁用凭证</summary><div class="scope-skip-body">${body}</div></details>`;
   }
   const handling = rule.handling?.length ? `<details data-part="handling" data-rule-handling="${escapeHTML(rule.id)}"><summary>处置记录（${rule.handling.length}）</summary>
-    <div class="quality-handling-records">${handlingOpen ? rule.handling.map(record => handlingRecord(record, name, canAcknowledge)).join('') : ''}</div></details>` : '';
-  return recent || dispatch || handling ? `<div class="rule-activity-tools" data-key="context:${escapeHTML(rule.id)}">${recent}${dispatch}${handling}</div>` : '';
+    <div class="quality-handling-records">${handlingOpen ? rule.handling.map(record => handlingRecord(record, name, canAcknowledge, rule.id)).join('') : ''}</div></details>` : '';
+  const due = rule.pending_schedule?.due;
+  const catchup = due ? `<p class="field-note">待补检周期：${escapeHTML(ruleTime(due))}</p>` : '';
+  return recent || dispatch || handling || catchup ? `<div class="rule-activity-tools" data-key="context:${escapeHTML(rule.id)}">${catchup}${recent}${dispatch}${handling}</div>` : '';
 }
 
 export function renderRuleRows(rules, targets, { connected, targetsFresh, settings = {}, scopeRule = '', busy, resourceStatus }) {
@@ -993,15 +1218,16 @@ export function renderRuleRows(rules, targets, { connected, targetsFresh, settin
   const ready = connected && targetsFresh && rulesCurrent;
   return rules.map((rule) => {
     const config = rule.config || rule, held = holdsPause(rule, targets);
-    const enabled = rule.enabled === true && !held, timed = rule.timer_active;
+    const enabled = rule.enabled === true && !held, timed = rule.timer_active, scheduled = ruleScheduleEnabled(rule);
     const known = typeof rule.enabled === 'boolean' && typeof timed === 'boolean';
     const unsupported = rule.status === 'unsupported' || (officialHost && (rule.action === 'pause_credential' || rule.automatic_pause));
     const on = enabled && timed === true;
+    const loginHold = ['credential_update_pending', 'credential_update_failed', 'credential_write_unknown', 'credential_identity_conflict'].includes(rule.status);
     const saving = busy?.has(`rule-timer:${rule.id}`);
-    const label = held ? officialHost ? '历史归属待核对' : '等待人工解除' : unsupported ? '不支持' : !known ? '状态未确认' : on ? '定时开启' : enabled ? '仅手动' : '已停止';
+    const label = held ? officialHost ? '历史归属待核对' : '等待人工解除' : unsupported ? '不支持' : !known ? '状态未确认' : scheduled && !on ? '定时未运行' : on ? '定时开启' : enabled ? '仅手动' : '已停止';
     const canSwitch = officialHost && known && ready && !held && !unsupported;
-    const hint = saving ? '正在保存' : canSwitch ? (on ? '暂停定时检测' : '启用定时检测') : label;
-    const blockedBy = held ? '目标或依赖凭证暂停，检测已停止' : !rulesCurrent ? '规则状态未确认，请刷新' : !ready ? '目录状态未确认，请刷新' : '';
+    const hint = saving ? '正在保存' : canSwitch ? scheduled ? (on ? '暂停定时检测' : '定时设置已保留但尚未运行；点击关闭已保存定时。') : '启用定时检测' : label;
+    const blockedBy = held ? '目标或依赖凭证暂停，检测已停止' : !rulesCurrent ? '规则状态未确认，请刷新' : loginHold ? statusLabels[rule.status] : !ready ? '目录状态未确认，请刷新' : rule.timer_wait_reason || '';
     const id = escapeHTML(rule.id), selected = scopeRule === rule.id;
     const models = config.models || [];
     const scope = escapeHTML(ruleScopeDescription(rule, targets));
@@ -1014,20 +1240,20 @@ export function renderRuleRows(rules, targets, { connected, targetsFresh, settin
     return `<article class="quality-rule${selected ? ' selected' : ''}" data-key="rule:${id}">
       <header class="quality-rule-head">
         <button type="button" class="quality-rule-select" data-rule-select="${id}" aria-pressed="${selected}" aria-controls="ops-activity" title="查看「${title}」的运行记录"><strong>${title}</strong></button>
-        <button type="button" class="rule-state rule-timer-toggle" role="switch" aria-label="${title}的定时检测" aria-checked="${on}" aria-busy="${!!saving}" data-rule-timer="${id}" title="${hint}" ${!canSwitch || saving ? 'disabled' : ''}><span class="rule-timer-track" aria-hidden="true"></span>${label}</button>
+        <button type="button" class="rule-state rule-timer-toggle" role="switch" aria-label="${title}的定时检测" aria-checked="${scheduled === true}" aria-busy="${!!saving}" data-rule-timer="${id}" title="${hint}" ${!canSwitch || saving ? 'disabled' : ''}><span class="rule-timer-track" aria-hidden="true"></span>${label}</button>
       </header>
       <dl class="quality-rule-config">
         <div class="quality-rule-scope"><dt>范围</dt><dd title="${scope}">${scope}</dd></div>
         <div><dt>模型</dt><dd class="quality-rule-models" title="${escapeHTML(models.join('、'))}">${models.length ? `<code>${escapeHTML(models[0])}</code>` : '未指定'}${models.length > 1 ? `<small>等 ${models.length} 个</small>` : ''}</dd></div>
         ${operationFact('答错时', action)}
         ${upstream.length ? `<div><dt>上游错误</dt><dd title="${escapeHTML(upstream.map(([condition, handling]) => condition + ' · ' + handling).join('，'))}">${upstream.length} 项处置策略</dd></div>` : ''}
-        ${on ? operationFact('下次执行', nextRuleTime(rule)) : ''}
+        ${on ? operationFact(rule.timer_wait_reason && !rule.pending_schedule ? '待补检周期' : '下次执行', ruleTime(rule.next_run_local || rule.next_run || rule.next_run_at)) : ''}
       </dl>
       ${blockedBy ? `<p class="quality-rule-warning">${escapeHTML(blockedBy)}</p>` : ''}
       <footer class="quality-rule-actions">
         <button type="button" class="text-button" data-rule-edit="${id}">编辑</button>
         <button type="button" class="text-button" data-rule-delete="${id}" ${held || !ready ? 'disabled' : ''}>删除</button>
-        <button type="button" data-rule-run="${id}" ${!ready || !enabled || unsupported ? 'disabled' : ''}><svg class="control-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 4.75a1 1 0 0 1 1.5-.87l12.5 7.25a1 1 0 0 1 0 1.74L7.5 20.12A1 1 0 0 1 6 19.25Z"/></svg>立即执行</button>
+        <button type="button" data-rule-run="${id}" ${!ready || !enabled || unsupported || loginHold ? 'disabled' : ''}><svg class="control-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 4.75a1 1 0 0 1 1.5-.87l12.5 7.25a1 1 0 0 1 0 1.74L7.5 20.12A1 1 0 0 1 6 19.25Z"/></svg>立即执行</button>
       </footer>
     </article>`;
   }).join('');
@@ -1053,10 +1279,11 @@ function qualityRunResult(run) {
   return facts.join('') || '暂无判定';
 }
 
-function qualityRunRow(run, ruleName, credentialName, clock, stamp) {
+function qualityRunRow(run, ruleName, clock, stamp, duplicateIndexes, duplicateLabels) {
   const config = run.config || {};
   const skip = admissionEvidence(run);
-  const identity = frozenProviderLabel(config) || skip?.email || run.credential_email || credentialName(skip?.id || config.auth_id) || '对象未记录';
+  const subject = frozenRunIdentity(run);
+  const identity = qualityIdentityLabel(subject);
   const models = config.models || [];
   const model = models.length > 1 ? `${models[0]} 等 ${models.length} 个模型` : models[0] || '模型未记录';
   const effort = config.parameters?.reasoning_effort;
@@ -1065,31 +1292,48 @@ function qualityRunRow(run, ruleName, credentialName, clock, stamp) {
   const response = !skip && runUpstreamResponses(run);
   const source = [config.recovery_check && '恢复复检',skip?.source || recordedProbePath(run)].filter(Boolean).join(' · ');
   const handling = credentialHandlingLabel(run);
+  const showID = subject.type === 'provider' ? duplicateIndexes.has(subject.index)
+    : subject.type === 'oauth' && (skip || duplicateLabels.has(identity)) && subject.id && subject.id !== identity;
+  const idLabel = subject.idLabel;
   return `<tr class="quality-run-row" data-key="run:${escapeHTML(run.id || run.run_id)}">
     <td class="quality-identity-cell">
-      <button type="button" class="quality-run-open" data-run="${escapeHTML(run.id || run.run_id)}" aria-haspopup="dialog" aria-label="查看 ${escapeHTML(identity)} 的运行详情 · ${escapeHTML(ruleName)} · ${escapeHTML(stamp)}"><bdi>${escapeHTML(identity)}</bdi><span aria-hidden="true">›</span></button>
-      ${skip?.id && skip.id !== identity ? `<small>${escapeHTML(skip.id)}</small>` : ''}
-      <div class="quality-run-context"><span>${escapeHTML(ruleName)}</span><span title="${escapeHTML(models.join(' / '))}">${escapeHTML(model)}</span>${!skip && effort ? `<span>请求强度 ${escapeHTML(effort)}</span>` : ''}</div>
+      <button type="button" class="quality-run-open" data-run="${escapeHTML(run.id || run.run_id)}" aria-haspopup="dialog"${subject.id ? ` title="${idLabel} ${escapeHTML(subject.id)}"` : ''} aria-label="查看 ${escapeHTML(identity)} 的运行详情${subject.id ? ` · ${idLabel} ${escapeHTML(subject.id)}` : ''} · ${escapeHTML(ruleName)} · ${escapeHTML(stamp)}"><bdi>${escapeHTML(identity)}</bdi><span aria-hidden="true">›</span></button>
+      ${subject.supplier && subject.name ? `<div class="quality-run-name">${escapeHTML(subject.name)}</div>` : ''}
+      ${showID ? `<small class="quality-run-auth-id">${subject.supplier ? idLabel + ' ' : ''}${escapeHTML(subject.id || '未记录')}</small>` : ''}
+      <div class="quality-run-context"><span>${escapeHTML(ruleName)}</span><span title="${escapeHTML(models.join(' / '))}">${escapeHTML(model)}</span>${effort ? `<span>${hasRecordedSamples(run) ? '请求强度' : '计划强度'} ${escapeHTML(effort)}</span>` : ''}</div>
     </td>
     <td class="quality-result-cell" data-label="检测结果"><div class="quality-result">${skip ? `${skip.status}<span>${escapeHTML(skip.result)}</span>` : qualityRunResult(run)}${response ? `<span>${escapeHTML(response)}</span>` : ''}</div>
       ${reason ? `<small class="quality-run-reason" title="${escapeHTML(reason)}">${escapeHTML(reason)}</small>` : ''}</td>
-    <td class="quality-handling-cell" data-label="凭证处理"><span data-handling="${escapeHTML(run.action_status)}">${escapeHTML(handling)}</span>${source ? `<small>${escapeHTML(source)}</small>` : ''}</td>
+    <td class="quality-handling-cell" data-label="本轮处置"><span data-handling="${escapeHTML(run.action_status)}">${escapeHTML(handling)}</span>${source ? `<small>${escapeHTML(source)}</small>` : ''}</td>
     <td class="quality-time-cell">${clock ? `<time datetime="${escapeHTML(run.created_at)}" title="${escapeHTML(stamp)}">${escapeHTML(clock)}</time>` : '未知'}</td>
   </tr>`;
 }
 
-export function renderQualityRuns(runs, rules, credentialName = id => id) {
+export function renderQualityRuns(runs, rules) {
   if (!runs.length) return renderQualityEmpty('暂无运行记录', '手动或定时执行规则后，在这里查看检测结果。');
   const ruleNames = new Map(rules.map(rule => [rule.id, rule.name]));
+  const routeIDs = new Map(), labelIDs = new Map();
+  for (const run of runs) {
+    const identity = frozenRunIdentity(run);
+    if (!identity.supplier) {
+      if (!labelIDs.has(identity.label)) labelIDs.set(identity.label, new Set());
+      labelIDs.get(identity.label).add(identity.id);
+    }
+    if (!identity.index) continue;
+    if (!routeIDs.has(identity.index)) routeIDs.set(identity.index, new Set());
+    routeIDs.get(identity.index).add(identity.id);
+  }
+  const duplicateIndexes = new Set([...routeIDs].filter(([, ids]) => ids.size > 1).map(([index]) => index));
+  const duplicateLabels = new Set([...labelIDs].filter(([, ids]) => ids.size > 1).map(([label]) => label));
   const days = new Map();
   for (const run of runs) {
     const stamp = date(run.created_at), [day, clock] = stamp.split(' ');
     const ruleID = run.rule_id || run.config?.rule_id;
     if (!days.has(day)) days.set(day, []);
-    days.get(day).push(qualityRunRow(run, ruleNames.get(ruleID) || ruleID || '规则检测', credentialName, clock, stamp));
+    days.get(day).push(qualityRunRow(run, ruleNames.get(ruleID) || ruleID || '规则检测', clock, stamp, duplicateIndexes, duplicateLabels));
   }
   const groups = Array.from(days, ([day, rows]) => `<tbody data-key="day:${escapeHTML(day)}"><tr class="quality-run-day"><th scope="rowgroup" colspan="4">${day === '未知' ? '日期未记录' : escapeHTML(day)}</th></tr>${rows.join('')}</tbody>`).join('');
-  return `<table class="quality-run-table" aria-label="规则检测运行记录"><thead><tr><th scope="col">凭证与规则</th><th scope="col">检测结果</th><th scope="col">凭证处理</th><th scope="col">时间</th></tr></thead>${groups}</table>`;
+  return `<table class="quality-run-table" aria-label="规则检测运行记录"><thead><tr><th scope="col">对象与规则</th><th scope="col">检测结果</th><th scope="col">本轮处置</th><th scope="col">时间</th></tr></thead>${groups}</table>`;
 }
 
 export function renderTargetRows(targets) {

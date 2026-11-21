@@ -57,11 +57,20 @@ async function main() {
           return route.fulfill({ json: {} });
         }
         assert.equal(req.method(), 'GET');
-        if (p.endsWith('/plugins/model-quality/targets') && control.targetState) {
-          const data = await (await route.fetch()).json();
-          const target = data.items.find(row => row.auth_id === 'fixture-quality-primary');
-          Object.assign(target, control.targetState);
-          return route.fulfill({ json: data });
+        if (p.endsWith('/plugins/model-quality/targets')) {
+          control.targetReads = (control.targetReads || 0) + 1;
+          const held = control.targetHolds?.shift();
+          if (control.targetState || held) {
+            const data = await (await route.fetch()).json();
+            const target = data.items.find(row => row.auth_id === 'fixture-quality-primary');
+            Object.assign(target, control.targetState, held?.state);
+            if (held) {
+              held.entered.release();
+              await held.wait.promise;
+              if (held.status) return route.fulfill({ status: held.status, json: { error: 'Synthetic target read failure' } });
+            }
+            return route.fulfill({ json: data });
+          }
         }
         if (p.endsWith('/runs/detail')) {
           const id = u.searchParams.get('id'), key = u.searchParams.get('idempotency_key');
@@ -142,10 +151,11 @@ async function main() {
       assert.equal(await page.locator('#model-note').textContent(), '');
       assert.doesNotMatch(await setup.innerText(), /可选\s*14\s*个模型/);
       await changeTarget({ credential_handling: 'disabled', error_policy_block: history, manual_disabled: true, runtime_status: 'disabled', effective_available: false });
-      assert.equal(await summary.textContent(), 'CPA 当前仍停用此凭证，无法开始智商测试。');
+      assert.equal(await summary.textContent(), '目标凭证当前仍在 CPA 停用，停用期间退出答题和恢复复检。');
       assert.doesNotMatch(await setup.innerText(), policyText);
-      assert(await submit(page).isDisabled());
+      assert(await submit(page).isEnabled());
       await page.locator('#run-form').evaluate(form => form.requestSubmit());
+      await page.waitForFunction(() => !document.querySelector('#run-submit').disabled);
       assert.equal(posts.length, 0);
       await changeTarget({ credential_handling: 'attention', error_policy_block: history });
       assert.equal(await summary.textContent(), '当前凭证状态尚未确认，无法开始智商测试。请刷新后重试。');
@@ -189,6 +199,95 @@ async function main() {
       assert.equal(submitted.question_id, 'logic-candy');
       assert.doesNotMatch(JSON.stringify(submitted), /former-model|error_policy|credential_handling/);
       return { options: models.length, selectedModel: manualModel, submittedModels: submitted.models, accepted: tasks.size, rejected: posts.length - tasks.size };
+    });
+    await scenario('disabled_capability_refresh', async ({ page, control, posts, tasks }) => {
+      await page.selectOption('#reasoning', 'high');
+      const disabled = { manual_disabled: true, runtime_status: 'disabled', effective_available: false,
+        credential_handling: 'disabled', models: [], reasoning: {} };
+      const cacheDisabled = async () => {
+        control.targetState = disabled;
+        await page.click('#refresh');
+        await page.waitForSelector('#refresh:not([aria-busy="true"])');
+        assert.equal(await page.locator('#models').inputValue(), 'fixture-reasoner');
+        assert.equal(await page.locator('#reasoning').inputValue(), 'high');
+        assert(await submit(page).isEnabled(), 'A complete cached disabled plan must be able to read current capabilities');
+        assert.equal(await page.locator('#model-note').innerText(), '当前缓存未提供此模型，开始测试时将刷新核对。');
+      };
+      const attempt = async () => {
+        const before = control.targetReads;
+        const refreshed = page.waitForResponse(response => new URL(response.url()).pathname.endsWith('/plugins/model-quality/targets'));
+        await submit(page).click();
+        await (await refreshed).finished();
+        await page.waitForSelector('#run-submit:not([aria-busy="true"])');
+        assert(control.targetReads > before, 'Submission must fetch the current target before validation');
+      };
+      await cacheDisabled();
+      await screenshot(page, 'disabled-capability-ready');
+      await attempt();
+      assert.equal(posts.length, 0, 'A still-disabled target must not create a model task');
+      control.targetState = { models: ['fixture-visual'], reasoning: {} };
+      await attempt();
+      assert.equal(posts.length, 0, 'A model absent from the current enabled directory must not create a model task');
+      assert.equal(await page.locator('#model-note').innerText(), '原模型已从目录移除，请重新选择模型。');
+      assert(await submit(page).isDisabled());
+      await cacheDisabled();
+      control.targetState = { reasoning: { 'fixture-reasoner': { levels: ['low'] } } };
+      await attempt();
+      assert.equal(posts.length, 0, 'A currently unsupported reasoning effort must not create a model task');
+      assert(await submit(page).isDisabled());
+      assert.match(await page.locator('#notice').innerText(), /思考强度.*支持范围/);
+      await cacheDisabled();
+      control.targetState = {};
+      const before = control.targetReads;
+      await submit(page).click();
+      await page.waitForFunction(() => document.querySelector('#run-frozen-data').textContent.includes('manual-1'));
+      assert(control.targetReads > before);
+      assert.equal(posts.length, 1);
+      assert.equal(tasks.size, 1);
+      const submitted = tasks.get(posts[0]).config;
+      assert.deepEqual(submitted.models, ['fixture-reasoner']);
+      assert.equal(submitted.parameters.reasoning_effort, 'high');
+      await screenshot(page, 'restored-capability-submitted');
+      return { rejectedPosts: 0, accepted: tasks.size, model: submitted.models[0], effort: submitted.parameters.reasoning_effort };
+    });
+    for (const order of ['submit_first', 'visibility_first', 'latest_failure']) {
+      await scenario('concurrent_target_reads_' + order, async ({ page, control, posts }) => {
+        const disabled = { manual_disabled: true, runtime_status: 'disabled', effective_available: false };
+        const first = { entered: gate(), wait: gate(), state: order === 'visibility_first' ? {} : disabled };
+        const latest = { entered: gate(), wait: gate(), state: disabled, ...(order === 'latest_failure' ? { status: 503 } : {}) };
+        control.targetHolds = [first, latest];
+        await submit(page).click(); await first.entered.promise;
+        await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
+        await latest.entered.promise;
+        const early = order === 'visibility_first' ? latest : first;
+        const late = early === first ? latest : first;
+        const response = page.waitForResponse(r => new URL(r.url()).pathname.endsWith('/plugins/model-quality/targets'));
+        early.wait.release(); await (await response).finished();
+        await page.waitForTimeout(80);
+        assert.equal(posts.length, 0, 'A superseded preflight must not submit using old enabled state');
+        late.wait.release();
+        await page.waitForSelector('#run-submit:not([aria-busy="true"])');
+        assert.equal(posts.length, 0);
+        if (order === 'latest_failure') {
+          assert(await submit(page).isDisabled());
+          assert.match(await page.locator('#target-summary').innerText(), /读取失败/);
+        } else assert.match(await page.locator('#target-summary').innerText(), /停用/);
+        return { posts: posts.length, newestReadControlsAdmission: true, responseOrder: order };
+      });
+    }
+    await scenario('target_read_session_switch', async ({ page, control, posts, configure }) => {
+      const held = { entered: gate(), wait: gate(), state: { manual_disabled: true, runtime_status: 'disabled', effective_available: false } };
+      control.targetHolds = [held];
+      await submit(page).click(); await held.entered.promise;
+      await page.click('#connection-top'); await page.click('#disconnect');
+      await page.waitForSelector('body:not(.connected)');
+      held.wait.release();
+      await page.click('#connection-open'); await page.fill('#management-key', management_key);
+      await page.click('#connection-form button[type=submit]'); await page.waitForSelector('body.connected');
+      await configure(); await page.waitForSelector('#run-submit:enabled');
+      assert.equal(posts.length, 0, 'An old preflight cannot submit into the new connection');
+      assert.equal(await page.locator('#target-summary').innerText(), '凭证可用');
+      return { posts: posts.length, oldSessionDiscarded: true, newConnectionReady: true };
     });
     await scenario('history_poll_after_selection', async ({ page, control }) => {
       control.otherActive = 'fixture-run-complete';

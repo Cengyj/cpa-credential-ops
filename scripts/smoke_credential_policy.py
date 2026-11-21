@@ -21,7 +21,7 @@ def docker(*args, **kwargs):
     return subprocess.run(['docker', *args], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **kwargs).stdout
 
 
-def main(package, output, interrupt_status=False, upstream_errors=False, scope_skips=False, error_suspensions=False, credential_replacements=False, runtime_policy=False, manual_readmission=False, scheduled_addition=False, rule_history_clear=False):
+def main(package, output, interrupt_status=False, upstream_errors=False, scope_skips=False, error_suspensions=False, credential_replacements=False, runtime_policy=False, manual_readmission=False, scheduled_addition=False, rule_history_clear=False, quality_operations=False):
     manifest = json.loads((package / 'build-manifest.json').read_text())
     archive = package / f'model-quality-v{manifest["plugin_version"]}-linux-arm64.zip'
     assert hashlib.sha256(archive.read_bytes()).hexdigest() == manifest['checksums'][archive.name]
@@ -50,9 +50,11 @@ def main(package, output, interrupt_status=False, upstream_errors=False, scope_s
         path = root / 'calls.jsonl'
         return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
 
+    previous_mutations = []
+
     def mutation_log():
         log = subprocess.run(['docker', 'logs', name], check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT).stdout.decode()
-        return re.findall(r'\|\s*(PATCH|DELETE)\s+"(/v8/management/credentials(?:/status|\?[^"]*))"', log)
+        return previous_mutations + re.findall(r'\|\s*(PATCH|DELETE)\s+"(/v8/management/credentials(?:/status|\?[^"]*))"', log)
 
     measured = []
 
@@ -114,7 +116,7 @@ def main(package, output, interrupt_status=False, upstream_errors=False, scope_s
             (root / 'plugins/model-quality.so').write_bytes(z.read('model-quality.so'))
         def credential(name):
             return {'type': 'codex', 'access_token': 'offline-only-' + name, 'account_id': 'synthetic-' + name, 'email': name + '@example.test', 'base_url': 'http://127.0.0.1:18887/v1'}
-        if credential_replacements or runtime_policy or manual_readmission or scheduled_addition:
+        if credential_replacements or runtime_policy or manual_readmission or scheduled_addition or quality_operations:
             credentials = {'one': credential('one')}
         elif error_suspensions or rule_history_clear:
             from smoke_error_suspensions import ACCOUNTS
@@ -133,7 +135,7 @@ def main(package, output, interrupt_status=False, upstream_errors=False, scope_s
         for account, data in credentials.items():
             (root / 'auths' / (account + '.json')).write_text(json.dumps(data))
         config = {'config-version': 8, 'server': {'host': '127.0.0.1', 'port': 18379, 'discovery': {'enabled': False}, 'kv-store': {'path': '/probe/kv.db'}}, 'management': {'secret-key': key, 'disable-control-panel': True, 'disable-auto-update-panel': True}, 'oauth': {'auth-dir': '/probe/auths'}, 'plugins': {'enabled': True, 'dir': '/probe/plugins', 'configs': {'model-quality': {'enabled': True, 'data_dir': '/probe/data', 'scheduling_enabled': False}}}}
-        native_codex = runtime_policy or manual_readmission
+        native_codex = runtime_policy or manual_readmission or quality_operations
         if native_codex:
             config['access'] = {'api-keys': [business_key]}
             subprocess.run(['openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1',
@@ -145,7 +147,10 @@ def main(package, output, interrupt_status=False, upstream_errors=False, scope_s
         record_writes = upstream_errors or error_suspensions or credential_replacements or native_codex or scheduled_addition or rule_history_clear
         adapter_port = 18479 if interrupt_status or record_writes else 18379
         business_fixture = ['--add-host', 'chatgpt.com:127.0.0.1', '-e', 'SSL_CERT_FILE=/probe/fixture-cert.pem'] if native_codex else []
-        docker('run', '-d', '--pull=never', '--network', 'none', '--name', name, *business_fixture, '-e', f'MODEL_QUALITY_CPA_URL=http://127.0.0.1:{adapter_port}', '--mount', f'type=bind,source={root},target=/probe', HOST, './CLIProxyAPI', '--config', '/probe/config.yaml', '--standalone', '--local-model')
+        def start_host():
+            docker('run', '-d', '--pull=never', '--network', 'none', '--name', name, *business_fixture, '-e', f'MODEL_QUALITY_CPA_URL=http://127.0.0.1:{adapter_port}', '--mount', f'type=bind,source={root},target=/probe', HOST, './CLIProxyAPI', '--config', '/probe/config.yaml', '--standalone', '--local-model')
+
+        start_host()
         try:
             def start_fixture():
                 fixture_args = ['--record-writes'] if record_writes else []
@@ -153,9 +158,17 @@ def main(package, output, interrupt_status=False, upstream_errors=False, scope_s
                     fixture_args.append('--business-tls')
                 docker('run', '-d', '--pull=never', '--name', mock, '--network', 'container:' + name, '--mount', f'type=bind,source={root},target=/probe', CURL, 'python3', '-u', '/probe/fake.py', *fixture_args)
 
-            def restart_with_fixture():
+            def restart_with_fixture(recreate_after=None):
                 docker('rm', '-f', mock)
-                docker('restart', name)
+                if recreate_after is None:
+                    docker('restart', name)
+                else:
+                    docker('stop', name)
+                    old_mutations = mutation_log()
+                    previous_mutations[:] = old_mutations
+                    docker('rm', name)
+                    time.sleep(max(0, recreate_after - time.time()))
+                    start_host()
                 start_fixture()
 
             start_fixture()
@@ -173,6 +186,18 @@ def main(package, output, interrupt_status=False, upstream_errors=False, scope_s
                 time.sleep(.2)
             else:
                 raise AssertionError('Synthetic credential did not register')
+            connection = request(PREFIX + '/connection')
+            assert connection['can_migrate'] and not connection['configured']
+            configured = request(PREFIX + '/connection', {'mode':'configure','revision':connection['revision']}, 'PUT')
+            assert configured['state'] == 'ready' and configured['source'] == 'saved'
+            if quality_operations:
+                from smoke_quality_operations import verify_operations
+                report = verify_operations(PREFIX, request, restart_with_fixture, root, targets[0], credential, recorded_calls)
+                report.update(plugin_version=manifest['plugin_version'], package_sha256=manifest['checksums'][archive.name],
+                              host='unchanged official 8.0.76', network='none', live_account_calls=0)
+                output.write_text(json.dumps(report, indent=2, ensure_ascii=False) + '\n')
+                print('Verified independent policies, cross-rule ownership, current enablement and new snapshots on isolated CPA.')
+                return
             if scheduled_addition:
                 from smoke_scheduled_addition import verify_scheduled_addition
                 report = verify_scheduled_addition(PREFIX, request, restart_with_fixture, root, targets[0], credential, recorded_calls, mutation_log)
@@ -275,9 +300,48 @@ def main(package, output, interrupt_status=False, upstream_errors=False, scope_s
                     snapshots.append({'action_status': detail['action_status'], 'handling': handling[0]['state'],
                                       'samples': len(detail['samples']), 'patches': len(mutation_log()), 'disabled': True})
                 assert request(PREFIX + '/rules/run-history', method='DELETE') == {'deleted': 1, 'kept': 1, 'kept_for_handling': 1}
-                output.write_text(json.dumps({'package_sha256': manifest['checksums'][archive.name], 'before': initial['action_status'],
-                                              'after_restarts': snapshots, 'fake_model_calls': len(recorded_calls())}, indent=2)+'\n')
-                print('Held a successful PATCH response, interrupted CPA and verified evidence through two starts.')
+                current_rule = next(r for r in request(PREFIX + '/rules')['items'] if r['id'] == suspended['id'])
+                action = current_rule['handling'][0]
+                calls_before_resolution = len(recorded_calls())
+                writes_before_resolution = mutation_log()
+                request(PREFIX + '/rules', {'id': current_rule['id'], 'revision': current_rule['revision']}, 'DELETE')
+                rules_after_deletion = request(PREFIX + '/rules')
+                assert all(r['id'] != suspended['id'] for r in rules_after_deletion['items'])
+                orphaned = rules_after_deletion['orphaned_handling']
+                assert len(orphaned) == 1 and orphaned[0]['auth_id'] == action['auth_id']
+                assert orphaned[0]['action_id'] == action['action_id'] and orphaned[0]['state'] == 'attention'
+                assert 'snapshot' not in orphaned[0]
+                ack = {'rule_id': '', 'auth_id': action['auth_id'], 'action_id': action['action_id']}
+                blocked_ack = request(PREFIX + '/rules/handling/acknowledge', ack, allowed=(409,))
+                assert blocked_ack['error']['code'] == 'blocked', blocked_ack
+                assert mutation_log() == writes_before_resolution and len(recorded_calls()) == calls_before_resolution
+                request('/v8/management/credentials/status', {'name': 'one.json', 'auth_index': codex['auth_index'], 'disabled': False}, 'PATCH')
+                until = time.monotonic() + 10
+                while True:
+                    enabled = next(t for t in request(PREFIX + '/targets')['items'] if t['auth_id'] == action['auth_id'])
+                    if not enabled['manual_disabled']:
+                        break
+                    if time.monotonic() >= until:
+                        raise AssertionError('Explicit CPA enablement did not become visible')
+                    time.sleep(.1)
+                assert request(PREFIX + '/rules')['orphaned_handling'][0]['state'] == 'attention'
+                stale_ack = request(PREFIX + '/rules/handling/acknowledge', {**ack, 'action_id': 'stale-action'}, allowed=(409,))
+                assert stale_ack['error']['code'] == 'conflict', stale_ack
+                assert request(PREFIX + '/rules/handling/acknowledge', ack) == {'ok': True}
+                final_rules = request(PREFIX + '/rules')
+                assert not final_rules['orphaned_handling'] and all(r['id'] != suspended['id'] for r in final_rules['items'])
+                assert request(detail_route)['samples'] == initial['samples']
+                assert mutation_log() == writes_before_resolution + [('PATCH', '/v8/management/credentials/status')]
+                assert len(recorded_calls()) == calls_before_resolution and not json.loads((root / 'auths/one.json').read_text())['disabled']
+                output.write_text(json.dumps({'plugin_version': manifest['plugin_version'], 'package_sha256': manifest['checksums'][archive.name],
+                                              'host': 'unchanged official 8.0.76', 'network': 'none', 'live_account_calls': 0,
+                                              'before': initial['action_status'], 'after_restarts': snapshots,
+                                              'fake_model_calls': len(recorded_calls()), 'orphaned_handling_visible_after_rule_deletion': True,
+                                              'disabled_orphan_acknowledgement_rejected': True, 'stale_orphan_acknowledgement_rejected': True,
+                                              'orphan_resolved_after_explicit_cpa_enablement': True,
+                                              'plugin_writes_for_orphan_resolution': 0, 'explicit_enable_writes': 1,
+                                              'source_samples_retained': len(initial['samples'])}, indent=2)+'\n')
+                print('Verified unknown-write protection through two starts and explicit orphan resolution after rule deletion.')
                 return
             models = next(t['models'][:2] for t in targets if t['email'] == 'native@example.test')
             settings = request(PREFIX + '/settings')
@@ -322,12 +386,12 @@ def main(package, output, interrupt_status=False, upstream_errors=False, scope_s
             assert rows[0]['samples'][-1]['quality_verdict'] == 'unknown'
             assert json.loads((root / 'auths/one.json').read_text())['disabled']
             request('/v8/management/credentials/status', {'name': 'one.json', 'auth_index': codex['auth_index'], 'disabled': True}, 'PATCH')
-            assert run(pause) == []
-            assert json.loads((root / 'auths/one.json').read_text())['disabled']
+            # A same-entry status write between rounds does not end answer ownership.
+            assert run(pause, write='enable')[0]['action_status'] == 'credential_restored'
             request('/v8/management/credentials/status', {'name': 'one.json', 'auth_index': codex['auth_index'], 'disabled': False}, 'PATCH')
+            request(PREFIX + '/targets')
             current = next(r for r in request(PREFIX + '/rules')['items'] if r['id'] == pause['id'])
-            held = current['handling'][0]
-            request(PREFIX + '/rules/handling/acknowledge', {'rule_id': pause['id'], 'auth_id': held['auth_id'], 'action_id': held['action_id']})
+            assert current['enabled'] and not current.get('handling')
             directory = rule('disable_credential', True, 'all_credentials')
             request('/v8/management/credentials/status', {'name': 'one.json', 'auth_index': codex['auth_index'], 'disabled': True}, 'PATCH')
             # Wait for CPA's file watcher before freezing a fresh manual-disable round.
@@ -400,7 +464,7 @@ def main(package, output, interrupt_status=False, upstream_errors=False, scope_s
                 'host': 'unchanged official 8.0.76', 'network': 'none', 'only_synthetic_credentials': True,
                 'suspend_and_whole_round_restore': True, 'recovery_probes_remained_disabled': True,
                 'incomplete_never_mutates': True, 'operator_disable_preserved': True,
-                'manual_resolution_stops_rule': True, 'exact_file_removal': True, 'dynamic_new_credentials': True,
+                'manual_enablement_keeps_rule_configuration': True, 'exact_file_removal': True, 'dynamic_new_credentials': True,
                 'restart_no_replay': True, 'fake_model_calls': before, 'live_account_calls': 0, 'rounds': measured,
             }
             output.write_text(json.dumps(report, indent=2)+'\n')
@@ -420,8 +484,9 @@ if __name__ == '__main__':
     modes.add_argument('--error-suspensions', action='store_true', help='verify error-disabled credentials stay excluded after restart and real cron triggers')
     modes.add_argument('--credential-replacements', action='store_true', help='verify an enabled replacement or renewed file can be tested and handled with current evidence')
     modes.add_argument('--runtime-policy', action='store_true', help='induce an official-host runtime error and verify current probe evidence and writes')
-    modes.add_argument('--manual-readmission', action='store_true', help='verify manual testing after external CPA enablement and continued exclusion from rules')
+    modes.add_argument('--manual-readmission', action='store_true', help='verify manual and rule testing after external CPA enablement without acknowledgement')
     modes.add_argument('--scheduled-addition', action='store_true', help='verify a dynamic timer discovers a credential added after an empty round without panel traffic')
     modes.add_argument('--rule-history-clear', action='store_true', help='clear completed history while preserving confirmed error dispositions through restart')
+    modes.add_argument('--quality-operations', action='store_true', help='verify independent policies, cross-rule error precedence and same-entry recovery')
     args = parser.parse_args()
-    main(args.package.resolve(), args.output.resolve(), args.interrupt_status, args.upstream_errors, args.scope_skips, args.error_suspensions, args.credential_replacements, args.runtime_policy, args.manual_readmission, args.scheduled_addition, args.rule_history_clear)
+    main(args.package.resolve(), args.output.resolve(), args.interrupt_status, args.upstream_errors, args.scope_skips, args.error_suspensions, args.credential_replacements, args.runtime_policy, args.manual_readmission, args.scheduled_addition, args.rule_history_clear, args.quality_operations)

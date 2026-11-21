@@ -131,7 +131,7 @@ func TestCPAPlanExclusionRetainsCandidateAndAccountSnapshot(t *testing.T) {
 			var s *Service
 			var late atomic.Bool
 			if mode == "late_policy" {
-				opts.Prepare = func(context.Context, string, string) error {
+				opts.Prepare = func(context.Context, string, string, string) error {
 					if late.CompareAndSwap(false, true) {
 						setPlanExclusions(t, s, "plus")
 					}

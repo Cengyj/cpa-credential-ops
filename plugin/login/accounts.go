@@ -86,6 +86,7 @@ type storedAccount struct {
 	Evidence             string
 	ConsumedEvidence     string
 	NextAttempt          time.Time
+	BindingRetryAt       time.Time
 }
 
 func (s *Service) initAccounts() error {
@@ -587,7 +588,7 @@ func (s *Service) startAccountOperationLocked(a storedAccount, target string, au
 	}
 	r.knownPlans = []string{a.View.PlanType, s.accountPlanType(a)}
 	if target != "" {
-		snapshot, err := s.opts.Manager.LoginSnapshot(target)
+		snapshot, principal, _, err := s.opts.Manager.LoginBinding(target)
 		if SafeCode(err) == "not_found" {
 			return Job{}, errors.New("cpa_credential_missing")
 		}
@@ -597,12 +598,7 @@ func (s *Service) startAccountOperationLocked(a storedAccount, target string, au
 		if a.Principal != "" && (snapshot.Principal != a.Principal || snapshot.IdentityVersion != a.View.IdentityVersion) {
 			return Job{}, errors.New("identity_changed")
 		}
-		current, ok := s.opts.Manager.GetByID(target)
-		if !ok {
-			return Job{}, errors.New("policy_changed")
-		}
-		principal, err := auth.LoginPrincipalFromAuth(current)
-		if err != nil || principal.Email != c.Email {
+		if principal.Email != c.Email {
 			return Job{}, errors.New("identity_conflict")
 		}
 		r.Intent = "reauthorize"
@@ -655,9 +651,11 @@ func (s *Service) syncAccountJobsLocked() error {
 			record = candidate
 		}
 		job := record.View
-		if job.ID == "" || job.ID == a.View.LastJobID && job.Status == a.View.LastJobStatus {
+		sameJob := job.ID == a.View.LastJobID && job.Status == a.View.LastJobStatus
+		if job.ID == "" || sameJob && (a.BindingRetryAt.IsZero() || s.opts.Now().Before(a.BindingRetryAt)) {
 			continue
 		}
+		a.BindingRetryAt = time.Time{}
 		previousJob := a.View.LastJobID
 		a.View.LastJobID = job.ID
 		a.View.LastJobStatus = job.Status
@@ -676,28 +674,28 @@ func (s *Service) syncAccountJobsLocked() error {
 			a.ConsumedEvidence = record.AccountEvidence
 		}
 		if job.Status == "committed" {
-			snapshot, err := s.opts.Manager.LoginSnapshot(job.TargetAuthID)
-			if err != nil || snapshot.IdentityVersion != record.AdoptedIdentity || snapshot.Principal != record.AdoptedPrincipal {
+			snapshot, principal, _, err := s.opts.Manager.LoginBinding(job.TargetAuthID)
+			switch {
+			case err != nil && SafeCode(err) == "storage_unavailable":
+				a.BindingRetryAt = s.opts.Now().Add(15 * time.Second)
+				a.View.HealthStatus, a.View.HealthReason = "unknown", "login_target_unavailable"
+			case err != nil || snapshot.IdentityVersion != record.AdoptedIdentity || snapshot.Principal != record.AdoptedPrincipal:
 				a.View.AttentionRequired = true
 				a.View.HealthReason = "identity_changed"
-			} else {
-				current, ok := s.opts.Manager.GetByID(job.TargetAuthID)
-				principal, principalErr := auth.LoginPrincipalFromAuth(current)
-				if !ok || principalErr != nil || s.journal.fingerprint("account-email", principal.Email) != a.EmailHash {
-					a.View.AttentionRequired = true
-					a.View.HealthReason = "identity_conflict"
-				} else {
-					a.View.AuthID = job.TargetAuthID
-					a.View.IdentityVersion = snapshot.IdentityVersion
-					a.Principal = snapshot.Principal
-					a.WorkspaceID = principal.AccountID
-					a.View.LastLoginAt = s.opts.Now().Format(time.RFC3339)
-					a.View.HealthStatus = "unknown"
-					a.View.HealthReason = "awaiting_inspection"
-					a.View.AttentionRequired = false
-					a.View.ConsecutiveFailures = 0
-					a.NextAttempt = time.Time{}
-				}
+			case s.journal.fingerprint("account-email", principal.Email) != a.EmailHash:
+				a.View.AttentionRequired = true
+				a.View.HealthReason = "identity_conflict"
+			default:
+				a.View.AuthID = job.TargetAuthID
+				a.View.IdentityVersion = snapshot.IdentityVersion
+				a.Principal = snapshot.Principal
+				a.WorkspaceID = principal.AccountID
+				a.View.LastLoginAt = s.opts.Now().Format(time.RFC3339)
+				a.View.HealthStatus = "unknown"
+				a.View.HealthReason = "awaiting_inspection"
+				a.View.AttentionRequired = false
+				a.View.ConsecutiveFailures = 0
+				a.NextAttempt = time.Time{}
 			}
 		} else if job.Status == "succeeded" {
 			a.View.AttentionRequired = false
@@ -719,7 +717,9 @@ func (s *Service) syncAccountJobsLocked() error {
 		} else if previousJob != job.ID {
 			a.View.AttentionRequired = false
 		}
-		a.View.Revision++
+		if !sameJob || a.BindingRetryAt.IsZero() {
+			a.View.Revision++
+		}
 		if err := s.saveAccountLocked(a); err != nil {
 			return err
 		}
@@ -766,6 +766,9 @@ func (s *Service) InspectAccounts(id string) ([]Account, error) {
 	return s.accountViewsLocked(id), nil
 }
 func (s *Service) inspectAccountLocked(a storedAccount, automatic bool) error {
+	if !a.BindingRetryAt.IsZero() {
+		return nil
+	}
 	now := s.opts.Now()
 	a.View.LastCheckedAt = now.Format(time.RFC3339)
 	a.View.NextCheckAt = ""
@@ -803,16 +806,24 @@ func (s *Service) inspectAccountLocked(a storedAccount, automatic bool) error {
 		return err
 	}
 	if automatic && s.accountAutomation.Load() && a.View.AutoRelogin && !a.View.AttentionRequired && eligible && a.Evidence != "" && a.ConsumedEvidence != a.Evidence && !now.Before(a.NextAttempt) && !s.accountBusyLocked(a) {
+		previous := a.View.LastJobID
 		_, err := s.startAccountLocked(a, "", true, a.Evidence)
 		if err != nil {
 			a = s.accounts[a.View.ID]
 			a.View.HealthReason = SafeCode(err)
 			a.NextAttempt = now.Add(time.Hour)
-			if err.Error() == "queue_full" || err.Error() == "rate_limited" || err.Error() == "conflict" {
+			retry := err.Error() == "queue_full" || err.Error() == "rate_limited" || err.Error() == "conflict"
+			if a.View.LastJobID == previous && SafeCode(err) == "storage_unavailable" && s.accountReady() == nil {
+				// Admission never recorded a job. Retry the read at a later
+				// inspection and recheck the current global and account permits.
+				retry = true
+				a.NextAttempt = now.Add(time.Minute)
+			}
+			if retry {
 				a.ConsumedEvidence = ""
 			}
 			a.View.Revision++
-			if err.Error() != "queue_full" && err.Error() != "rate_limited" && err.Error() != "conflict" {
+			if !retry {
 				a.View.AttentionRequired = true
 			}
 			return s.saveAccountLocked(a)

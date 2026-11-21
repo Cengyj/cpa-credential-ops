@@ -48,12 +48,21 @@ func errorReply(err error) pluginapi.ManagementResponse {
 		status = 404
 	case "invalid_request", "invalid_credentials", "invalid_proxy", "invalid_callback":
 		status = 400
-	case "runtime_unavailable", "storage_unavailable", "plugin_unavailable":
+	case "runtime_unavailable", "storage_unavailable", "plugin_unavailable", "cpa_credential_unavailable", "quality_authority_unavailable":
 		status = 503
 	case "rate_limited", "queue_full":
 		status = 429
 	}
-	return reply(status, map[string]string{"error": code, "code": code})
+	source := "business"
+	switch code {
+	case "runtime_unavailable", "runtime_failed", "runtime_timeout", "runtime_protocol_error", "runtime_invalid":
+		source = "login_runtime"
+	case "plugin_unavailable", "storage_unavailable":
+		source = "plugin"
+	case "cpa_credential_unavailable", "quality_authority_unavailable":
+		source = "sdk"
+	}
+	return reply(status, map[string]any{"error": code, "code": code, "source": source, "outcome_unknown": code == "idempotency_unknown" || code == "commit_unknown" || code == "security_uncertain" || code == "saved_not_adopted"})
 }
 func (s *Service) Handle(ctx context.Context, req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
 	if s == nil {

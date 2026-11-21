@@ -64,16 +64,15 @@ def verify_scheduled_addition(prefix, request, restart, root, initial, credentia
     assert current['last_scope_batch'] == after['config']['scope_batch_id']
     assert [r['auth_id'] for r in current['handling']] == ['one.json']
 
-    # A new process has the timer and its ownership, but no in-memory management session.
+    # Recreate the isolated container on the original volume after missing two minutes.
+    # Only read the fake upstream log until the coalesced catch-up actually executes.
     next_due = datetime.fromisoformat(current['next_run'].replace('Z', '+00:00')).timestamp()
-    restart()
-    time.sleep(max(0, next_due + 6 - time.time()))
-    assert len(recorded_calls()) == 2
-    # The first authenticated plugin read reestablishes the session for the following tick.
-    blocked = [r for r in request(prefix + '/runs?rule_id=' + saved['id'])['items'] if r['id'] not in {before['id'], after['id']}]
-    assert len(blocked) == 1 and blocked[0]['config']['auth_id'] == 'new.json' and blocked[0]['config'].get('scheduled_dispatch'), blocked
-    assert blocked[0]['status'] == 'blocked' and blocked[0]['preflight_detail']['code'] == 'management_session_required'
-    assert not blocked[0]['samples'] and len(recorded_calls()) == 2
+    restart(recreate_after=next_due + 65)
+    wait_until(next_due + 95, lambda: len(recorded_calls()) >= 3, 'No browser-free catch-up after recreation')
+    recovered_check = [r for r in request(prefix + '/runs?rule_id=' + saved['id'])['items'] if r['id'] not in {before['id'], after['id']}]
+    assert len(recovered_check) == 1 and recovered_check[0]['config']['auth_id'] == 'new.json'
+    assert recovered_check[0]['config'].get('scheduled_dispatch') and len(recorded_calls()) == 3
+    assert request(prefix + '/connection')['state'] == 'ready'
 
     provider_name, provider_key = 'scheduled-provider', 'offline-scheduled-provider-key'
     wire_model = 'fixture-wire-model'
@@ -85,13 +84,13 @@ def verify_scheduled_addition(prefix, request, restart, root, initial, credentia
         'name': provider_name, 'base-url': 'http://127.0.0.1:18887/v1',
         'models': [{'name': wire_model, 'alias': model}], 'keys': [{'api-key': provider_key}],
     }], 'PUT')
-    wait_until(next_due + 85, lambda: len(recorded_calls()) >= 4, 'Authenticated next tick did not reach both OAuth and new provider route')
-    assert {(c['account'], c['model'], c['outcome']) for c in recorded_calls()[2:]} == {
+    wait_until(next_due + 145, lambda: len(recorded_calls()) >= 5, 'Authenticated next tick did not reach both OAuth and new provider route')
+    assert {(c['account'], c['model'], c['outcome']) for c in recorded_calls()[3:]} == {
         ('new@example.test', model, '4'), (provider_name, wire_model, '4')}
-    assert not any(c['disabled'] for c in recorded_calls()[2:])
+    assert not any(c['disabled'] for c in recorded_calls()[3:])
     def recovered_receipts():
         entries = request(prefix + '/runs?rule_id=' + saved['id'])['items']
-        return [r for r in entries if r['id'] not in {before['id'], after['id'], blocked[0]['id']} and r.get('completed_at')]
+        return [r for r in entries if r['id'] not in {before['id'], after['id'], recovered_check[0]['id']} and r.get('completed_at')]
     wait_until(time.time() + 12, lambda: len(recovered_receipts()) >= 2, 'Missing recovered scheduled receipts')
     new_files = recovered_receipts()
     assert len(new_files) == 2 and len({r['config']['scope_batch_id'] for r in new_files}) == 1
@@ -105,8 +104,8 @@ def verify_scheduled_addition(prefix, request, restart, root, initial, credentia
             'scheduled_receipts': [{'id': row['id'], 'auth_id': row['config']['auth_id'], 'scope_batch_id': row['config']['scope_batch_id'],
                                     'action_status': row['action_status']} for row in [before, after]],
             'fake_upstream_accounts': [c['account'] for c in recorded_calls()], 'credential_status_writes': 1,
-            'restart_without_panel': {'blocked_run': blocked[0]['id'], 'reason': blocked[0]['preflight_detail']['code'],
-                                      'model_calls': 0, 'writes': 0, 'calls_on_reauthenticated_next_tick': 2},
+            'restart_without_panel': {'catchup_run': recovered_check[0]['id'], 'missed_minutes': 2,
+                                      'model_calls': 1, 'writes': 0, 'new_calls_on_next_cron_tick': 2},
             'provider_added_while_scheduled': {'provider': provider_name, 'id': provider['config']['auth_id'],
                                               'run_id': provider['id'], 'wire_model': wire_model},
             'calls_to_suspended_credential': 0, 'plugin_requests_between_activation_and_new_probe': 0}

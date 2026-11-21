@@ -2,6 +2,7 @@ package quality
 
 import (
 	"context"
+	"math/rand/v2"
 	"sync"
 	"time"
 
@@ -172,7 +173,7 @@ func (en *Engine) Tick(now time.Time) {
 		}
 	}
 	due, err := en.takeDueRulesLocked(now)
-	inventoryCtx := en.inventoryContextLocked(en.ctx)
+	inventoryCtx := context.WithValue(en.inventoryContextLocked(en.ctx), scheduledInventoryGeneration{}, en.loginGeneration)
 	en.mu.Unlock()
 	if err != nil {
 		return
@@ -188,43 +189,163 @@ func (en *Engine) Tick(now time.Time) {
 		targets, err := read()
 		if coverage, ok := ctx.Value(providerInventoryStatusKey{}).(*providerInventoryStatus); ok {
 			coverage.Verified = status.Verified
+			coverage.Reason = status.Reason
 		}
 		return targets, err
 	}
 	for _, scheduled := range due {
-		if _, err = en.dispatchWithInventory(en.ctx, scheduled.id, scheduled.revision, true, inventory); err != nil {
+		if _, err = en.dispatchOccurrence(inventoryCtx, scheduled.id, scheduled.revision, true, inventory, &scheduled); err != nil {
+			en.mu.Lock()
+			r := en.rules[scheduled.id]
+			if !en.closed && en.fault == nil && r != nil && r.Revision == scheduled.revision && en.scheduleGeneration == scheduled.generation &&
+				ruleScheduled(r) && en.timerAllowed(r) && scheduled.current(r) && en.loginWaitLocked(r.RunConfig) == nil {
+				// No worker owns this occurrence. Delay the next read/admission
+				// attempt, including for SDK errors outside the directory request.
+				en.deferOccurrenceLocked(r, &scheduled, "后台暂未能受理本轮，正在等待重新核实。", false)
+			}
+			en.mu.Unlock()
 			log.WithField("rule_id", scheduled.id).Debug("model-quality: scheduled run not admitted")
 		}
 	}
 }
 
+type scheduledInventoryGeneration struct{}
+
 type scheduledRule struct {
-	id       string
-	revision uint64
+	id         string
+	revision   uint64
+	generation uint64
+	due        time.Time
+	checked    time.Time
+	catchup    bool
+	remainder  bool
+}
+
+// A mixed observation can continue testing eligible OAuth files while its other
+// objects wait for the management directory. This receipt survives history cleanup.
+type pendingRuleSchedule struct {
+	Due      time.Time `json:"due"`
+	Accepted []string  `json:"accepted_auth_ids,omitempty"`
+}
+
+func allowsPartialSchedule(r *Rule) bool {
+	return dynamicScope(r.TargetScope) && !managedRule(r) && contains(ruleTypes(r), objectOAuth)
+}
+
+func (s *scheduledRule) current(r *Rule) bool {
+	if s.remainder {
+		return r.PendingSchedule != nil && r.PendingSchedule.Due.Equal(s.due)
+	}
+	return r.NextRun.Equal(s.due)
+}
+
+type scheduleRetry struct {
+	revision       uint64
+	due            time.Time
+	after          time.Time
+	delay          time.Duration
+	waitManagement bool
+	reason         string
+}
+
+func (en *Engine) deferOccurrenceLocked(r *Rule, occurrence *scheduledRule, reason string, waitManagement bool) {
+	if en.scheduleRetry == nil {
+		en.scheduleRetry = make(map[string]scheduleRetry)
+	}
+	retry := en.scheduleRetry[r.ID]
+	delay := 2 * time.Second
+	if retry.revision == r.Revision && retry.due.Equal(occurrence.due) {
+		delay = max(delay, min(time.Minute, retry.delay*2))
+	}
+	en.scheduleRetry[r.ID] = scheduleRetry{revision: r.Revision, due: occurrence.due, delay: delay,
+		after: occurrence.checked.Add(delay + rand.N(delay/4)), waitManagement: waitManagement, reason: reason}
+}
+
+// Advance the durable cursor in the very transaction which admits the round.
+// A process interruption on either side leaves a due occurrence or its receipt.
+func (en *Engine) consumeOccurrence(c *changeSet, next *Rule, occurrence *scheduledRule) {
+	if occurrence == nil {
+		return
+	}
+	now := en.now()
+	if now.Before(occurrence.checked) {
+		now = occurrence.checked
+	}
+	if !occurrence.remainder {
+		next.NextRun = nextRun(*next, now)
+	}
+	c.rules[next.ID] = next
+	if occurrence.catchup && next.PendingSchedule == nil {
+		c.audits = append(c.audits, en.audit("rule_timer_catchup", next.ID, "", "",
+			"Fresh round for missed schedule "+occurrence.due.UTC().Format(time.RFC3339)))
+	}
 }
 
 func (en *Engine) takeDueRulesLocked(now time.Time) ([]scheduledRule, error) {
 	due := []scheduledRule{}
 	c := changes()
+	capability := en.Capabilities()
 	for _, r := range en.rules {
-		if en.unsupportedRule(r) {
+		if en.unsupportedRule(r) || !en.timerAllowed(r) || !ruleScheduled(r) || r.NextRun.IsZero() || en.loginWaitLocked(r.RunConfig) != nil {
 			continue
 		}
-		if en.timerAllowed(r) && ruleScheduled(r) && !r.NextRun.IsZero() && !r.NextRun.After(now) {
-			n := cloneRule(r)
-			n.NextRun = nextRun(*r, now)
-			c.rules[r.ID] = n
-			if n.NextRun.IsZero() {
-				c.audits = append(c.audits, en.audit("rule_schedule_invalid", r.ID, "", "", "invalid stored schedule; no run admitted"))
-				continue
-			}
-			due = append(due, scheduledRule{id: r.ID, revision: r.Revision})
+		normalDue := !r.NextRun.After(now)
+		remainderReady := r.PendingSchedule != nil && (!capability.CredentialManagement || capability.ManagementSession)
+		if !normalDue && !remainderReady {
+			continue
 		}
+		if nextRun(*r, now).IsZero() {
+			n := cloneRule(r)
+			n.NextRun = time.Time{}
+			c.rules[r.ID] = n
+			c.audits = append(c.audits, en.audit("rule_schedule_invalid", r.ID, "", "", "invalid stored schedule; no run admitted"))
+			continue
+		}
+		occurrence := scheduledRule{id: r.ID, revision: r.Revision, generation: en.scheduleGeneration, due: r.NextRun, checked: now,
+			catchup: !r.NextRun.After(en.loadedAt) || r.PendingSchedule != nil, remainder: !normalDue}
+		if occurrence.remainder {
+			occurrence.due = r.PendingSchedule.Due
+		}
+		// A current, accepted manual or scheduled round already covers this
+		// occurrence. Never queue a second round as soon as that one finishes.
+		if en.hasCurrentRoundLocked(r) {
+			if normalDue {
+				n := cloneRule(r)
+				n.NextRun = nextRun(*r, now)
+				c.rules[r.ID] = n
+			}
+			continue
+		}
+		retry := en.scheduleRetry[r.ID]
+		retrying := retry.revision == r.Revision && retry.due.Equal(occurrence.due)
+		occurrence.catchup = occurrence.catchup || retrying
+		if capability.CredentialManagement && !capability.ManagementSession && !allowsPartialSchedule(r) && (managedRule(r) || scopeNeedsProviderDirectory(r, nil) || retrying && retry.waitManagement) {
+			if !retrying || !retry.waitManagement {
+				en.deferOccurrenceLocked(r, &occurrence, sessionSkip().Reason, true)
+			}
+			continue
+		}
+		if retrying && !retry.waitManagement && now.Before(retry.after) || en.scanning[r.ID] {
+			continue
+		}
+		due = append(due, occurrence)
 	}
 	if err := en.commitLocked(c); err != nil {
 		return nil, err
 	}
 	return due, nil
+}
+
+func (en *Engine) hasCurrentRoundLocked(rule *Rule) bool {
+	if len(en.queue) == 0 && len(en.active) == 0 {
+		return false
+	}
+	for _, r := range en.runs {
+		if r.Config.RuleID == rule.ID && r.Config.RuleRevision == rule.Revision && !r.CancelRequested && (r.Status == "queued" || r.Status == "running") {
+			return true
+		}
+	}
+	return false
 }
 func (en *Engine) Usage(event UsageEvent) {
 	if en.ctx != nil && en.ctx.Err() != nil {

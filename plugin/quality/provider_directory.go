@@ -1,6 +1,7 @@
 package quality
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -26,8 +27,52 @@ const providerConfigPath = "/v8/management/config/api-keys"
 
 type providerObject = map[string]any
 
-type providerInventoryStatus struct{ Verified bool }
+type providerInventoryStatus struct {
+	Verified bool
+	Reason   string
+}
 type providerInventoryStatusKey struct{}
+
+// Only fixed diagnostic categories and a validated HTTP status may cross the
+// inventory boundary. Never retain configuration bodies, keys or raw errors.
+func providerDirectoryFailureReason(err error) string {
+	if err == nil {
+		return ""
+	}
+	message := err.Error()
+	if strings.HasPrefix(message, "management_session_required:") {
+		return "本轮尚未建立 CPA 管理会话，未能读取提供商配置目录。请查看后台连接状态。"
+	}
+	var status int
+	if _, scanErr := fmt.Sscanf(message, "management_http_%d:", &status); scanErr == nil && status >= 100 && status <= 599 {
+		if status == http.StatusUnauthorized || status == http.StatusForbidden {
+			return fmt.Sprintf("本轮 CPA 管理接口鉴权未通过（HTTP %d），未能核实提供商配置目录。", status)
+		}
+		return fmt.Sprintf("本轮 CPA 管理接口未成功返回提供商配置目录（HTTP %d）。", status)
+	}
+	if strings.HasPrefix(message, "management_uncertain:") {
+		return "本轮连接或读取 CPA 管理接口失败，未能核实提供商配置目录。"
+	}
+	if strings.HasPrefix(message, "management_unavailable:") {
+		return "本轮 CPA 提供商配置响应无法核实，未建立可信的路由目录。"
+	}
+	return "本轮 CPA 提供商配置目录未能核实，未进行路由匹配。"
+}
+
+func markProviderDirectoryUnavailable(t *Target, reason string) {
+	if !t.IsProvider {
+		return
+	}
+	if reason == "" {
+		reason = "本轮 CPA 提供商配置目录未能核实，未进行路由匹配。"
+	}
+	for _, code := range []string{"provider_route_unverified", "provider_directory_unavailable"} {
+		if !contains(t.Reasons, code) {
+			t.Reasons = append(t.Reasons, code)
+		}
+	}
+	t.ProviderProbeReason = reason
+}
 
 // Objects containing keys, endpoints and custom headers exist only for the
 // duration of an authenticated config read, probe or conditional write.
@@ -66,15 +111,76 @@ func configText(field any) string {
 }
 
 func configList(field any) []providerObject {
-	var result []providerObject
-	if list, ok := field.([]any); ok {
-		for _, raw := range list {
-			if item, ok := raw.(map[string]any); ok {
-				result = append(result, item)
+	items, _ := providerObjects(field)
+	return items
+}
+
+func providerObjects(field any) ([]providerObject, bool) {
+	list, ok := field.([]any)
+	if !ok {
+		return nil, false
+	}
+	items := make([]providerObject, 0, len(list))
+	for _, raw := range list {
+		item, ok := raw.(map[string]any)
+		if !ok || item == nil {
+			return nil, false
+		}
+		items = append(items, item)
+	}
+	return items, true
+}
+
+// Validate the fields used to identify, contact or modify a route. Preserve
+// additional fields verbatim when writing the original family document back.
+func validProviderFields(item providerObject) bool {
+	if item == nil {
+		return false
+	}
+	for _, key := range []string{"name", "api-key", "base-url", "proxy-url", "prefix", "auth_index"} {
+		if _, ok := item[key].(string); !ok && item[key] != nil {
+			return false
+		}
+	}
+	if _, ok := item["disabled"].(bool); !ok && item["disabled"] != nil {
+		return false
+	}
+	if raw := item["headers"]; raw != nil {
+		headers, ok := raw.(map[string]any)
+		if !ok {
+			return false
+		}
+		for _, value := range headers {
+			if _, ok := value.(string); !ok {
+				return false
 			}
 		}
 	}
-	return result
+	if raw := item["excluded-models"]; raw != nil {
+		list, ok := raw.([]any)
+		if !ok {
+			return false
+		}
+		for _, value := range list {
+			if _, ok := value.(string); !ok {
+				return false
+			}
+		}
+	}
+	if raw := item["models"]; raw != nil {
+		models, ok := providerObjects(raw)
+		if !ok {
+			return false
+		}
+		for _, model := range models {
+			for _, key := range []string{"name", "alias"} {
+				if _, ok := model[key].(string); !ok && model[key] != nil {
+					return false
+				}
+			}
+		}
+	}
+	return true
 }
 
 func configStrings(field any) []string {
@@ -192,10 +298,9 @@ func (m *ManagementClient) readProviderValue(ctx context.Context, path string, o
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusNotFound {
-		var missing struct {
-			Error string `json:"error"`
-		}
-		if stdjson.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(&missing) != nil || missing.Error != "not_found" {
+		var missing map[string]string
+		raw, readErr := io.ReadAll(io.LimitReader(resp.Body, 4097))
+		if readErr != nil || len(raw) > 4096 || decodeProviderValue(raw, &missing) != nil || len(missing) != 1 || missing["error"] != "not_found" {
 			return "", false, fmt.Errorf("management_unavailable: CPA could not verify the configuration path")
 		}
 		return "", false, nil
@@ -208,12 +313,29 @@ func (m *ManagementClient) readProviderValue(ctx context.Context, path string, o
 	if err != nil || len(raw) > maxConfig {
 		return "", false, fmt.Errorf("management_unavailable: invalid CPA configuration")
 	}
-	decoder := stdjson.NewDecoder(strings.NewReader(string(raw)))
-	decoder.UseNumber()
-	if err := decoder.Decode(out); err != nil {
+	if err := decodeProviderValue(raw, out); err != nil {
 		return "", false, fmt.Errorf("management_unavailable: invalid CPA configuration")
 	}
 	return resp.Header.Get("ETag"), true, nil
+}
+
+func decodeProviderValue(raw []byte, out any) error {
+	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return errors.New("null CPA configuration")
+	}
+	if err := uniqueJSON(raw); err != nil {
+		return err
+	}
+	decoder := stdjson.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	if err := decoder.Decode(out); err != nil {
+		return err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		return fmt.Errorf("invalid trailing CPA configuration data")
+	}
+	return nil
 }
 
 func (h *NativeHost) providerDirectory(ctx context.Context) ([]providerRoute, error) {
@@ -225,6 +347,9 @@ func (h *NativeHost) providerDirectory(ctx context.Context) ([]providerRoute, er
 	if err != nil || !present {
 		return nil, err
 	}
+	if all == nil {
+		return nil, fmt.Errorf("management_unavailable: invalid CPA provider directory")
+	}
 	var out []providerRoute
 	groupCounts, indexCounts, idCounts := map[string]int{}, map[string]int{}, map[string]int{}
 	for _, family := range slices.Sorted(maps.Keys(all)) {
@@ -234,7 +359,19 @@ func (h *NativeHost) providerDirectory(ctx context.Context) ([]providerRoute, er
 		default:
 			continue
 		}
+		if groups == nil {
+			return nil, fmt.Errorf("management_unavailable: invalid CPA provider groups")
+		}
 		for position, group := range groups {
+			if !validProviderFields(group) {
+				return nil, fmt.Errorf("management_unavailable: invalid CPA provider group")
+			}
+			keys, complete := providerObjects(group["keys"])
+			_, hasKeys := group["keys"]
+			// Older keyless compatible groups omit the array entirely.
+			if !complete && (family != "openai-compatibility" || hasKeys) {
+				return nil, fmt.Errorf("management_unavailable: invalid CPA provider members")
+			}
 			name := configText(group["name"])
 			if name == "" {
 				name = family
@@ -249,12 +386,14 @@ func (h *NativeHost) providerDirectory(ctx context.Context) ([]providerRoute, er
 			base := configText(group["base-url"])
 			gid := "pg-" + fingerprint([3]string{family, strings.ToLower(name), base})[:32]
 			groupCounts[gid]++
-			keys := configList(group["keys"])
 			entries := keys
 			if len(entries) == 0 && family == "openai-compatibility" {
 				entries = []providerObject{nil}
 			}
 			for _, key := range entries {
+				if key != nil && !validProviderFields(key) {
+					return nil, fmt.Errorf("management_unavailable: invalid CPA provider member")
+				}
 				r := providerRoute{family: family, name: name, executor: executor, unit: unit, groupID: gid, etag: tag, base: base, group: group, key: key, keys: keys, familyList: groups, groupPosition: position}
 				r.proxy = configText(r.effective("proxy-url"))
 				r.prefix = strings.Trim(configText(r.effective("prefix")), "/")
@@ -293,12 +432,16 @@ func (h *NativeHost) providerDirectory(ctx context.Context) ([]providerRoute, er
 			routeGroups[loc] = append(routeGroups[loc], r.id)
 		}
 	}
+	groupSuffixes := make(map[location]string, len(routeGroups))
+	for location, members := range routeGroups {
+		slices.Sort(members)
+		groupSuffixes[location] = "-" + fingerprint(members)[:16]
+	}
 	for i := range out {
 		r := &out[i]
 		r.conflict = idCounts[r.id] != 1 || indexCounts[r.index] != 1
 		if groupCounts[r.groupID] > 1 {
-			members := slices.Sorted(slices.Values(routeGroups[location{r.family, r.groupPosition}]))
-			r.groupID += "-" + fingerprint(members)[:16]
+			r.groupID += groupSuffixes[location{r.family, r.groupPosition}]
 		}
 	}
 	var globalProxy string
@@ -327,6 +470,9 @@ func (h *NativeHost) providerDirectory(ctx context.Context) ([]providerRoute, er
 			groupConflicts[r.groupID] = groupConflicts[r.groupID] || r.conflict
 		}
 	}
+	for _, members := range groupMembers {
+		slices.Sort(members)
+	}
 	for i := range out {
 		r := &out[i]
 		r.globalProxy = globalProxy
@@ -340,18 +486,24 @@ func (h *NativeHost) providerDirectory(ctx context.Context) ([]providerRoute, er
 		if r.prefix != "" && !prefixKnown {
 			r.probeProblem = "CPA 未能核实此路由使用的模型前缀。"
 		}
-		r.members = []string{r.id}
 		if r.unit == "group" {
-			r.members = slices.Sorted(slices.Values(groupMembers[r.groupID]))
+			// The in-memory directory shares an immutable list per group.
+			r.members = groupMembers[r.groupID]
 			r.conflict = groupConflicts[r.groupID]
+		} else {
+			r.members = []string{r.id}
 		}
 	}
 	return out, nil
 }
 
-func (h *NativeHost) configuredRoutes(ctx context.Context) map[string]providerRoute {
-	routes, _ := h.providerDirectory(ctx)
-	return routesByIndex(routes)
+func (h *NativeHost) configuredTargetForEntry(ctx context.Context, entry pluginapi.HostAuthModels) Target {
+	routes, err := h.providerDirectory(ctx)
+	target := configuredTarget(entry, routesByIndex(routes)[entry.AuthIndex])
+	if err != nil {
+		markProviderDirectoryUnavailable(&target, providerDirectoryFailureReason(err))
+	}
+	return target
 }
 
 func routesByIndex(routes []providerRoute) map[string]providerRoute {
@@ -533,7 +685,7 @@ func (r providerRoute) snapshot() CredentialSnapshot {
 		}
 	}
 	return CredentialSnapshot{AuthID: r.id, AuthIndex: r.index, Provider: r.executor, Name: r.name,
-		ProviderMechanism: mechanism, ProviderGroupID: r.groupID, ProviderMembers: r.members, ProviderETag: r.etag,
+		ProviderMechanism: mechanism, ProviderGroupID: r.groupID, ProviderMembers: slices.Clone(r.members), ProviderETag: r.etag,
 		ProviderExclusionSource: source, Disabled: r.disabled, Fingerprint: fingerprint([]any{content, r.forcePrefix && r.prefix != ""})}
 }
 
@@ -565,7 +717,7 @@ func (h *NativeHost) confirmProviderRuntime(ctx context.Context, r providerRoute
 	var files struct {
 		Files []pluginapi.HostAuthFileEntry `json:"files"`
 	}
-	if err := h.call(ctx, "host.auth.list", struct{}{}, &files); err != nil {
+	if err := h.call(ctx, "host.auth.list", struct{}{}, &files); err != nil || files.Files == nil {
 		return rejectScope("unavailable: CPA provider origin unavailable", "provider_runtime_unavailable", "无法从 CPA 文件目录确认提供商身份。")
 	}
 	for _, file := range files.Files {
@@ -575,7 +727,7 @@ func (h *NativeHost) confirmProviderRuntime(ctx context.Context, r providerRoute
 	}
 	// An empty successful full catalog establishes absence. Failure to read
 	// a particular index does not distinguish removal from a callback error.
-	if err := h.call(ctx, "host.auth.models", pluginapi.HostAuthModelsRequest{}, &all); err != nil {
+	if err := h.call(ctx, "host.auth.models", pluginapi.HostAuthModelsRequest{}, &all); err != nil || all.Credentials == nil {
 		return rejectScope("unavailable: CPA provider runtime unavailable", "provider_runtime_unavailable", "CPA 未能返回运行时路由目录。")
 	}
 	count := 0
@@ -587,7 +739,7 @@ func (h *NativeHost) confirmProviderRuntime(ctx context.Context, r providerRoute
 			return rejectScope("blocked: provider identity conflict", "identity_conflict", "提供商配置与运行时的目标身份或索引冲突。")
 		}
 		count++
-		if r.disabled && len(entry.Models) > 0 || !r.disabled && len(entry.Models) == 0 {
+		if !validCatalogModels(entry.Models) || r.disabled && len(entry.Models) > 0 || !r.disabled && len(entry.Models) == 0 {
 			return rejectScope("blocked: CPA provider runtime pending", "provider_runtime_pending", "CPA 配置与运行时模型目录尚未同步。")
 		}
 	}

@@ -95,7 +95,7 @@ func TestAccountAutomaticCommitRejectsChangedPolicyAndQualityPause(t *testing.T)
 			opts := offlineOptions(t)
 			opts.Call = h.call
 			var alter atomic.Bool
-			opts.Prepare = func(_ context.Context, id, _ string) error {
+			opts.Prepare = func(_ context.Context, id, _, _ string) error {
 				if !alter.Load() {
 					return nil
 				}
@@ -172,7 +172,7 @@ func TestInspectionSkipsDisabledAndRechecksConsentBeforeSave(t *testing.T) {
 			opts.Call = h.call
 			var change atomic.Bool
 			var s *Service
-			opts.Prepare = func(_ context.Context, id, _ string) error {
+			opts.Prepare = func(_ context.Context, id, _, _ string) error {
 				if !change.Load() {
 					return nil
 				}

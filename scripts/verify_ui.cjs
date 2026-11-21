@@ -460,18 +460,18 @@ const server = http.createServer(async (req, res) => {
       await page.keyboard.press('m');
       assert.equal(await page.locator('#models').inputValue(), 'mock-visual', 'Native model choices support pointer opening and keyboard selection');
       assert.equal(await page.locator('#reasoning').inputValue(), '', 'Changing to an unknown-capability model clears incompatible reasoning');
-      assert(await page.locator('#reasoning').isDisabled());
+      assert.equal(await page.locator('#reasoning option:not([value=""])').count(), 0);
       assert.deepEqual(await page.locator('#reasoning option').evaluateAll(nodes => nodes.map(node => node.value)), ['']);
       await refresh();
       assert.equal(await page.locator('#models').inputValue(), 'mock-visual', 'Refresh preserves a still-registered model');
 
       targets[1].models = ['mock-special'];
-      targets[1].reasoning = { 'mock-special': { Min: 0, Max: 0, ZeroAllowed: false, DynamicAllowed: false, Levels: [] } };
+      targets[1].reasoning = { 'mock-special': null };
       await refresh();
       await page.locator('#target').selectOption(targets[1].auth_id);
       assert.deepEqual(await modelChoices(), ['mock-special']);
       assert.equal(await page.locator('#models').inputValue(), 'mock-special', 'Credential changes cannot carry a model from a different registry');
-      assert(await page.locator('#reasoning').isDisabled(), 'A known model without reasoning controls stays on the default');
+      assert.equal(await page.locator('#reasoning option:not([value=""])').count(), 0, 'A known model without reasoning controls stays on the default');
       await page.locator('#target').selectOption(targets[0].auth_id);
       assert.equal(await page.locator('#models').inputValue(), 'mock-reasoner');
 
@@ -1425,7 +1425,7 @@ const server = http.createServer(async (req, res) => {
     assert.equal(await page.locator('#safe-preview').getAttribute('sandbox'), '');
     assert.equal(await frame.locator('script,form,iframe,meta[http-equiv=refresh]').count(), 0);
     assert.equal(await frame.locator('[src],[href],a,area,map,set').count(), 0);
-    assert.equal(await page.locator('#safe-preview').getAttribute('inert'), '');
+    assert.equal(await page.locator('#safe-preview').getAttribute('inert'), null);
     assert.equal(await page.locator('body').getAttribute('data-compromised'), null);
     assert.deepEqual(external, []);
     await verifyDialogPadding('preview-dialog');

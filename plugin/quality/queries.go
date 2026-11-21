@@ -85,21 +85,29 @@ func (en *Engine) QueryRuns(query url.Values) (map[string]any, error) {
 
 // List rows keep full evidence on the detail endpoint.
 func runListSummary(r *Run) map[string]any {
+	type probeEvidence struct {
+		Path string `json:"path"`
+	}
 	type verdict struct {
-		Model             string `json:"model"`
-		Index             int    `json:"index"`
-		ExecutionStatus   string `json:"execution_status"`
-		QualityVerdict    string `json:"quality_verdict"`
-		AnswerMatch       string `json:"answer_match,omitempty"`
-		Review            string `json:"review,omitempty"`
-		Error             string `json:"error,omitempty"`
-		UpstreamCondition string `json:"upstream_condition,omitempty"`
+		Model             string         `json:"model"`
+		Index             int            `json:"index"`
+		ExecutionStatus   string         `json:"execution_status"`
+		QualityVerdict    string         `json:"quality_verdict"`
+		AnswerMatch       string         `json:"answer_match,omitempty"`
+		Review            string         `json:"review,omitempty"`
+		Error             string         `json:"error,omitempty"`
+		UpstreamCondition string         `json:"upstream_condition,omitempty"`
+		Evidence          *probeEvidence `json:"evidence,omitempty"`
 	}
 	samples := make([]verdict, len(r.Samples))
 	for i := range r.Samples {
 		s := &r.Samples[i]
 		samples[i] = verdict{Model: s.Model, Index: s.Index, ExecutionStatus: s.ExecutionStatus, QualityVerdict: s.QualityVerdict,
 			AnswerMatch: displayAnswerMatch(r, s), Review: s.Review, Error: s.Error, UpstreamCondition: s.UpstreamCondition}
+		switch s.Evidence.Path {
+		case providerConfigProbe, "provider_native_probe", "cpa_management_probe":
+			samples[i].Evidence = &probeEvidence{Path: s.Evidence.Path}
+		}
 	}
 	cfg := &r.Config
 	config := map[string]any{
@@ -111,6 +119,8 @@ func runListSummary(r *Run) map[string]any {
 	}
 	if cfg.ProviderName != "" {
 		config["provider_name"] = cfg.ProviderName
+	}
+	if cfg.SubjectIndex != "" {
 		config["subject_auth_index"] = cfg.SubjectIndex
 	}
 	if cfg.CatalogMissingModel != "" {
@@ -121,6 +131,9 @@ func runListSummary(r *Run) map[string]any {
 		"credential_email": r.CredentialEmail, "action_status": r.ActionStatus, "credential_action": r.CredentialAction, "upstream_condition": r.UpstreamCondition, "pruned_samples": r.PrunedSamples,
 		"error": r.Error, "block_reason": r.BlockReason, "samples": samples,
 		"config": config,
+	}
+	if r.CancelRequested {
+		row["cancel_requested"] = true
 	}
 	if r.SkipDetail != nil {
 		row["skip_detail"] = cloneValue(r.SkipDetail)
@@ -134,8 +147,36 @@ func runListSummary(r *Run) map[string]any {
 	return row
 }
 
-var previewDocument = regexp.MustCompile(`(?i)^(?:(?:\x60{3,}|~{3,})(?:html|svg|xml)? *)?` +
-	`(?:<\?xml .*?\?> *)?(?:<!--.*?--> *)*(?:<!doctype +|<)(html|svg)(?:[ />]|$)`)
+var previewDocument = regexp.MustCompile(`(?i)^(?:<\?xml\s.*?\?>\s*)?(?:<!--.*?-->\s*)*(?:<!doctype\s+|<)(html|svg)(?:[\s/>]|$)`)
+var previewFence = regexp.MustCompile(`^(\x60{3,}|~{3,})(.*)$`)
+var previewHTMLFragment = regexp.MustCompile(`(?i)^<(?:head|body|style|main|div|section|article|p|table|h[1-6])(?:[\s/>]|$)`)
+
+// Summaries inspect only the bounded prefix. Displaying the work uses the full
+// retained answer from the detail endpoint.
+func previewDocumentKind(prefix string) string {
+	var fence, language string
+	for line := range strings.SplitSeq(prefix, "\n") {
+		line = strings.TrimSpace(line)
+		if marker := previewFence.FindStringSubmatch(line); marker != nil {
+			if fence == "" {
+				fence, language = marker[1], strings.ToLower(strings.TrimSpace(marker[2]))
+			} else if strings.HasPrefix(marker[1], fence) && strings.TrimSpace(marker[2]) == "" {
+				fence, language = "", ""
+			}
+			continue
+		}
+		if fence != "" && language != "" && language != "html" && language != "svg" && language != "xml" {
+			continue
+		}
+		if match := previewDocument.FindStringSubmatch(line); match != nil {
+			return strings.ToLower(match[1])
+		}
+		if language == "html" && previewHTMLFragment.MatchString(line) {
+			return "html"
+		}
+	}
+	return ""
+}
 
 // Ignore leading whitespace before limiting the work used to format the excerpt.
 func manualAnswerPreview(run *Run) *AnswerPreview {
@@ -155,8 +196,8 @@ func manualAnswerPreview(run *Run) *AnswerPreview {
 			continue
 		}
 		preview := &AnswerPreview{SampleSlot: SampleSlot{Model: sample.Model, Index: sample.Index}}
-		if match := previewDocument.FindStringSubmatch(text); match != nil {
-			preview.Kind = strings.ToLower(match[1])
+		if kind := previewDocumentKind(output[:end]); kind != "" {
+			preview.Kind = kind
 			return preview
 		}
 		truncated := end < len(output)
@@ -189,15 +230,19 @@ func (en *Engine) queryRules(query url.Values) map[string]any {
 		views[i] = viewRule(en.ruleForDisplayLocked(en.rules[id]))
 		positions[id] = i
 	}
+	orphaned := make([]HandlingSummary, 0)
 	for _, d := range en.managed {
 		if i, ok := positions[d.RuleID]; ok && activeDisposition(d) {
-			views[i].Handling = append(views[i].Handling, HandlingSummary{Email: d.Email, AuthID: d.AuthID, ActionID: d.ActionID, State: d.State, UpstreamCondition: d.UpstreamCondition, CatalogMissingModel: d.CatalogMissingModel})
+			views[i].Handling = append(views[i].Handling, handlingSummary(d))
+		} else if en.orphanedHandlingLocked(d) {
+			orphaned = append(orphaned, handlingSummary(d))
 		}
 	}
 	for _, v := range views {
 		sort.Slice(v.Handling, func(i, j int) bool { return v.Handling[i].AuthID < v.Handling[j].AuthID })
 	}
-	return map[string]any{"items": views, "total": len(ids), "offset": offset, "limit": limit}
+	sort.Slice(orphaned, func(i, j int) bool { return orphaned[i].AuthID < orphaned[j].AuthID })
+	return map[string]any{"items": views, "total": len(ids), "offset": offset, "limit": limit, "orphaned_handling": orphaned}
 }
 
 func trafficSource(source string) string {

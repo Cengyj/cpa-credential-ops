@@ -173,7 +173,7 @@ func TestPortableLoginManualCommitAndPolicyPreservation(t *testing.T) {
 	opts := offlineOptions(t)
 	opts.Call = h.call
 	prepared := 0
-	opts.Prepare = func(context.Context, string, string) error { prepared++; return nil }
+	opts.Prepare = func(context.Context, string, string, string) error { prepared++; return nil }
 	s := offlineService(t, opts)
 	j := startCandidate(t, s, offlineStart())
 	if h.saves != 0 {

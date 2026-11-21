@@ -95,7 +95,7 @@ async function test() {
     await page.selectOption('#target', 'fixture-quality-primary');
     assert.equal(await page.locator('#target option:checked').textContent(), 'current@example.test');
     await page.selectOption('#models', 'fixture-reasoner');
-    await page.selectOption('#reasoning', 'max');
+    await page.locator('#reasoning').selectOption('max');
     await page.selectOption('#question', 'logic-candy');
     await page.selectOption('#samples', '2');
     const button = page.locator('#run-submit');

@@ -15,6 +15,50 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
 
+// Isolated business fixtures supply a verified session without running a server lifecycle.
+func (m *ManagementClient) authorize(headers http.Header) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.key = managementKey(headers)
+	m.status.State = "ready"
+}
+
+func TestForwardedManagementKeyMatchesOfficialHeaderSelection(t *testing.T) {
+	const key = "offline-panel-key"
+	for _, tc := range []struct {
+		name          string
+		authorization string
+		alternative   string
+	}{
+		{"bearer", "Bearer " + key, ""},
+		{"mixed case bearer", "bEaReR " + key, ""},
+		{"alternative only", "", key},
+		{"raw authorization", key, ""},
+		{"raw authorization takes precedence", key, "unused-fixture-key"},
+		{"bearer takes precedence", "Bearer " + key, "unused-fixture-key"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Header.Get("Authorization") != "Bearer "+key {
+					w.WriteHeader(http.StatusUnauthorized)
+				}
+			}))
+			t.Cleanup(server.Close)
+			client, err := NewManagementClient(server.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			headers := make(http.Header)
+			headers.Set("Authorization", tc.authorization)
+			headers.Set("X-Management-Key", tc.alternative)
+			client.authorize(headers)
+			if err := client.request(t.Context(), http.MethodGet, "/fixture", nil, nil, 64); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
 func TestDisplayReasoningMatchesCredentialModelsAndChannel(t *testing.T) {
 	reads := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -37,7 +81,7 @@ func TestDisplayReasoningMatchesCredentialModelsAndChannel(t *testing.T) {
 		{Provider: "custom", Models: []string{"shared"}},
 	}
 	m.addModelReasoning(context.Background(), targets)
-	for i, expected := range []string{`{"shared":{"levels":["low","max"]}}`, `{"other":{"levels":["high"]}}`, "null"} {
+	for i, expected := range []string{`{"shared":{"levels":["low","max"]},"visual":null}`, `{"other":{"levels":["high"]}}`, "null"} {
 		raw, err := json.Marshal(targets[i].Reasoning)
 		if err != nil || string(raw) != expected {
 			t.Fatalf("target %d: %s, %v", i, raw, err)

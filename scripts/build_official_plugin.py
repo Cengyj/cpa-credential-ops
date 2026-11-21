@@ -17,7 +17,7 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNTIME_VERSION = '2.2.1'
-PLUGIN_VERSION = '0.29.37'
+PLUGIN_VERSION = '0.31.0'
 ENGINE = 'go_sobek_protocol'
 MODULE = 'github.com/router-for-me/CLIProxyAPI/v8'
 
@@ -47,7 +47,7 @@ def verify_sdk(go):
     expected = (ROOT / 'workspaces/CLIProxyAPI-official').resolve()
     if len(replacements) != 1 or (ROOT / 'plugin' / replacements[0]).resolve() != expected or not (expected / 'go.mod').is_file():
         raise ValueError('plugin SDK must reference the unchanged workspaces/CLIProxyAPI-official checkout')
-    baseline_path = ROOT / 'host-patches/baseline.json'
+    baseline_path = ROOT / 'host-patches/official-8.0.76-baseline.json'
     baseline = json.loads(baseline_path.read_bytes())
     files = baseline['sha256']
     changed = [name for name, checksum in files.items()

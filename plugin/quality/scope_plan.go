@@ -49,8 +49,13 @@ func recoveryMember(rule *Rule, t Target, d *CredentialDisposition) bool {
 		errorPolicyDisabled(d).Code == "" && rule.AutoRestore && rule.Action == disableCredential
 }
 
+func currentErrorSuspension(t Target, d *CredentialDisposition) bool {
+	return disabledObject(t) && !t.identityConflict && objectType(t) != objectUnknown && errorPolicyDisabled(d).Code != "" &&
+		(!t.IsProvider || providerBindingProblem(t) == nil)
+}
+
 func scopeMember(rule *Rule, t Target, d *CredentialDisposition, group string) bool {
-	if !selectedIdentity(rule, t, group) || errorPolicyDisabled(d).Code != "" {
+	if !selectedIdentity(rule, t, group) || currentErrorSuspension(t, d) {
 		return false
 	}
 	if !rule.acceptsSubject(t) && objectType(t) != objectUnknown && dynamicScope(rule.TargetScope) {
@@ -65,7 +70,10 @@ func scopeMember(rule *Rule, t Target, d *CredentialDisposition, group string) b
 func (en *Engine) collectScopeLocked(ctx context.Context, draft *Rule, inventory func(context.Context) ([]Target, error), preview bool) (ruleDispatch, []scopeMatch, map[string]Target, error) {
 	r := cloneRule(draft)
 	original := en.rules[r.ID]
-	owned := maps.Clone(en.managed)
+	loginGeneration := en.loginGeneration
+	if captured, shared := ctx.Value(scheduledInventoryGeneration{}).(uint64); shared {
+		loginGeneration = captured
+	}
 	ctx = en.inventoryContextLocked(ctx)
 	coverage := &providerInventoryStatus{Verified: true}
 	ctx = context.WithValue(ctx, providerInventoryStatusKey{}, coverage)
@@ -81,16 +89,36 @@ func (en *Engine) collectScopeLocked(ctx context.Context, draft *Rule, inventory
 		for i := range targets {
 			if targets[i].IsProvider {
 				t := &targets[i]
-				t.Reasons = append(slices.Clone(t.Reasons), "provider_route_unverified")
-				t.ProviderProbeReason = "CPA 提供商配置目录未读到，无法核实路由。"
+				t.Reasons = slices.Clone(t.Reasons)
+				markProviderDirectoryUnavailable(t, coverage.Reason)
 			}
 		}
 	}
-	var profiles []scopeProfile
-	if err == nil {
-		profiles = en.readScopeProfiles(ctx, r, targets, owned)
-	}
 	en.mu.Lock()
+	if err == nil && r.expectedTargetObjectType != "" {
+		if selectionErr := r.verifySelectedRuleTarget(targets); selectionErr != nil {
+			return ruleDispatch{}, nil, nil, selectionErr
+		}
+	}
+	var profiles []scopeProfile
+	var reconciliation map[string]error
+	if err == nil {
+		err = en.observeMissingEntriesLocked(ctx, targets, coverage.Verified)
+		if err == nil {
+			reconciliation = en.reconcileCurrentTargetsLocked(ctx, targets, nil)
+		}
+	}
+	owned := maps.Clone(en.managed)
+	if err == nil {
+		en.mu.Unlock()
+		profiles = en.readScopeProfiles(ctx, r, targets, owned)
+		en.mu.Lock()
+		for i, target := range targets {
+			if failure := reconciliation[target.AuthID]; failure != nil {
+				profiles[i].err = failure
+			}
+		}
+	}
 	result := ruleDispatch{Candidates: map[string]int{objectOAuth: 0, objectProvider: 0}, Verified: err == nil}
 	if ctx.Err() != nil {
 		return result, nil, nil, ctx.Err()
@@ -117,16 +145,29 @@ func (en *Engine) collectScopeLocked(ctx context.Context, draft *Rule, inventory
 			seen[t.AuthID] = t
 		}
 	}
+	var providerDirectoryReason string
 	if !coverage.Verified && scopeNeedsProviderDirectory(r, seen) {
 		result.Verified = false
 		result.Reason = "CPA 提供商配置目录未读到，AI 提供商范围待核实。"
+		if coverage.Reason != "" {
+			result.Reason = coverage.Reason
+		}
+		providerDirectoryReason = result.Reason
 	}
 	group := selectedGroup(r, targets)
 	var matches []scopeMatch
 	var encounters int
-	if !dynamicScope(r.TargetScope) && en.terminalDependencyLocked(r.RunConfig) {
-		result.Reason = "指定对象或其依赖已按上游错误策略暂停，退出后续运维检测。"
-		return result, nil, seen, nil
+	if !dynamicScope(r.TargetScope) {
+		for _, id := range dependencies(r.RunConfig) {
+			t := seen[id]
+			if failure := reconciliation[id]; failure != nil && (!t.IsProvider || providerBindingProblem(t) == nil) {
+				return result, nil, seen, failure
+			}
+			if currentErrorSuspension(t, en.managed[id]) {
+				result.Reason = "指定对象或其依赖已按上游错误策略暂停，退出后续运维检测。"
+				return result, nil, seen, nil
+			}
+		}
 	}
 	if r.LegacyScope && !dynamicScope(r.TargetScope) && !contains(r.ObjectTypes, objectProvider) {
 		for _, id := range dependencies(r.RunConfig) {
@@ -146,7 +187,7 @@ func (en *Engine) collectScopeLocked(ctx context.Context, draft *Rule, inventory
 		}
 		d := en.managed[t.AuthID]
 		held := groupGuard(en.managed, t)
-		if held != nil && errorPolicyDisabled(held).Code != "" {
+		if currentErrorSuspension(t, held) {
 			continue
 		}
 		if !scopeMember(r, t, d, group) {
@@ -155,16 +196,28 @@ func (en *Engine) collectScopeLocked(ctx context.Context, draft *Rule, inventory
 		encounters++
 		kind := objectType(t)
 		result.Candidates[kind]++
-		if held != nil && !activeDisposition(d) {
+		if held != nil && groupTargetBlocked(en.managed, t) && !activeDisposition(d) {
 			result.skip(t, ScopeSkipDetail{Code: "group_members_changed", Reason: "本组已有处置归属，当前路由的身份与停用快照无法对应。"})
 			continue
 		}
 		cfg := r.RunConfig
 		cfg.AuthID, cfg.Provider = t.AuthID, t.Provider
-		m := scopeMatch{target: t, config: cfg, recovery: r.TargetScope == scopeAll && recoveryMember(r, t, d)}
-		detail := en.scopeAdmissionLocked(r, &m, t, seen, profiles[i], owned[t.AuthID], preview)
+		m := scopeMatch{target: t, config: cfg, recovery: disabledObject(t) && canRecoverDisabled(r, d)}
+		var detail *ScopeSkipDetail
+		for _, id := range dependencies(m.config) {
+			if hold := en.loginHolds[id]; hold != nil && (hold.State != "completed" || hold.generation > loginGeneration) {
+				code, reason := hold.reason()
+				detail = &ScopeSkipDetail{Code: code, Reason: reason, NotExecuted: true}
+				break
+			}
+		}
+		if detail == nil {
+			detail = en.scopeAdmissionLocked(r, &m, t, seen, profiles[i], owned[t.AuthID], preview, providerDirectoryReason)
+		}
 		if detail != nil {
-			if disabledObject(t) {
+			if detail.Code == "bound_origin_changed" {
+				t = r.boundHistoryTarget()
+			} else if disabledObject(t) {
 				detail.NotExecuted = true
 			}
 			result.skip(t, *detail)
@@ -182,13 +235,18 @@ func (en *Engine) collectScopeLocked(ctx context.Context, draft *Rule, inventory
 		result.Reason = "当前目录中没有可纳入本轮的对象。下次执行时会重新匹配。"
 	}
 	if encounters == 0 && !dynamicScope(r.TargetScope) {
-		missing := Target{AuthID: r.AuthID, AuthIndex: r.TargetAuthIndex, Provider: r.Provider, ProviderGroupID: r.TargetGroup}
+		missing := r.boundHistoryTarget()
+		kind := missing.ObjectType
 		detail := missingCredentialSkip()
-		if !result.Verified {
+		if kind == objectProvider {
+			detail.Reason = "当前目录中找不到规则绑定的供应商路由。"
+		} else if kind == objectUnknown {
+			detail.Reason = "当前目录中找不到规则绑定的对象。"
+		}
+		if !result.Verified && kind != objectOAuth {
 			detail = ScopeSkipDetail{Code: "provider_directory_unavailable", NotExecuted: true, Reason: result.Reason}
 		}
 		if r.TargetGroup != "" {
-			missing.AuthID = r.TargetGroup
 			if result.Verified {
 				detail = ScopeSkipDetail{Code: "group_missing", Reason: "指定的提供商配置组不在当前可核实目录中。"}
 			}
@@ -201,18 +259,15 @@ func (en *Engine) collectScopeLocked(ctx context.Context, draft *Rule, inventory
 		// A terminal group or subject is retired, with no repeated records.
 		excluded := false
 		for _, t := range targets {
-			if selectedIdentity(r, t, group) && (errorPolicyDisabled(en.managed[t.AuthID]).Code != "" || errorPolicyDisabled(groupGuard(en.managed, t)).Code != "") {
+			if selectedIdentity(r, t, group) && (currentErrorSuspension(t, en.managed[t.AuthID]) || currentErrorSuspension(t, groupGuard(en.managed, t))) {
 				excluded = true
-			}
-		}
-		for _, d := range en.managed {
-			if r.TargetGroup != "" && d.Snapshot.ProviderGroupID == r.TargetGroup && errorPolicyDisabled(d).Code != "" {
-				excluded = true
+				break
 			}
 		}
 		if excluded {
 			result.Reason = "指定的提供商组已按上游错误策略暂停，退出后续运维检测。"
 		} else {
+			detail.ObjectType = kind
 			seen[missing.AuthID] = missing
 			result.skip(missing, detail)
 		}
@@ -238,9 +293,26 @@ func scopeNeedsProviderDirectory(rule *Rule, targets map[string]Target) bool {
 			}
 			continue
 		}
-		if id == rule.AuthID && contains(ruleTypes(rule), objectProvider) && (len(ruleTypes(rule)) == 1 || providerFamily(id, rule.Provider) != "") {
+		if couldBeBoundProvider(rule, id) {
 			return true
 		}
+	}
+	return false
+}
+
+// A missing row can still belong to an unreadable provider directory. This
+// describes incomplete coverage only and never establishes identity or access.
+func couldBeBoundProvider(rule *Rule, id string) bool {
+	switch id {
+	case rule.AuthID:
+		if rule.TargetObjectType == objectOAuth || rule.TargetObjectType == objectProvider {
+			return rule.TargetObjectType == objectProvider
+		}
+		return contains(ruleTypes(rule), objectProvider) && (len(ruleTypes(rule)) == 1 || providerFamily(id, rule.Provider) != "")
+	case rule.ControlAuthID:
+		return providerFamily(id, rule.ControlProvider) != ""
+	case rule.Judge.AuthID:
+		return rule.Judge.Mode == "llm" && providerFamily(id, rule.Judge.Provider) != ""
 	}
 	return false
 }
@@ -259,7 +331,7 @@ func (receipt *ruleDispatch) classifyPreflight() {
 	receipt.SkipDetails = skips
 }
 
-func (en *Engine) scopeAdmissionLocked(r *Rule, m *scopeMatch, t Target, targets map[string]Target, p scopeProfile, old *CredentialDisposition, preview bool) *ScopeSkipDetail {
+func (en *Engine) scopeAdmissionLocked(r *Rule, m *scopeMatch, t Target, targets map[string]Target, p scopeProfile, old *CredentialDisposition, preview bool, directoryReason string) *ScopeSkipDetail {
 	d := en.managed[t.AuthID]
 	problem := func(code, reason string) *ScopeSkipDetail { return &ScopeSkipDetail{Code: code, Reason: reason} }
 	if t.QualityPaused || t.RetainedPause || en.localPause(m.config) != "" {
@@ -267,6 +339,9 @@ func (en *Engine) scopeAdmissionLocked(r *Rule, m *scopeMatch, t Target, targets
 	}
 	if t.identityConflict {
 		return problem("identity_conflict", "CPA 返回的对象或模型目录标识互相冲突。")
+	}
+	if r.boundOriginChanged(t.AuthID, objectType(t)) {
+		return &boundOriginRejection().detail
 	}
 	if !r.acceptsSubject(t) {
 		if objectType(t) == objectUnknown {
@@ -283,21 +358,25 @@ func (en *Engine) scopeAdmissionLocked(r *Rule, m *scopeMatch, t Target, targets
 	if e := providerRuleProblem(r, t, r.Models, true); e != nil {
 		return &e.detail
 	}
-	if activeDisposition(d) && (d.State != "disabled" || d.RuleID != r.ID && disabledObject(t)) {
-		if d.State == "disabled" && d.RuleID != r.ID {
-			return problem("other_rule_owner", "该对象由其他规则持有停用。")
-		}
+	if activeDisposition(d) && d.State != "disabled" {
 		return problem("handling_blocked", "对象的上次处置尚待核对。")
 	}
 	if d != old {
 		return problem("ownership_changed", "目录核对期间处置归属已变化。")
 	}
-	if disabledObject(t) && !canRecoverDisabled(r, d) && (r.LegacyScope || r.TargetScope != scopeAllCredentials || activeDisposition(d)) {
+	if disabledObject(t) && !canRecoverDisabled(r, d) && (r.LegacyScope || r.TargetScope != scopeAllCredentials) {
 		if !activeDisposition(d) {
 			return problem("manual_disabled", "对象由管理员停用，本规则范围不允许探测该对象。")
 		}
 		detail := recoveryDenied(r, d)
 		return &detail
+	}
+	if p.err != nil && activeDisposition(d) && !disabledObject(t) {
+		var e *scopeRejection
+		if errors.As(p.err, &e) {
+			return cloneValue(&e.detail)
+		}
+		return problem("snapshot_unavailable", "无法读取 CPA 当前凭证状态，旧处置记录已保留。")
 	}
 	if needsScopeSnapshot(r, t) {
 		// A verified missing model on an enabled object is a catalog check,
@@ -334,27 +413,31 @@ func (en *Engine) scopeAdmissionLocked(r *Rule, m *scopeMatch, t Target, targets
 		if id == t.AuthID {
 			continue
 		}
+		role, models, desired := "对照", m.config.Models, m.config.ControlProvider
+		if id == m.config.Judge.AuthID {
+			role, models, desired = "判题", []string{m.config.Judge.Model}, m.config.Judge.Provider
+		}
 		dep, ok := targets[id]
 		if !ok {
-			return problem("dependency_unavailable", "规则指定的判题或对照对象不在当前目录中。")
+			if directoryReason != "" && couldBeBoundProvider(r, id) {
+				return problem("provider_directory_unavailable", role+"对象的路由无法核实。"+directoryReason)
+			}
+			return problem("dependency_unavailable", "规则指定的"+role+"对象不在当前目录中。")
 		}
 		if dep.QualityPaused || dep.RetainedPause {
 			return problem("quality_paused", "规则所需凭证仍受质量暂停保护，禁止检测。")
-		}
-		if activeDisposition(en.managed[id]) || groupGuard(en.managed, dep) != nil || !dep.EffectiveAvailable || dep.ManualDisabled {
-			return problem("dependency_unavailable", "规则指定的判题或对照对象不可用。")
-		}
-		models := m.config.Models
-		desired := m.config.ControlProvider
-		if id == m.config.Judge.AuthID {
-			models = []string{m.config.Judge.Model}
-			desired = m.config.Judge.Provider
 		}
 		if dep.Provider != desired {
 			return problem("dependency_unavailable", "判题或对照对象的提供方已变化。")
 		}
 		if e := providerRuleProblem(r, dep, models, false); e != nil {
-			return &e.detail
+			detail := e.detail
+			detail.NotExecuted = true
+			detail.Reason = role + "对象核对失败。" + detail.Reason
+			return &detail
+		}
+		if activeDisposition(en.managed[id]) || groupTargetBlocked(en.managed, dep) || !dep.EffectiveAvailable || dep.ManualDisabled {
+			return problem("dependency_unavailable", "规则指定的"+role+"对象不可用。")
 		}
 		if dep.ComparisonIdentity == "" || dep.ComparisonIdentity == t.ComparisonIdentity || t.ComparisonIdentity == "" {
 			return problem("dependency_identity", "无法确认判题或对照对象独立于被测对象。")

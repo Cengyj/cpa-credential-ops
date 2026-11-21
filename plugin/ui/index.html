@@ -9,7 +9,7 @@
   <link rel="modulepreload" href="./view.js">
   <script type="module" src="./app.js"></script>
 </head>
-<body>
+<body data-resuming>
 <a class="skip-link" href="#main">跳到工作区</a>
 <header class="app-header">
   <div class="page-heading"><h1 id="page-crumb">账号管理</h1><p id="page-description"><!--{{block "account-description" .}}-->管理 OpenAI 账号、授权与登录状态。<!--{{end}}--></p></div>
@@ -20,7 +20,7 @@
     </div>
     <select id="theme-toggle" aria-label="界面主题"><option value="light">浅色</option><option value="white">纯白</option><option value="dark">暗色</option></select>
     <button id="connection-open" class="connection-button" aria-haspopup="dialog" aria-controls="connection-dialog">
-      <span class="connection-dot" aria-hidden="true"></span><span id="login-connect">未连接</span>
+      <span class="connection-dot" aria-hidden="true"></span><span id="login-connect">未连接</span><span class="connection-pending-label">管理连接</span>
     </button>
     <button id="connection-top" class="connection-button" aria-haspopup="dialog" aria-controls="connection-dialog">
       <span class="connection-dot" aria-hidden="true"></span><span id="connection-state">未连接</span>
@@ -47,22 +47,13 @@
     <div class="manual-workbench">
 
     <section id="manual-setup" class="card" aria-label="题目测试">
-      <header class="setup-heading"><svg class="control-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h5m4 0h7M4 17h9m4 0h3"/><circle cx="11" cy="7" r="2"/><circle cx="15" cy="17" r="2"/></svg><h2>测试设置</h2>
-        <span class="manual-kind-caption" aria-hidden="true">测试来源</span><fieldset class="manual-target-kind"><legend class="sr-only">测试来源</legend>
-          <label><input id="manual-kind-credential" type="radio" name="manual-target-kind" value="credential" checked><span>普通凭证</span></label>
-          <label><input id="manual-kind-provider" type="radio" name="manual-target-kind" value="provider"><span>供应商</span></label>
-        </fieldset>
-      </header>
+      <header class="setup-heading"><svg class="control-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h5m4 0h7M4 17h9m4 0h3"/><circle cx="11" cy="7" r="2"/><circle cx="15" cy="17" r="2"/></svg><h2>测试设置</h2></header>
       <form id="run-form">
         <div class="test-configuration">
           <div class="test-model-config">
-              <div id="manual-provider-field" class="credential-strip" hidden>
-                <label for="manual-provider">供应商</label>
-                <select id="manual-provider" aria-describedby="target-summary"><option value="">选择供应商</option></select>
-              </div>
               <div class="credential-strip">
-                <label id="manual-target-label" for="target">测试凭证</label>
-                <select id="target" required aria-describedby="target-summary"><option value="">连接后选择凭证</option></select>
+                <label id="manual-target-label" for="target">测试对象</label>
+                <select id="target" required aria-describedby="target-summary"><option value="">连接后选择对象</option></select>
                 <div id="target-summary" class="target-summary"></div>
               </div>
           <fieldset class="test-target">
@@ -167,6 +158,7 @@
           <div class="quality-activity-notes">
             <div id="ops-dispatch-receipt" class="dispatch-receipt" aria-label="手动执行回执" role="region" hidden></div>
             <div id="ops-rule-context" role="region" aria-label="所选规则的调度与处置记录" hidden></div>
+            <div id="ops-orphaned-handling" role="region" aria-label="已删除规则的待核对处置" hidden></div>
           </div>
           <p id="activity-read-note" class="quality-read-note" role="status" hidden></p>
           <div id="operations-history" class="quality-run-list" tabindex="0" role="region" aria-label="规则运行记录"></div>
@@ -198,6 +190,7 @@
             <label id="rule-target-field" hidden>指定对象<select id="rule-target" aria-describedby="rule-scope-note"></select></label>
           </div>
           <p id="rule-scope-note" role="status"></p>
+          <p id="rule-scope-detail" class="field-note"></p>
           <div class="rule-group-access" id="rule-group-access" hidden>
             <h3>整组启停授权</h3><p class="field-note">勾选后，暂停和恢复可作用于该组全部路由。仅选检测对象不会授权整组启停。</p>
             <div id="rule-group-options"></div>
@@ -560,7 +553,8 @@
             关闭
           </button>
         </div>
-        <p>连接成功后，管理密钥会明文保存在此浏览器，刷新页面自动重连。点击“断开”会清除保存的密钥。只有点击开始测试才调用模型。</p>
+        <p>首次连接会验证密钥，并明文保存在当前浏览器和插件专用数据目录。后台授权失效后，输入新密钥可同时更新后台配置。退出此浏览器后，后台按已保存的许可继续运行。</p>
+        <p id="connection-status" role="status">当前浏览器尚未验证。</p>
         <label
           >管理密钥<input
             id="management-key"
@@ -571,8 +565,9 @@
         /></label>
         <div class="button-row end">
           <span id="connection-build" class="connection-build"></span>
-          <button type="button" class="subtle" id="disconnect">断开</button
-          ><button class="primary" type="submit">连接</button>
+          <button type="button" class="subtle" id="connection-clear" hidden>清除后台配置</button>
+          <button type="button" class="subtle" id="disconnect">退出此浏览器</button>
+          <button class="primary" id="connection-submit" type="submit">连接</button>
         </div>
       </form>
     </dialog>
@@ -602,12 +597,11 @@
       <p>脚本禁用、外部网络阻止、表单与弹窗禁用。CSS / SVG 动画仍可展示。</p>
       <iframe
         id="safe-preview"
-        inert
-        tabindex="-1"
+        tabindex="0"
         title="模型生成内容的隔离预览"
         sandbox=""
         referrerpolicy="no-referrer"
       ></iframe>
     </dialog>
-<script type="application/json" id="build-info">{"application":"model-quality","ui_version":"13.6.62"}</script>
+<script type="application/json" id="build-info">{"application":"model-quality","ui_version":"13.8.0"}</script>
 </body></html>

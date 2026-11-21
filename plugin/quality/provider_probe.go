@@ -113,7 +113,7 @@ func (h *NativeHost) executeProvider(ctx context.Context, e Execution) (s Sample
 		transport = proxyutil.NewDirectTransport()
 	}
 	defer transport.CloseIdleConnections()
-	client := http.Client{Transport: transport, Timeout: 65 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	client := http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	request, fields, err := r.probeRequest(ctx, e, wire)
 	if err != nil {
 		s.ExecutionStatus = "skipped"
@@ -149,7 +149,7 @@ func (h *NativeHost) executeProvider(ctx context.Context, e Execution) (s Sample
 	s.Evidence.PayloadFingerprint = fingerprint(fields)
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		s.Error = fmt.Sprintf("upstream HTTP %d", response.StatusCode)
-		s.UpstreamCondition = managedUpstreamCondition(response.StatusCode, string(raw), wire)
+		s.UpstreamCondition = managedUpstreamCondition(response.StatusCode, string(raw), wire, response.Header)
 		return
 	}
 	output, model, usage, err := parseProviderAnswer(r.family, raw, limit)
@@ -301,7 +301,7 @@ func parseProviderAnswer(family string, raw []byte, limit int) (string, string, 
 	case "codex", "meta", "xai":
 		return parseManagedResponses(string(raw))
 	}
-	if !ojson.ValidBytes(raw) {
+	if !ojson.ValidBytes(raw) || uniqueJSON(raw) != nil {
 		return "", "", nil, incomplete
 	}
 	root := ojson.ParseBytes(raw)

@@ -27,6 +27,7 @@ func manualPolicyTestFixture(t *testing.T) *manualPolicyFixture {
 	f.file = map[string]any{"type": "codex", "email": "person@example.test", "account_id": "offline-account", "access_token": "old", "disabled": true}
 	entry := f.entries["one"]
 	entry.Email = "person@example.test"
+	entry.Disabled, entry.Status = true, "disabled"
 	f.entries["one"] = entry
 	callback := f.host.Call
 	f.host.Call = func(method string, in, out any) error {
@@ -62,6 +63,8 @@ func manualPolicyTestFixture(t *testing.T) *manualPolicyFixture {
 		State: "disabled", Snapshot: s, Email: entry.Email, UpstreamCondition: "unauthorized"}
 	f.engine.managed["one"] = f.owner
 	f.file["disabled"], f.file["access_token"] = false, "refreshed"
+	entry.Disabled, entry.Status = false, "active"
+	f.entries["one"] = entry
 	return f
 }
 
@@ -79,14 +82,14 @@ func TestManualTestWithExternallyEnabledErrorSuspension(t *testing.T) {
 				f.owner.UpstreamCondition = ""
 			}
 			r, err := f.engine.Submit(context.Background(), f.config)
-			if err != nil || r.Config.ManagedProbe != nil || (r.Config.ManualPolicyActionID != "") != (tc != "ordinary quality suspension") {
+			if err != nil || r.Config.ManagedProbe != nil || r.Config.ManualPolicyActionID != "" || r.Config.ManualAccountFingerprint == "" {
 				t.Fatal("manual test did not follow the native execution path", err)
 			}
 			f.file["access_token"] = "rotated-again"
 			f.engine.execute(r.ID)
 			row, err := f.engine.Run(r.ID)
 			if err != nil || row.Status != "completed" || len(row.Samples) != 2 || row.Samples[1].Output != "4" ||
-				f.nativeCalls != 2 || f.probes != 0 || len(f.patches)+f.deletes != 0 || f.engine.managed["one"] != f.owner || f.owner.State != "disabled" {
+				f.nativeCalls != 2 || f.probes != 0 || len(f.patches)+f.deletes != 0 || activeDisposition(f.engine.managed["one"]) || f.engine.managed["one"].State != "externally_enabled" || f.engine.managed["one"].ActionID != f.owner.ActionID {
 				t.Fatal("manual test changed ownership or used a management probe", err, row.Status, f.nativeCalls, f.probes)
 			}
 			f.file["disabled"] = true
@@ -98,8 +101,43 @@ func TestManualTestWithExternallyEnabledErrorSuspension(t *testing.T) {
 	}
 }
 
+func TestManualReenabledEntryUsesCurrentAccount(t *testing.T) {
+	for _, mode := range []string{"account replaced", "legacy missing email", "old locator", "runtime email", "file email"} {
+		t.Run(mode, func(t *testing.T) {
+			f := manualPolicyTestFixture(t)
+			switch mode {
+			case "runtime email":
+				entry := f.entries["one"]
+				entry.Email = "different@example.test"
+				f.entries["one"] = entry
+			case "file email":
+				f.file["email"] = "different@example.test"
+			case "account replaced":
+				f.file["account_id"] = "replacement"
+				f.file["email"] = "replacement@example.test"
+				entry := f.entries["one"]
+				entry.Email = "replacement@example.test"
+				f.entries["one"] = entry
+			case "legacy missing email":
+				f.owner.Snapshot.AccountFingerprint, f.owner.Email = "", ""
+			case "old locator":
+				f.owner.Snapshot.AuthIndex = "previous-index"
+			}
+			run, err := f.engine.Submit(context.Background(), f.config)
+			if err != nil {
+				t.Fatal(err)
+			}
+			f.engine.execute(run.ID)
+			result, err := f.engine.Run(run.ID)
+			if err != nil || result.Status != "completed" || f.nativeCalls != 2 || f.probes != 0 || len(f.patches) != 0 || f.deletes != 0 || activeDisposition(f.engine.managed["one"]) {
+				t.Fatal("current enabled entry retained a historical account restriction", result, err)
+			}
+		})
+	}
+}
+
 func TestManualErrorSuspensionFailsClosed(t *testing.T) {
-	for _, reason := range []string{"runtime disabled", "file disabled", "malformed flag", "file read", "file type", "runtime email", "file email", "account replaced", "legacy missing email", "wrong index", "missing model", "conflicting catalog", "unknown write", "deleted", "quality pause", "control", "judge"} {
+	for _, reason := range []string{"runtime disabled", "file disabled", "malformed flag", "file read", "file type", "missing model", "conflicting catalog", "unknown write", "deleted", "quality pause", "control", "judge"} {
 		t.Run(reason, func(t *testing.T) {
 			f := manualPolicyTestFixture(t)
 			e := f.entries["one"]
@@ -145,7 +183,7 @@ func TestManualErrorSuspensionFailsClosed(t *testing.T) {
 			}
 			f.entries["one"] = e
 			_, err := f.engine.Submit(context.Background(), f.config)
-			if err == nil || !strings.HasPrefix(err.Error(), "blocked:") || len(f.engine.runs) != 0 || f.nativeCalls+f.probes+len(f.patches)+f.deletes != 0 {
+			if err == nil || !strings.HasPrefix(err.Error(), "blocked:") && !strings.HasPrefix(err.Error(), "model not available") || len(f.engine.runs) != 0 || f.nativeCalls+f.probes+len(f.patches)+f.deletes != 0 {
 				t.Fatal("unsafe manual admission", err)
 			}
 		})

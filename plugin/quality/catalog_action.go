@@ -3,10 +3,20 @@ package quality
 import "context"
 
 // An absent model is meaningful only on a verified catalog row for the same
-// enabled file credential. A disabled target's missing catalog is expected.
+// enabled target. A disabled target's missing catalog is expected.
 func catalogMissingModelAction(rule *Rule, target Target, snapshot CredentialSnapshot, detail ScopeSkipDetail) bool {
-	return rule != nil && credentialMutation(rule.UpstreamErrorActions["model_unsupported"]) &&
-		(rule.AuthID == "" || rule.AuthID == target.AuthID && rule.Provider == target.Provider) &&
+	if rule == nil || !credentialMutation(rule.UpstreamErrorActions["model_unsupported"]) {
+		return false
+	}
+	if rule.AuthID != "" && rule.AuthID != target.AuthID {
+		// providerWriteSnapshots revalidates this group's anchor and every member
+		// before a provider disposition can reach the final catalog confirmation.
+		if !rule.expandedProviderPeer(target.AuthID) || !rule.holdsGroup(target) || snapshot.ProviderMechanism != "group_disabled" ||
+			target.ProviderGroupID != snapshot.ProviderGroupID || !contains(snapshot.ProviderMembers, rule.AuthID) {
+			return false
+		}
+	}
+	return (rule.AuthID == "" || rule.Provider == target.Provider) &&
 		detail.Code == "missing_model" && detail.Model != "" && contains(rule.Models, detail.Model) &&
 		target.catalogVerified && len(target.Models) > 0 && ruleSubjectEnabled(target) && !contains(target.Models, detail.Model) &&
 		!snapshot.Disabled && snapshot.Fingerprint != "" && (!snapshot.UpdatedAt.IsZero() || snapshot.ProviderMechanism != "") &&

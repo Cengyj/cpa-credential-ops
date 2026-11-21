@@ -241,7 +241,9 @@ async function main() {
     await click('[data-rule-run="rule-1"]');await click('#action-confirm');await text('#ops-batch-summary','1–20 / 23');assert.equal(await el('#operations-history [data-run]').count(),20);
     await text('#operations-history','请求强度 low');
     await text('#operations-history','snapshot@example.test');
-    await text('#operations-history','scope@example.test');
+    const oldSubject = el('[data-key="run:run-1"] .quality-identity-cell');
+    assert.match(await oldSubject.innerText(), /fixture-122/);
+    assert.doesNotMatch(await oldSubject.innerText(), /scope@example\.test/, 'A missing historical email must not be filled from the live directory');
     const runResult = index => el(`[data-key="run:run-${index}"] .quality-result`);
     assert.equal(await runResult(0).locator('.history-ratio').innerText(), '1 / 1');
     assert.equal(await runResult(1).locator('.history-ratio').count(), 0, 'Missing sample plan cannot establish a whole-round score');
@@ -358,7 +360,7 @@ async function main() {
     failDetail = true;
     await openRow(0); await text('#quality-detail-message','读取失败');
     failDetail = false; await click('#quality-detail-retry');
-    await text('.quality-detail-identity','snapshot@example.test'); await text('.quality-detail-facts','未处理凭证');
+    await text('.quality-detail-identity','snapshot@example.test'); await text('.quality-detail-facts','本轮未处置');
     assert.equal(await el('.quality-detail-facts dd').first().innerText(),'正确');
     await text('.quality-detail-question','21'); await text('#quality-detail .sample-heading','样本 1');
     assert.equal(await el('#quality-detail .sample-heading .tag').count(),0);

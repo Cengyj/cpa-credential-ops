@@ -18,6 +18,7 @@ import (
 
 type managementFixture struct {
 	mu             sync.Mutex
+	managementKey  string
 	entries        map[string]pluginapi.HostAuthFileEntry
 	answers        map[string]string
 	changedContent bool
@@ -26,6 +27,7 @@ type managementFixture struct {
 	incomplete     bool
 	upstreamStatus int
 	upstreamBody   string
+	probeEnvelope  string
 	patches        []bool
 	deletes        int
 	probes         int
@@ -36,14 +38,30 @@ type managementFixture struct {
 	engine         *Engine
 }
 
+// Advance the isolated verifier after the fixture's injected server failure ends.
+func (f *managementFixture) verifyManagement(t *testing.T) {
+	t.Helper()
+	client := f.host.Management
+	f.mu.Lock()
+	key := f.managementKey
+	f.mu.Unlock()
+	outcome := client.probe(t.Context(), key)
+	if outcome.state != "ready" {
+		t.Fatal(outcome)
+	}
+	client.mu.Lock()
+	client.applyLocked(outcome)
+	client.mu.Unlock()
+}
+
 func managementTestFixture(t *testing.T) *managementFixture {
 	t.Helper()
-	f := &managementFixture{entries: map[string]pluginapi.HostAuthFileEntry{}, answers: map[string]string{"a": "4", "b": "4"}}
+	f := &managementFixture{managementKey: "offline-management-only", entries: map[string]pluginapi.HostAuthFileEntry{}, answers: map[string]string{"a": "4", "b": "4"}}
 	f.add("one")
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		defer f.mu.Unlock()
-		if r.Header.Get("Authorization") != "Bearer offline-management-only" {
+		if r.Header.Get("Authorization") != "Bearer "+f.managementKey {
 			w.WriteHeader(401)
 			return
 		}
@@ -54,6 +72,8 @@ func managementTestFixture(t *testing.T) *managementFixture {
 			}
 		}
 		switch r.Method + " " + r.URL.Path {
+		case "GET " + readinessPath:
+			write(map[string]int{"in_flight": 0})
 		case "GET /v8/management/config/api-keys":
 			write(map[string]any{})
 		case "POST /v8/management/requests/api-call":
@@ -79,6 +99,10 @@ func managementTestFixture(t *testing.T) *managementFixture {
 				t.Errorf("unexpected controlled probe request")
 			}
 			f.probes++
+			if f.probeEnvelope != "" {
+				_, _ = w.Write([]byte(f.probeEnvelope))
+				return
+			}
 			if entry, ok := f.entries[body.AuthIndex]; !ok {
 				w.WriteHeader(400)
 				return
@@ -400,7 +424,7 @@ func TestManagedResponsesSelectOneFinalAssistantAnswer(t *testing.T) {
 	}
 }
 
-func TestManagedRecoveryRejectsManualInterferenceAndReplacement(t *testing.T) {
+func TestManagedRecoveryRetainsEntryOwnershipAndChecksRulePermissions(t *testing.T) {
 	for _, mode := range []string{"operator-disable", "replacement", "recovery-off", "rule-stopped"} {
 		t.Run(mode, func(t *testing.T) {
 			f := managementTestFixture(t)
@@ -431,6 +455,13 @@ func TestManagedRecoveryRejectsManualInterferenceAndReplacement(t *testing.T) {
 				}
 			}
 			before := f.probes
+			if mode == "operator-disable" || mode == "replacement" {
+				runs, err := f.round(t, r)
+				if err != nil || len(runs) != 1 || runs[0].ActionStatus != "credential_restored" || f.probes != before+2 || len(f.patches) != 2 || f.entries["one"].Disabled {
+					t.Fatal("same-entry update invalidated answer recovery ownership", runs, err)
+				}
+				return
+			}
 			receipt, err := f.engine.dispatchRule(context.Background(), r.ID, f.engine.rules[r.ID].Revision, false)
 			if mode == "rule-stopped" {
 				if err == nil || receipt.BatchID != "" || len(f.engine.runs) != 1 {
@@ -504,8 +535,8 @@ func TestManagedDeleteStopsDependentsAndDoesNotRecreate(t *testing.T) {
 	if err != nil || runs[0].ActionStatus != "credential_removed" || f.deletes != 1 || len(f.entries) != 0 {
 		t.Fatal(runs, err)
 	}
-	if f.engine.rules[r.ID].Enabled || f.engine.rules[observer.ID].Enabled {
-		t.Fatal("dependent single-target rules were left enabled")
+	if !f.engine.rules[r.ID].Enabled || !f.engine.rules[observer.ID].Enabled {
+		t.Fatal("credential removal changed rule enablement")
 	}
 	f.add("one")
 	if _, err := f.engine.PrepareCredentialLogin(context.Background(), CredentialLoginPrepareRequest{AuthID: "one", PreparationID: "recreate"}); err == nil {
@@ -800,8 +831,8 @@ func TestManagementSessionAndURLBoundaries(t *testing.T) {
 		t.Fatal("missing session used ambient authority")
 	}
 	response := f.engine.Handle(context.Background(), pluginapi.ManagementRequest{Method: "GET", Path: "/v0/management/plugins/model-quality/settings", Headers: http.Header{"Authorization": []string{"Bearer offline-management-only"}}})
-	if response.StatusCode != 200 || !f.host.Management.ready() {
-		t.Fatal("authenticated panel did not establish session")
+	if response.StatusCode != 200 || f.host.Management.ready() {
+		t.Fatal("ordinary panel GET established background session")
 	}
 	if bytes.Contains(response.Body, []byte("offline-management-only")) {
 		t.Fatal("session key returned in settings")
@@ -933,7 +964,7 @@ func TestManualDisabledRecoveryCannotBorrowAnotherRulesAuthority(t *testing.T) {
 		t.Fatal("could not establish a different rule's disposition", runs, err)
 	}
 	f.answers["a"] = "4"
-	if runs, err := f.round(t, authorized); err != nil || len(runs) != 0 || f.disabledProbes != 16 ||
+	if runs, err := f.round(t, authorized); err != nil || len(runs) != 1 || runs[0].ActionStatus != "credential_kept_disabled" || f.disabledProbes != 20 ||
 		f.engine.managed["one"].RuleID != owner.ID || !f.entries["one"].Disabled || len(f.patches) != 2 {
 		t.Fatal("all-credentials manual recovery overrode another rule's disposition", runs, err)
 	}
@@ -961,7 +992,7 @@ func TestManagedAcknowledgmentIsExplicitAndNeverEnablesCredential(t *testing.T) 
 	if err := f.engine.acknowledgeHandling(context.Background(), r.ID, "one", d.ActionID); err != nil {
 		t.Fatal(err)
 	}
-	if f.engine.rules[r.ID].Enabled || f.engine.rules[r.ID].SchedulingEnabled || activeDisposition(f.engine.managed["one"]) || len(f.patches) != 1 {
-		t.Fatal("acknowledgment changed CPA or left rule running")
+	if !f.engine.rules[r.ID].Enabled || f.engine.rules[r.ID].SchedulingEnabled || activeDisposition(f.engine.managed["one"]) || len(f.patches) != 1 {
+		t.Fatal("acknowledgment changed CPA or rule settings")
 	}
 }

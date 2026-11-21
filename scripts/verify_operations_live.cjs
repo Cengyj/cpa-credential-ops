@@ -29,12 +29,19 @@ async function main() {
       config: { rule_id: ruleID, auth_id: id + '@example.test', scope_batch_id: batch, models: ['fixture-reasoner'], samples: 1, question_id: 'logic-candy', judge: { mode: 'deterministic' } },
     });
     const rows = [run('outside', 'other-rule'), ...Array.from({length: 21}, (_, i) => run('row-' + i))];
-    let tokens = 10, hold, failActivity = false;
+    let tokens = 10, hold, failActivity = false, failTargets = false;
+    let target = { auth_id: 'live-target', auth_index: 'live-route', provider: 'openai', provider_name: '合成供应商', is_provider: true,
+      object_type: 'provider', models: ['fixture-reasoner'], manual_disabled: true, runtime_status: 'disabled', effective_available: false,
+      error_policy_block: { code: 'error_policy_disabled', reason: 'synthetic previous 401' } };
     page.on('pageerror', err => errors.push(err.message));
     await page.route(origin + prefix + '/**', async route => {
       const req = route.request(), u = new URL(req.url()), p = u.pathname.slice(prefix.length);
       if (req.method() !== 'GET') { writes.push(p); return route.fulfill({status:405,json:{error:'fixture_read_only'}}); }
       reads.push(p + u.search);
+      if (p === '/targets') {
+        if (failTargets) { failTargets = false; return route.fulfill({status:503,json:{error:'synthetic target failure'}}); }
+        return route.fulfill({json:{items:[target],total:1}});
+      }
       if (p === '/rules') return route.fulfill({json:{items:[rule],total:1}});
       if (p === '/metrics') return route.fulfill({json:{known_tokens:tokens,judged:0,planned:0}});
       if (p === '/runs/detail') {
@@ -64,18 +71,25 @@ async function main() {
       await el('#connection-form button[type=submit]').click(); await el('body.connected').waitFor();
     };
     await connect();
+    await el('[data-page=manual]').click();
+    await el('#target').selectOption(target.auth_id);
+    await el('#target-summary').getByText('目标供应商路由当前仍在 CPA 停用', {exact:false}).waitFor();
+    assert(await el('#run-submit').isEnabled());
     await el('[data-page=operations]').click(); await displays('#ops-batch-summary', '1–20 / 22');
     const start = reads.length;
     await el('[data-run=row-0]').focus();
     rows.unshift(run('admitted-after-timer', rule.id, 'batch-new'));
     rows[0].status = 'running';
+    target = {...target, manual_disabled:false, runtime_status:'registered', effective_available:true};
     tokens = 42; rule.next_run_local = '2026-11-21T08:15:00+08:00';
     await tick(5100);
     await el('[data-run=admitted-after-timer]').waitFor();
     await displays('#metrics', '42'); await displays('#rules-list', '08:15:00');
     assert(await el('[data-run=row-0]').evaluate(node => node === document.activeElement));
     const liveEndpoints = [...new Set(reads.slice(start).map(url => url.split('?')[0]))].sort();
-    assert.deepEqual(liveEndpoints, ['/metrics', '/rules', '/runs']);
+    assert.deepEqual(liveEndpoints, ['/metrics', '/rules', '/runs', '/targets']);
+    assert.equal(await el('#target-summary').textContent(), '通过 CPA 原生路由测试');
+    assert(await el('#run-submit').isEnabled());
     await el('[data-rule-select=live-rule]').click();
     await displays('#ops-batch-summary', '1–20 / 22');
     await el('[data-skip-rule=live-rule] > summary').click();
@@ -141,6 +155,12 @@ async function main() {
     await el('[data-page=operations]').click(); await el('[data-run=host-return]').waitFor();
     const resumed = query().length;
     await tick(5100); assert.equal(query().length, resumed + 1);
+    failTargets = true; await tick(5100);
+    assert(await el('#run-submit').isDisabled());
+    assert.match(await el('#target-summary').textContent(), /读取失败/);
+    assert.doesNotMatch(await el('#target-summary').textContent(), /停用|错误策略/);
+    await tick(12500);
+    assert.doesNotMatch(await el('#target-summary').textContent(), /读取失败/);
     assert.deepEqual(writes, []); assert.deepEqual(errors, []);
     const result = {liveEndpoints, scopeAndPagination:true, preservedFocus:true, preservedDetail:true, readsWhileHidden:0,
       noOverlappingPolls:true, recoveredAfterFailure:true, resumedAfterDisconnect:true, resumedAfterFrameRemoval:true, writes:writes.length};

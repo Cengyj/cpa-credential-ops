@@ -30,6 +30,9 @@ func (en *Engine) sortedRuleIDsLocked() []string {
 
 func (en *Engine) ruleForDisplayLocked(r *Rule) Rule {
 	next := cloneRule(r)
+	if next.PendingSchedule != nil {
+		next.PendingSchedule.Accepted = nil
+	}
 	if next.LastScopeDispatch != nil {
 		for i, detail := range next.LastScopeDispatch.Details {
 			if en.runs[detail.RunID] == nil {
@@ -43,6 +46,20 @@ func (en *Engine) ruleForDisplayLocked(r *Rule) Rule {
 		next.NextRun = time.Time{}
 	}
 	next.timerActive = ruleScheduled(next) && en.timerAllowed(next)
+	if next.timerActive {
+		if retry := en.scheduleRetry[r.ID]; retry.revision == r.Revision && (retry.due.Equal(r.NextRun) || r.PendingSchedule != nil && retry.due.Equal(r.PendingSchedule.Due)) {
+			next.timerWaitReason = retry.reason
+		}
+		if next.timerWaitReason == "" && r.PendingSchedule != nil {
+			next.timerWaitReason = "部分对象已受理，其余对象等待后台管理目录就绪。"
+		}
+	}
+	if next.Status == "detecting" {
+		if hold := en.loginWaitLocked(next.RunConfig); hold != nil {
+			next.Status, _ = hold.reason()
+			next.timerActive = false
+		}
+	}
 	return *next
 }
 func (en *Engine) SaveRule(ctx context.Context, in Rule, update bool) (*Rule, error) {
@@ -140,6 +157,24 @@ func (en *Engine) saveRuleLocked(ctx context.Context, in Rule, update bool, acti
 	if in.Action != "observe_only" && in.Action != "pause_credential" && !credentialMutation(in.Action) {
 		return nil, fmt.Errorf("unsupported action")
 	}
+	if old != nil {
+		needsCurrentState := false
+		for _, d := range en.managed {
+			needsCurrentState = needsCurrentState || d.RuleID == old.ID && d.State == "disabled"
+		}
+		if needsCurrentState {
+			targets, readErr := en.host.Targets(ctx)
+			if readErr != nil {
+				return nil, fmt.Errorf("unavailable: cannot read current CPA targets: %w", readErr)
+			}
+			failures := en.reconcileCurrentTargetsLocked(ctx, targets, nil)
+			for id, failure := range failures {
+				if d := en.managed[id]; d != nil && d.RuleID == old.ID {
+					return nil, failure
+				}
+			}
+		}
+	}
 	if err := en.validateManagedRule(&in, old); err != nil {
 		return nil, err
 	}
@@ -193,6 +228,7 @@ func (en *Engine) saveRuleLocked(ctx context.Context, in Rule, update bool, acti
 	}
 	in.EvidenceSignature = ""
 	in.FailCount = 0
+	in.PendingSchedule = nil
 	in.LastRun = ""
 	in.LastScopeBatch = ""
 	in.LastManualSkips = nil
@@ -223,13 +259,20 @@ func (en *Engine) saveRuleLocked(ctx context.Context, in Rule, update bool, acti
 	for _, group := range in.AuthorizedGroups {
 		newGroup = newGroup || old == nil || !contains(old.AuthorizedGroups, group)
 	}
-	if !scoped && !retired || newGroup {
+	checkSelection := in.expectedTargetObjectType != ""
+	if !scoped && !retired || newGroup || checkSelection {
 		targets, err = en.host.Targets(en.inventoryContextLocked(ctx))
 		if err != nil {
 			return nil, err
 		}
 		if err = validateRuleGroups(&in, old, targets); err != nil {
 			return nil, err
+		}
+		if checkSelection {
+			if err := in.verifySelectedRuleTarget(targets); err != nil {
+				return nil, err
+			}
+			in.expectedTargetObjectType = ""
 		}
 	}
 	if !scoped && !retired {
@@ -240,9 +283,9 @@ func (en *Engine) saveRuleLocked(ctx context.Context, in Rule, update bool, acti
 				return nil, problem
 			}
 		}
-		for _, t := range targets {
-			if t.AuthID == in.AuthID && in.Provider == t.Provider && !t.identityConflict && objectType(t) != objectUnknown && in.TargetAuthIndex == "" && !in.LegacyScope {
-				in.TargetAuthIndex = t.AuthIndex
+		if !checkSelection {
+			for _, t := range targets {
+				in.recordBoundTarget(t)
 			}
 		}
 		if managedRule(&in) {
@@ -278,7 +321,7 @@ func (en *Engine) saveRuleLocked(ctx context.Context, in Rule, update bool, acti
 			return nil, fmt.Errorf("blocked: owned pause requires manual release")
 		}
 		if !retired && !scoped {
-			if err = en.checkTargetsForRunLocked(in.RunConfig, targets, !en.Capabilities().QualityPause); err != nil {
+			if err = en.checkTargetPoliciesLocked(in.RunConfig, targets, !en.Capabilities().QualityPause); err != nil {
 				return nil, err
 			}
 		}
@@ -332,7 +375,8 @@ func (en *Engine) setRuleTimer(ctx context.Context, id string, revision uint64, 
 	}
 	next := cloneRule(old)
 	next.timerActive = ruleScheduled(old) && en.timerAllowed(old)
-	if next.timerActive == enabled {
+	// Inactive rules can retain permission behind a closed global gate or pause.
+	if enabled && next.timerActive || !enabled && !old.SchedulingEnabled && !en.timers[id] {
 		return next, nil
 	}
 	if enabled {
@@ -385,7 +429,23 @@ func (en *Engine) PauseRule(id string, rev uint64, paused bool) error {
 			if problem := en.checkRuleProvidersLocked(r, r.RunConfig, targets); problem != nil {
 				return problem
 			}
-			if err = en.checkTargetsForRunLocked(r.RunConfig, targets, !en.Capabilities().QualityPause); err != nil {
+			if !en.Capabilities().QualityPause {
+				for i, target := range targets {
+					if target.AuthID != r.AuthID || !disabledObject(target) || !needsScopeSnapshot(r, target) {
+						continue
+					}
+					// Resuming the rule uses the same owned recovery admission as
+					// dispatch. This projection does not enable or probe CPA.
+					projected, _, snapshotErr := en.admitManagedLocked(en.ctx, r, target, false)
+					if snapshotErr != nil {
+						return snapshotErr
+					}
+					targets = append([]Target(nil), targets...)
+					targets[i] = projected
+					break
+				}
+			}
+			if err = en.checkTargetPoliciesLocked(r.RunConfig, targets, !en.Capabilities().QualityPause); err != nil {
 				return err
 			}
 		}
@@ -432,6 +492,20 @@ func (en *Engine) DeleteRule(ctx context.Context, id string, rev uint64) error {
 	var clearHandling []string
 	var unresolved []*CredentialDisposition
 	for _, d := range en.managed {
+		// Removing a rule or its history must not turn an error suspension
+		// into an operator disable that another rule may probe or restore.
+		if errorPolicyDisabled(d).Code != "" && (d.RuleID == id || d.ErrorSource != nil && d.ErrorSource.RuleID == id) {
+			for _, runID := range []string{d.RunID, d.TriggerRunID} {
+				if runID != "" {
+					retainedRuns[runID] = true
+				}
+			}
+			if d.ErrorSource != nil && d.ErrorSource.RunID != "" {
+				retainedRuns[d.ErrorSource.RunID] = true
+			}
+			retainedActions[d.ActionID] = true
+			continue
+		}
 		if d.RuleID != id {
 			continue
 		}
@@ -439,7 +513,7 @@ func (en *Engine) DeleteRule(ctx context.Context, id string, rev uint64) error {
 			return fmt.Errorf("conflict: CPA 凭证写入尚在处理中，请等待结果后再删除。")
 		}
 		switch d.State {
-		case "disabled", "deleted", "restored", "externally_enabled", "acknowledged", "precondition_failed":
+		case "disabled", "deleted", "restored", "externally_enabled", "entry_missing", "acknowledged", "precondition_failed":
 			clearHandling = append(clearHandling, d.AuthID)
 			continue
 		}
@@ -500,6 +574,7 @@ func (en *Engine) DeleteRule(ctx context.Context, id string, rev uint64) error {
 		return err
 	}
 	delete(en.rules, id)
+	delete(en.scheduleRetry, id)
 	delete(en.finishedRules, id)
 	for _, authID := range clearHandling {
 		delete(en.managed, authID)
@@ -543,7 +618,8 @@ func RoundVerdict(r *Run) string {
 }
 
 func roundVerdict(r *Run, hasEvidence func(*Sample) bool) string {
-	if r.Status != "completed" || len(r.Config.Models) == 0 || r.Config.Samples < 1 || len(r.Samples) != len(r.Config.Models)*r.Config.Samples {
+	if r.Status != "completed" || r.Error != "" || r.BlockReason != "" || r.CancelRequested || r.UpstreamCondition != "" ||
+		len(r.Config.Models) == 0 || r.Config.Samples < 1 || len(r.Samples) != len(r.Config.Models)*r.Config.Samples {
 		return "unknown"
 	}
 	seen := make(map[string][]bool, len(r.Config.Models))
@@ -557,7 +633,7 @@ func roundVerdict(r *Run, hasEvidence func(*Sample) bool) string {
 	for i := range r.Samples {
 		s := &r.Samples[i]
 		indices := seen[s.Model]
-		if s.Index < 0 || s.Index >= len(indices) || indices[s.Index] || s.ExecutionStatus != "completed" || !hasEvidence(s) {
+		if s.Index < 0 || s.Index >= len(indices) || indices[s.Index] || s.ExecutionStatus != "completed" || s.Error != "" || s.UpstreamCondition != "" || !hasEvidence(s) {
 			return "unknown"
 		}
 		indices[s.Index] = true
@@ -585,6 +661,11 @@ func (en *Engine) decideLocked(run *Run) {
 	out := cloneRun(run)
 	c := changes()
 	c.runs[run.ID] = out
+	if en.loginWaitLocked(run.Config.RunConfig) != nil || run.BlockReason == "credential_authorization_changed" {
+		out.ActionStatus = "credential_authorization_changed"
+		_ = en.commitLocked(c)
+		return
+	}
 	if r == nil || !r.Enabled || r.Revision != run.Config.RuleRevision || ruleStatus(r) != "detecting" {
 		out.ActionStatus = "stale_rule"
 		if r != nil && ruleStatus(r) == "awaiting_release" {

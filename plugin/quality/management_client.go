@@ -3,6 +3,7 @@ package quality
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -10,19 +11,22 @@ import (
 	"net/url"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/MoeForge/moego/json"
 	"github.com/MoeForge/moego/ojson"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
 
-// ManagementClient holds an authenticated panel session in memory only. It never
-// discovers keys from host files, persists them, follows redirects, or uses a proxy.
+// ManagementClient owns one loopback transport and one lifecycle-bound verifier.
 type ManagementClient struct {
-	mu     sync.RWMutex
+	mu   sync.RWMutex
+	edit sync.Mutex
+	connectionState
 	base   string
 	key    string
 	client *http.Client
@@ -40,43 +44,67 @@ func NewManagementClient(base string) (*ManagementClient, error) {
 	if ip == nil || !ip.IsLoopback() {
 		return nil, fmt.Errorf("CPA management URL must use a loopback IP")
 	}
-	transport := &http.Transport{DialContext: (&net.Dialer{Timeout: 5 * time.Second}).DialContext, TLSHandshakeTimeout: 5 * time.Second}
-	return &ManagementClient{base: strings.TrimRight(base, "/"), client: &http.Client{
+	transport := &http.Transport{DialContext: (&net.Dialer{Timeout: 5 * time.Second}).DialContext, TLSHandshakeTimeout: 5 * time.Second, IdleConnTimeout: 90 * time.Second, MaxIdleConnsPerHost: 8, MaxConnsPerHost: 24}
+	return &ManagementClient{connectionState: connectionState{status: ConnectionStatus{State: "unconfigured", CanMigrate: true}}, base: strings.TrimRight(base, "/"), client: &http.Client{
 		Transport: transport, Timeout: 70 * time.Second,
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}}, nil
 }
 
-func (m *ManagementClient) authorize(headers http.Header) {
-	key := strings.TrimSpace(headers.Get("X-Management-Key"))
-	if value := headers.Get("Authorization"); len(value) > 7 && strings.EqualFold(value[:7], "Bearer ") {
-		key = strings.TrimSpace(value[7:])
+func managementKey(headers http.Header) string {
+	// Match the credential selected by the authenticated CPA middleware.
+	key := headers.Get("Authorization")
+	if scheme, value, found := strings.Cut(key, " "); found && strings.EqualFold(scheme, "Bearer") {
+		key = value
 	}
-	if key == "" || len(key) > 8192 || strings.ContainsAny(key, "\r\n") {
-		return
+	if key == "" {
+		key = headers.Get("X-Management-Key")
 	}
-	m.mu.Lock()
-	m.key = key
-	m.mu.Unlock()
+	if !validManagementKey(key) {
+		return ""
+	}
+	return key
 }
 
-func (m *ManagementClient) ready() bool { m.mu.RLock(); defer m.mu.RUnlock(); return m.key != "" }
+func validManagementKey(key string) bool {
+	return key != "" && len(key) <= 8192 && utf8.ValidString(key) && strings.IndexFunc(key, func(r rune) bool { return r < 32 || r == 127 }) < 0 && strings.TrimSpace(key) == key
+}
+
+func (m *ManagementClient) ready() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.status.State == "ready" && m.key != ""
+}
 
 // Auth model discovery returns IDs only. Join the display page to the
 // corresponding CPA channel catalog without adding models to any credential.
 func (m *ManagementClient) addModelReasoning(ctx context.Context, targets []Target) {
 	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
-	type thinkingOptions struct {
-		Levels         []string `json:"levels,omitempty"`
-		ZeroAllowed    bool     `json:"zero_allowed,omitempty"`
-		DynamicAllowed bool     `json:"dynamic_allowed,omitempty"`
-	}
 	byChannel := make(map[string]map[string]*thinkingOptions)
 	for i := range targets {
 		target := &targets[i]
+		reasoning, _ := target.Reasoning.(map[string]*thinkingOptions)
+		modelIDs := make(map[string]string)
+		for _, id := range target.Models {
+			if _, configured := reasoning[id]; configured {
+				continue
+			}
+			catalogID := id
+			if target.reasoningModelIDs != nil {
+				catalogID = target.reasoningModelIDs[id]
+			}
+			if catalogID != "" {
+				modelIDs[id] = catalogID
+			}
+		}
 		channel := strings.ToLower(strings.TrimSpace(target.Provider))
-		if len(target.Models) == 0 || channel == "" || channel == "." || channel == ".." || strings.ContainsAny(channel, "/\\") {
+		if len(modelIDs) == 0 || channel == "" || channel == "." || channel == ".." || strings.ContainsAny(channel, "/\\") {
+			continue
+		}
+		// These catalogs aggregate public aliases from multiple routes. Only
+		// authenticated route-local configuration can establish their support.
+		if channel == "openai-compatibility" || strings.HasPrefix(channel, "openai-compatible-") {
 			continue
 		}
 		catalog, loaded := byChannel[channel]
@@ -94,13 +122,15 @@ func (m *ManagementClient) addModelReasoning(ctx context.Context, targets []Targ
 			}
 			catalog = make(map[string]*thinkingOptions)
 			for _, model := range reply.Models {
-				catalog[model.ID] = model.Thinking
+				catalog[model.ID] = normalizedThinkingOptions(model.Thinking)
 			}
 			byChannel[channel] = catalog
 		}
-		reasoning := make(map[string]*thinkingOptions)
-		for _, id := range target.Models {
-			if support := catalog[id]; support != nil {
+		if reasoning == nil {
+			reasoning = make(map[string]*thinkingOptions)
+		}
+		for id, catalogID := range modelIDs {
+			if support, known := catalog[catalogID]; known {
 				reasoning[id] = support
 			}
 		}
@@ -117,11 +147,24 @@ func (m *ManagementClient) conditionalResponse(ctx context.Context, method, path
 		return nil, fmt.Errorf("unavailable: CPA management connection is not configured")
 	}
 	m.mu.RLock()
-	key := m.key
+	key, status := m.key, m.status
 	m.mu.RUnlock()
-	if key == "" {
-		return nil, fmt.Errorf("management_session_required: open the authenticated plugin panel after restarting CPA")
+	if status.State != "ready" || key == "" {
+		return nil, connectionError(status)
 	}
+	resp, err := m.send(ctx, key, method, path, body, ifMatch)
+	// CPA reports upstream transport failures as an outer 502 on api-call.
+	upstreamTransport := resp != nil && path == "/v8/management/requests/api-call" && resp.StatusCode == http.StatusBadGateway
+	if ctx.Err() == nil && !upstreamTransport && (err != nil || resp.StatusCode >= 400) {
+		m.observeFailure(status.Revision, resp)
+	}
+	if err != nil && method != http.MethodGet {
+		return nil, fmt.Errorf("management_uncertain: CPA did not confirm the operation")
+	}
+	return resp, err
+}
+
+func (m *ManagementClient) send(ctx context.Context, key, method, path string, body any, ifMatch string) (*http.Response, error) {
 	var raw []byte
 	var err error
 	if body != nil {
@@ -141,14 +184,7 @@ func (m *ManagementClient) conditionalResponse(ctx context.Context, method, path
 	}
 	resp, err := m.client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("management_uncertain: CPA request did not return a confirmed result")
-	}
-	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-		m.mu.Lock()
-		if m.key == key {
-			m.key = ""
-		}
-		m.mu.Unlock()
+		return nil, fmt.Errorf("management_network: CPA management endpoint did not respond")
 	}
 	return resp, nil
 }
@@ -169,6 +205,66 @@ func (m *ManagementClient) request(ctx context.Context, method, path string, bod
 	if out != nil && json.Unmarshal(raw, out) != nil {
 		return fmt.Errorf("management_uncertain: invalid CPA response")
 	}
+	return nil
+}
+
+// CPA wraps an upstream HTTP response inside its own successful management
+// response. Only one explicit status and body can authorize an error policy.
+type managementProbeResponse struct {
+	StatusCode int
+	Body       string
+	Header     http.Header
+}
+
+// CPA expands its authentication placeholder in the serialized request body as
+// well as in headers. Escape it in JSON string values so the upstream receives
+// the original text and the authentication header can still use the placeholder.
+type managementProbeText string
+
+func (s managementProbeText) MarshalJSON() ([]byte, error) {
+	quoted, err := json.Marshal(string(s))
+	if err != nil || !strings.Contains(string(s), "$TOKEN$") {
+		return quoted, err
+	}
+	return bytes.ReplaceAll(quoted, []byte("$TOKEN$"), []byte(`\u0024TOKEN\u0024`)), nil
+}
+
+func (r *managementProbeResponse) UnmarshalJSON(raw []byte) error {
+	root := ojson.ParseBytes(raw)
+	invalid := errors.New("invalid CPA probe response")
+	if !root.IsObject() || !ojson.ValidBytes(raw) {
+		return invalid
+	}
+	var status int
+	var body, header ojson.Result
+	valid := true
+	root.ForEach(func(key, value ojson.Result) bool {
+		name := key.String()
+		switch {
+		case strings.EqualFold(name, "status_code"):
+			n, err := strconv.Atoi(value.Raw)
+			valid = name == "status_code" && status == 0 && err == nil && n >= 200 && n <= 599
+			status = n
+		case strings.EqualFold(name, "body"):
+			valid = name == "body" && !body.Exists() && value.Type == ojson.String
+			body = value
+		case strings.EqualFold(name, "header"):
+			valid = name == "header" && !header.Exists() && (value.IsObject() || value.Raw == "null")
+			header = value
+		}
+		return valid
+	})
+	if !valid || status == 0 || !body.Exists() {
+		return invalid
+	}
+	var upstreamHeader http.Header
+	if status == http.StatusTooManyRequests && header.IsObject() {
+		rawHeader := []byte(header.Raw)
+		if uniqueJSON(rawHeader) != nil || json.Unmarshal(rawHeader, &upstreamHeader) != nil {
+			return invalid
+		}
+	}
+	r.StatusCode, r.Body, r.Header = status, body.String(), upstreamHeader
 	return nil
 }
 
@@ -198,8 +294,21 @@ type managedHost interface {
 	DeleteCredential(context.Context, CredentialSnapshot) error
 }
 
+// Only local checks before a mutation request may return this error. HTTP
+// failures after sending a request still leave the result uncertain.
+var errCredentialPrecondition = errors.New("conflict: credential changed before write")
+
 func sameCredential(a, b CredentialSnapshot) bool {
 	return a.AuthID == b.AuthID && a.AuthIndex == b.AuthIndex && a.Name == b.Name && a.Provider == b.Provider && a.Fingerprint != "" && a.Fingerprint == b.Fingerprint
+}
+
+// Entry continuity is distinct from the content that a particular round used.
+// CPA file indices follow the file locator; provider indices may change with a
+// key edit. Never infer that such a new provider locator inherits ownership.
+func sameCredentialEntry(a, b CredentialSnapshot) bool {
+	return a.AuthID != "" && a.AuthID == b.AuthID && a.AuthIndex != "" && a.AuthIndex == b.AuthIndex &&
+		a.Name != "" && a.Name == b.Name && a.Provider == b.Provider && a.ProviderMechanism == b.ProviderMechanism &&
+		a.ProviderGroupID == b.ProviderGroupID
 }
 func sameSnapshot(a, b CredentialSnapshot) bool {
 	if a.ProviderMechanism != "" || b.ProviderMechanism != "" {
@@ -250,6 +359,16 @@ func (h *NativeHost) credentialProfile(ctx context.Context, id, index string) (C
 	if json.Unmarshal(raw.JSON, &data) != nil || data == nil {
 		return empty, a, nil, rejectScope("blocked: credential snapshot identity changed", "snapshot_unavailable", "无法解析凭证文件快照。")
 	}
+	fileType, ok := data["type"].(string)
+	if !ok || strings.TrimSpace(fileType) != provider {
+		return empty, a, nil, rejectScope("blocked: credential file type differs from runtime", "identity_conflict", "CPA 凭证文件类型与当前运行信息不一致。")
+	}
+	if disabled, exists := data["disabled"]; exists {
+		value, valid := disabled.(bool)
+		if !valid || value != (a.Disabled || a.Status == "disabled") {
+			return empty, a, nil, rejectScope("blocked: credential file and runtime disabled states disagree", "snapshot_unavailable", "CPA 凭证文件与运行时的启停状态尚未一致，或文件启停字段无效。")
+		}
+	}
 	// Expanded sources, SIWC, and ambiguous routing need their native executor.
 	for _, field := range []string{"use_siwc", "virtual", "projects", "project_ids"} {
 		if value := data[field]; value != nil && value != false && value != "false" && value != "" {
@@ -274,7 +393,7 @@ func (h *NativeHost) credentialProfile(ctx context.Context, id, index string) (C
 
 // Re-read the pinned runtime and physical file through public SDK callbacks.
 // Token refresh and host restart may both change the full snapshot fingerprint.
-func (h *NativeHost) verifyEnabledManualFile(ctx context.Context, t Target, d *CredentialDisposition) (string, error) {
+func (h *NativeHost) verifyEnabledManualFile(ctx context.Context, t Target, _ *CredentialDisposition) (string, error) {
 	current, runtime, data, err := h.credentialProfile(ctx, t.AuthID, t.AuthIndex)
 	if err != nil {
 		if ctx.Err() != nil {
@@ -288,30 +407,13 @@ func (h *NativeHost) verifyEnabledManualFile(ctx context.Context, t Target, d *C
 	if disabled, exists := data["disabled"]; exists && disabled != false {
 		return "", fmt.Errorf("blocked: CPA 文件尚未确认启用此凭证，请核对文件状态。")
 	}
-	old := d.Snapshot
 	fileType, _ := data["type"].(string)
-	fileEmail, _ := data["email"].(string)
-	email := strings.TrimSpace(d.Email)
-	sameEmail := func(value string) bool { return strings.EqualFold(email, strings.TrimSpace(value)) }
-	if current.AuthID != old.AuthID || current.AuthIndex != old.AuthIndex || current.Provider != old.Provider || current.Name != old.Name ||
-		fileType != current.Provider || old.Fingerprint == "" ||
-		email != "" && (t.Email != "" && !sameEmail(t.Email) || runtime.Email != "" && !sameEmail(runtime.Email) || fileEmail != "" && !sameEmail(fileEmail)) {
-		return "", fmt.Errorf("blocked: CPA 当前凭证与原错误处置记录的身份不一致，请核对账号。")
+	if current.AuthID != t.AuthID || current.AuthIndex != t.AuthIndex || current.Provider != t.Provider || fileType != current.Provider {
+		return "", fmt.Errorf("blocked: CPA 当前凭证文件与所选条目的身份不一致，请刷新目录。")
 	}
-	if old.AccountFingerprint != "" {
-		if old.AccountFingerprint != current.AccountFingerprint {
-			return "", fmt.Errorf("blocked: CPA 当前账号标识与原错误处置记录不一致，请核对账号。")
-		}
-	} else if current.Fingerprint != old.Fingerprint && (email == "" || !sameEmail(fileEmail)) {
-		return "", fmt.Errorf("blocked: 无法确认刷新后的凭证仍属于原账号，请在质量运维中核对。")
-	}
-	// Pin the selected account throughout this run, including for legacy
-	// dispositions whose only retained principal was an email address.
+	// Pin the current account, independently of historical suspension content.
 	if current.AccountFingerprint != "" {
 		return current.AccountFingerprint, nil
-	}
-	if email != "" && sameEmail(fileEmail) {
-		return fingerprint([2]string{current.Provider, strings.ToLower(email)}), nil
 	}
 	return current.Fingerprint, nil
 }
@@ -334,7 +436,7 @@ func (h *NativeHost) SetCredentialDisabled(ctx context.Context, expected Credent
 	}
 	current, err := h.CredentialSnapshot(ctx, expected.AuthID, expected.AuthIndex)
 	if err != nil || !sameSnapshot(current, expected) || current.Disabled == disabled {
-		return CredentialSnapshot{}, fmt.Errorf("conflict: credential changed before status update")
+		return CredentialSnapshot{}, errCredentialPrecondition
 	}
 	var response struct {
 		Status   string `json:"status"`
@@ -387,7 +489,7 @@ func (h *NativeHost) DeleteCredential(ctx context.Context, expected CredentialSn
 	}
 	current, err := h.CredentialSnapshot(ctx, expected.AuthID, expected.AuthIndex)
 	if err != nil || !sameSnapshot(current, expected) {
-		return fmt.Errorf("conflict: credential changed before removal")
+		return errCredentialPrecondition
 	}
 	// Never use the bulk/all endpoint. CPA's delete API is filename based.
 	var response struct {
@@ -442,12 +544,12 @@ func (h *NativeHost) executeManaged(ctx context.Context, e Execution) (s Sample)
 		return
 	}
 	doc := ojson.NewDocString(`{}`)
-	fields := map[string]any{"model": e.Model, "stream": false, "max_tokens": e.Parameters.MaxTokens, "messages": []map[string]string{{"role": "user", "content": e.Prompt}}}
+	fields := map[string]any{"model": managementProbeText(e.Model), "stream": false, "max_tokens": e.Parameters.MaxTokens, "messages": []map[string]any{{"role": "user", "content": managementProbeText(e.Prompt)}}}
 	headers := map[string]string{"Authorization": "Bearer $TOKEN$", "Content-Type": "application/json", "Accept": "application/json"}
 	path := "/chat/completions"
 	if codex {
 		path = "/responses"
-		fields = map[string]any{"model": e.Model, "stream": true, "store": false, "instructions": "Answer the question directly.", "input": []map[string]any{{"role": "user", "content": []map[string]string{{"type": "input_text", "text": e.Prompt}}}}, "max_output_tokens": e.Parameters.MaxTokens}
+		fields = map[string]any{"model": managementProbeText(e.Model), "stream": true, "store": false, "instructions": "Answer the question directly.", "input": []map[string]any{{"role": "user", "content": []map[string]any{{"type": "input_text", "text": managementProbeText(e.Prompt)}}}}, "max_output_tokens": e.Parameters.MaxTokens}
 		headers["Accept"] = "text/event-stream"
 		headers["Originator"] = "codex-tui"
 		headers["User-Agent"] = "codex-tui/0.154.0"
@@ -478,10 +580,7 @@ func (h *NativeHost) executeManaged(ctx context.Context, e Execution) (s Sample)
 	if limit < 1024 {
 		limit = 262144
 	}
-	var response struct {
-		StatusCode int    `json:"status_code"`
-		Body       string `json:"body"`
-	}
+	var response managementProbeResponse
 	err = h.Management.request(ctx, http.MethodPost, "/v8/management/requests/api-call", map[string]any{"auth_index": expected.AuthIndex, "method": "POST", "url": strings.TrimRight(base, "/") + path, "header": headers, "data": doc.String()}, &response, int64(limit)*6+16384)
 	if err != nil {
 		s.Error = scrubError(err)
@@ -502,7 +601,7 @@ func (h *NativeHost) executeManaged(ctx context.Context, e Execution) (s Sample)
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		s.Error = fmt.Sprintf("upstream HTTP %d", response.StatusCode)
 		if len(response.Body) <= limit {
-			if condition := managedUpstreamCondition(response.StatusCode, response.Body, e.Model); condition != "" && confirmProbe() {
+			if condition := managedUpstreamCondition(response.StatusCode, response.Body, e.Model, response.Header); condition != "" && confirmProbe() {
 				s.UpstreamCondition = condition
 			}
 		}
@@ -542,6 +641,8 @@ func (h *NativeHost) executeManaged(ctx context.Context, e Execution) (s Sample)
 // refusals, tool calls and successful HTTP statuses alone cannot pass a round.
 func parseManagedResponses(body string) (string, string, *Usage, error) {
 	var terminal ojson.Result
+	var responseID, responseModel string
+	done := false
 	for _, line := range strings.Split(body, "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, ":") || strings.HasPrefix(line, "event:") {
@@ -552,12 +653,20 @@ func parseManagedResponses(body string) (string, string, *Usage, error) {
 		}
 		raw := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 		if raw == "[DONE]" {
+			done = true
 			continue
 		}
-		if !ojson.Valid(raw) {
+		if done {
+			return "", "", nil, fmt.Errorf("event after responses stream end")
+		}
+		if !ojson.Valid(raw) || uniqueJSON([]byte(raw)) != nil {
 			return "", "", nil, fmt.Errorf("invalid responses event")
 		}
 		event := ojson.Parse(raw)
+		if !observeResponseIdentity(event.Get("response.id"), &responseID) || !observeResponseIdentity(event.Get("response_id"), &responseID) ||
+			!observeResponseIdentity(event.Get("response.model"), &responseModel) {
+			return "", "", nil, fmt.Errorf("conflicting responses identity")
+		}
 		switch event.Get("type").String() {
 		case "error", "response.failed", "response.incomplete":
 			return "", "", nil, fmt.Errorf("incomplete responses result")
@@ -574,6 +683,9 @@ func parseManagedResponses(body string) (string, string, *Usage, error) {
 	}
 	if terminal.Get("status").String() != "completed" || terminal.Get("error").Raw != "" && terminal.Get("error").Raw != "null" {
 		return "", "", nil, fmt.Errorf("missing completed responses result")
+	}
+	if details := terminal.Get("incomplete_details"); details.Exists() && details.Raw != "null" {
+		return "", "", nil, fmt.Errorf("responses result contains incomplete details")
 	}
 	output := terminal.Get("output")
 	if !output.IsArray() {

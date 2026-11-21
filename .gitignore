@@ -17,6 +17,9 @@
 !.env.sample
 config.yaml
 auths/
+model-quality-data/
+**/management/connection.json
+**/management/.connection-*
 logs/
 *.db
 *.db-*

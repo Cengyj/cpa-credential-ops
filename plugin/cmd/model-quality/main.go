@@ -58,14 +58,13 @@ import "C"
 import (
 	"encoding/json"
 	"fmt"
-	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 	"unsafe"
 
 	"github.com/cliproxyapi-plugins/model-quality/quality"
-	"github.com/cliproxyapi-plugins/model-quality/ui"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 	log "github.com/sirupsen/logrus"
@@ -200,16 +199,23 @@ func handle(method string, raw []byte) (any, error) {
 		if err := cfg.Validate(); err != nil {
 			return nil, err
 		}
-		managementURL := os.Getenv("MODEL_QUALITY_CPA_URL")
-		management, err := quality.NewManagementClient(managementURL)
+		directory, err := filepath.Abs(cfg.DataDir)
 		if err != nil {
 			return nil, err
 		}
-		native := &quality.NativeHost{Call: callback, MaxResponseBytes: cfg.MaxResponseBytes, Management: management}
-		if err := native.Check(); err != nil {
-			return nil, err
-		}
-		if err := runtime.configure(runtimeConfig{settings: cfg, managementURL: managementURL}, method == pluginabi.MethodPluginReconfigure, func() (runtimeEngine, error) { return newApplication(cfg, native) }); err != nil {
+		cfg.DataDir = directory
+		managementURL := os.Getenv("MODEL_QUALITY_CPA_URL")
+		if err := runtime.configure(runtimeConfig{settings: cfg, managementURL: managementURL}, method == pluginabi.MethodPluginReconfigure, func() (runtimeEngine, error) {
+			management := quality.RuntimeManagementClient(managementURL)
+			native := &quality.NativeHost{Call: callback, MaxResponseBytes: cfg.MaxResponseBytes, Management: management}
+			app, err := newApplication(cfg, native)
+			if err != nil {
+				management.Close()
+				return nil, err
+			}
+			management.Start(cfg.DataDir, os.Getenv("MODEL_QUALITY_MANAGEMENT_KEY"))
+			return &connectedApplication{runtimeEngine: app, management: management}, nil
+		}); err != nil {
 			return nil, err
 		}
 		return registration(), nil
@@ -239,23 +245,8 @@ func handle(method string, raw []byte) (any, error) {
 		if err := json.Unmarshal(raw, &req); err != nil {
 			return nil, err
 		}
-		if strings.HasPrefix(req.Path, "/v0/resource/plugins/model-quality/") {
-			name := strings.TrimPrefix(req.Path, "/v0/resource/plugins/model-quality/")
-			ct := ""
-			for _, resource := range staticResources {
-				if name == resource.name {
-					ct = resource.contentType
-					break
-				}
-			}
-			if req.Method != "GET" || ct == "" {
-				return pluginapi.ManagementResponse{StatusCode: 404}, nil
-			}
-			b, err := ui.Files.ReadFile(name)
-			if err != nil {
-				return nil, err
-			}
-			return pluginapi.ManagementResponse{StatusCode: 200, Body: b, Headers: http.Header{"Content-Type": {ct}, "Cache-Control": {"no-store"}, "X-Content-Type-Options": {"nosniff"}, "Content-Security-Policy": {"default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; frame-src 'self' blob:; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'self'"}}}, nil
+		if name, ok := strings.CutPrefix(req.Path, "/v0/resource/plugins/model-quality/"); ok {
+			return serveStaticResource(name, req.ManagementRequest)
 		}
 		instance, release, err := runtime.acquire()
 		if err != nil {

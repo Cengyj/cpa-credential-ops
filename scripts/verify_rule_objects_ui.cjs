@@ -77,8 +77,14 @@ async function main() {
       }
       if (api === '/rules' && ['PUT','POST'].includes(r.method())) {
         writes.push(body);
+        const target=directory.find(t=>t.auth_id===body.auth_id && t.provider===body.provider && t.auth_index===body.target_auth_index);
+        if (body.expected_target_object_type && body.expected_target_object_type!==target?.object_type) {
+          return request.fulfill({status:409,json:{error:{code:'conflict',message:'CPA 当前目录无法核实所选对象的来源、提供方或索引，请刷新后重新选择'}}});
+        }
         const prior = rules.find(t => t.id === body.id), saved = {legacy_scope:prior?.legacy_scope,legacy_provider_observation:prior?.legacy_provider_observation,
           ...body,id:body.id || 'rule-'+revision,revision:revision++,enabled:true,timer_active:false};
+        delete saved.expected_target_object_type;
+        if (target) saved.target_object_type=target.object_type;
         saved.parameters={...prior?.parameters,...body.parameters};
         if(saved.parameters.reasoning_effort === 'default') saved.parameters.reasoning_effort='';
         if (prior) rules[rules.indexOf(prior)] = saved; else rules.push(saved);
@@ -128,7 +134,7 @@ async function main() {
     assert.doesNotMatch(await el('#rule-dialog').innerText(),/模型默认/);
     await save(); assert.deepEqual(writes[0].object_types,['provider']); assert.deepEqual(writes[0].authorized_groups,[]);
     assert.equal(writes[0].parameters.reasoning_effort,'high'); assert.deepEqual(writes[0].models,[shortcuts[0]]);
-    assert.equal(writes[0].auth_id,a.auth_id); assert.equal(writes[0].target_auth_index,a.auth_index); assert(!writes[0].target_group); assert.equal(batches.length,0);
+    assert.equal(writes[0].auth_id,a.auth_id); assert.equal(writes[0].target_auth_index,a.auth_index); assert.equal(writes[0].expected_target_object_type,'provider'); assert(!writes[0].target_group); assert.equal(batches.length,0);
     const first = rules[0].id;
     directory=directory.map(t=>t===a?{...t,auth_index:'replacement'}:t);
     await el('#refresh').click(); await el('[data-rule-edit="'+first+'"]').click();
@@ -240,6 +246,55 @@ async function main() {
     directoryChecks.push({target_scope:'all_enabled',directory_states:['active_with_error_policy_history','native_cooldown','native_unavailable'],
       results_offline:true,summary:await el('#rule-scope-note').innerText()});
     assert.equal(writes.length,7); assert.equal(batches.length,2); assert.equal(previews.length,2); assert.equal(runPreviewExpected,false);
+    await el('#rule-form .editor-footer [data-close]').click();
+    const replacement = {...account,auth_id:a.auth_id,auth_index:a.auth_index,email:'replacement@example.test',models:['replacement-only-model']};
+    const bound = {...rules[0],id:'bound-route',name:'固定来源验证',target_scope:'single',target_group:'',auth_id:a.auth_id,
+      provider:a.provider,target_auth_index:a.auth_index,target_object_type:'provider',object_types:['oauth','provider'],authorized_groups:[]};
+    rules.push(bound);
+    directory=[replacement,account,b]; resultsOffline=false;
+    await el('#refresh').click();
+    const boundCard=el('[data-key="rule:bound-route"] .quality-rule-scope');
+    await boundCard.waitFor();
+    const scopeLabel=await boundCard.innerText();
+    assert.match(scopeLabel,/供应商路由.*north-a.*idx-A.*原绑定待核实/);
+    assert.doesNotMatch(scopeLabel,/replacement@example/);
+    await el('#rule-search').fill(replacement.email);
+    assert.equal(await boundCard.count(),0,'A different source entered the saved-rule search index');
+    await el('#rule-search').fill('');
+    await el('[data-rule-edit="bound-route"]').click();
+    const option=el('#rule-target option:checked');
+    assert.match(await option.innerText(),/供应商路由.*north-a.*idx-A.*原绑定待核实/);
+    assert(await option.evaluate(o=>o.disabled));
+    assert.equal(await option.getAttribute('data-kind'),'provider');
+    await directoryCount(0,0);
+    assert.equal(await el('#rule-model-catalog option[value="replacement-only-model"]').count(),0);
+    assert.equal(writes.length,7); assert.equal(batches.length,2);
+    if (out) await el('#rule-dialog').screenshot({path:path.join(out,'bound-origin.png')});
+    await el('#rule-target').selectOption(account.auth_id);
+    assert.equal(await option.getAttribute('data-kind'),'oauth');
+    assert(!(await option.evaluate(o=>o.disabled)));
+    await directoryCount(1,0);
+    await save();
+    assert.equal(writes.length,8);
+    assert.equal(writes.at(-1).auth_id,account.auth_id);
+    assert.equal(writes.at(-1).target_auth_index,account.auth_index);
+    assert.equal(writes.at(-1).expected_target_object_type,'oauth');
+    assert.equal(batches.length,2); assert.equal(previews.length,2);
+    await el('[data-rule-edit="bound-route"]').click();
+    await el('#rule-name').fill('仅修改名称');
+    await save();
+    assert.equal(writes.length,9);
+    assert.equal(writes.at(-1).expected_target_object_type,undefined);
+    const savedCount=rules.length;
+    await el('#rule-new').click();
+    await el('#rule-name').fill('新规则来源冲突');
+    await el('#rule-object-provider').check(); await chooseScope('#rule-scope-single');
+    await el('#rule-target').selectOption(b.auth_id);
+    directory=directory.map(t=>t===b?{...replacement,auth_id:b.auth_id,auth_index:b.auth_index}:t);
+    await el('#rule-form button[type=submit]').click();
+    await visible('#rule-dialog',/来源、提供方或索引/);
+    assert.equal(writes.length,10); assert.equal(writes.at(-1).expected_target_object_type,'provider');
+    assert.equal(rules.length,savedCount); assert.equal(batches.length,2); assert.equal(previews.length,2);
     assert.deepEqual(errors,[]); assert.deepEqual(unexpected,[]);
     const hashes = {};
     for (const [name,checksum] of assets) hashes[name]=await checksum;
@@ -247,7 +302,9 @@ async function main() {
     const version = JSON.parse(await el('#build-info').textContent()).ui_version;
     if (out) await fs.writeFile(path.join(out,'rule-objects.json'),JSON.stringify({ui_version:version,ui_source_sha256:hashes,previews:previews.length,saved:writes,dispatched:batches.length,
       model_calls:0,editor_scope_previews:0,dispatch_scope_previews:previews.length,layouts,directory_checks:directoryChecks,shortcut_order:shortcuts,legacy_models:legacyModels,legacy_parameters:legacyParameters,
-      empty_selection_rejected:true,verified_group_authorization:true,unknown_directory_save:true},null,2)+'\n');
+      empty_selection_rejected:true,verified_group_authorization:true,unknown_directory_save:true,fixed_origin_replacement:{scope_label:scopeLabel,
+        replacement_selected:false,replacement_model_offered:false,explicit_other_binding_saved:true,ordinary_rename_preserved:true,
+        draft_changed_before_post_rejected:true}},null,2)+'\n');
     console.log('Local rule directory counts, zero editor scope previews, model shortcuts, legacy edits, dispatch previews, batch receipts and three responsive layouts passed.');
   } finally { await browser?.close(); host.kill(); await exited; }
 }
