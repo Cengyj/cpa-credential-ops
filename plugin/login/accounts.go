@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/gob"
 	"errors"
-	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -17,6 +16,7 @@ import (
 // Account contains management metadata. Its full email is populated only for a
 // response; stored records retain the complete plaintext account material.
 type Account struct {
+	BindingReadError         string `json:"binding_read_error,omitempty"`
 	PendingUploadJobID       string `json:"pending_upload_job_id,omitempty"`
 	PlanType                 string `json:"plan_type"`
 	SecurityPending          bool   `json:"security_pending"`
@@ -152,7 +152,7 @@ func (s *Service) accountStorageFailure() error {
 	return errors.New("storage_unavailable")
 }
 func (s *Service) saveAccountLocked(a storedAccount) error {
-	a.View.Email, a.View.CredentialsError = "", ""
+	a.View.Email, a.View.CredentialsError, a.View.BindingReadError, a.View.PendingUploadJobID = "", "", "", ""
 	a.View.EffectiveProxyURL, a.View.ProxySource, a.View.ProxyError = "", "", ""
 	a.View.LastJobErrorCode, a.View.LastJobErrorStage, a.View.LastJobErrorReason = "", "", ""
 	a.View.LastJobCreatedAt, a.View.LastJobPhase, a.View.LastJobIntent = "", "", ""
@@ -188,35 +188,15 @@ func validateAccountCredentials(c Credentials) (Credentials, error) {
 	}
 	return DecodeCredentials(r)
 }
-func (s *Service) Accounts() ([]Account, error) {
-	s.accountMu.Lock()
-	defer s.accountMu.Unlock()
-	if err := s.accountReady(); err != nil {
-		return nil, err
-	}
-	if err := s.syncAccountJobsLocked(); err != nil {
-		return nil, err
-	}
-	return s.accountViewsLocked(""), nil
-}
-func (s *Service) accountViewsLocked(id string) []Account {
-	out := []Account{}
-	for key, a := range s.accounts {
-		if id == "" || id == key {
-			out = append(out, s.accountView(a))
-		}
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
-	return out
-}
+func (s *Service) Accounts() ([]Account, error) { return s.accountList("") }
 
-func (s *Service) accountView(a storedAccount) Account {
+func (s *Service) accountMetadata(a storedAccount, job Job, pending string) Account {
 	v := a.View
-	v.PlanType = s.accountPlanType(a)
-	var proxyErr error
-	v.EffectiveProxyURL, v.ProxySource, proxyErr = s.effectiveLoginProxy(v.ProxyURL, v.AuthID)
-	v.ProxyError = SafeCode(proxyErr)
-	job := s.visibleAccountJob(v.ID, v.LastJobID)
+	if job.ID != "" && !publicJobDiagnostics(job) {
+		// The account remains readable even when its attached history cannot
+		// supply reliable diagnostics. No stored job or permission is changed.
+		job = Job{ID: job.ID, Status: "unknown", ErrorCode: "storage_unavailable"}
+	}
 	v.LastJobID, v.LastJobStatus = job.ID, job.Status
 	v.LastJobCreatedAt, v.LastJobAutomatic = job.CreatedAt, job.Automatic
 	v.LastJobPhase, v.LastJobIntent = job.Phase, job.Intent
@@ -224,14 +204,7 @@ func (s *Service) accountView(a storedAccount) Account {
 	v.LastJobAutoCommit, v.LastJobCredentialEnabled = job.AutoCommit, job.CredentialEnabled
 	v.LastJobAction, v.LastJobSecurityStatus = job.Action, job.SecurityStatus
 	if terminal(job.Status) && !a.View.SecurityPending {
-		s.mu.Lock()
-		for _, pending := range s.jobs {
-			if pending.record.View.AccountID == v.ID && pending.record.View.Status == "awaiting_commit" {
-				v.PendingUploadJobID = pending.record.View.ID
-				break
-			}
-		}
-		s.mu.Unlock()
+		v.PendingUploadJobID = pending
 	}
 	v.LastJobTOTPReset, v.LastJobDevicesLoggedOut = job.TOTPReset, job.DevicesLoggedOut
 	c, err := s.accountCredentials(a)
@@ -363,6 +336,9 @@ func (s *Service) accountOperationBusyLocked(a storedAccount, allowPendingUpload
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if lease := s.activeConversion; lease != nil && lease.matches(a.Credentials.Email, a.WorkspaceID, a.Principal) {
+		return true
+	}
 	for _, j := range s.jobs {
 		v := j.record.View
 		if v.AccountID != a.View.ID || j.record.HistoryDeleted {
@@ -541,6 +517,9 @@ func (s *Service) StartAccount(id string, revision uint64, targetAuthID string) 
 }
 
 func (s *Service) startManualAccount(id string, revision uint64, targetAuthID string, upload bool) (Job, error) {
+	return s.startManualAccountCommand(id, revision, targetAuthID, upload, "")
+}
+func (s *Service) startManualAccountCommand(id string, revision uint64, targetAuthID string, upload bool, commandID string) (Job, error) {
 	s.accountMu.Lock()
 	defer s.accountMu.Unlock()
 	if err := s.accountReady(); err != nil {
@@ -559,12 +538,12 @@ func (s *Service) startManualAccount(id string, revision uint64, targetAuthID st
 	if a.View.AuthID != "" && targetAuthID != "" && targetAuthID != a.View.AuthID {
 		return Job{}, errors.New("identity_conflict")
 	}
-	return s.startAccountOperationLocked(a, targetAuthID, false, "", "", false, false, upload)
+	return s.startAccountOperationLocked(a, targetAuthID, false, "", "", false, false, upload, commandID)
 }
 func (s *Service) startAccountLocked(a storedAccount, target string, automatic bool, evidence string) (Job, error) {
-	return s.startAccountOperationLocked(a, target, automatic, evidence, "", false, false, true)
+	return s.startAccountOperationLocked(a, target, automatic, evidence, "", false, false, true, "")
 }
-func (s *Service) startAccountOperationLocked(a storedAccount, target string, automatic bool, evidence, action string, logoutAll, reauthorize, upload bool) (Job, error) {
+func (s *Service) startAccountOperationLocked(a storedAccount, target string, automatic bool, evidence, action string, logoutAll, reauthorize, upload bool, commandID string) (Job, error) {
 	manualLogin := !automatic && action == ""
 	if s.accountOperationBusyLocked(a, manualLogin) {
 		return Job{}, errors.New("conflict")
@@ -573,7 +552,7 @@ func (s *Service) startAccountOperationLocked(a storedAccount, target string, au
 	if err != nil {
 		return Job{}, err
 	}
-	r := StartRequest{securityAction: action, logoutAllDevices: logoutAll, reauthorize: reauthorize, ConsumerPlugin: "model-quality", Method: "password_totp", Intent: "import", Credentials: c, ProxyURL: a.View.ProxyURL, accountID: a.View.ID, automatic: automatic, autoEvidence: evidence, autoCommit: upload, enableCredential: action == "" || reauthorize}
+	r := StartRequest{commandID: commandID, securityAction: action, logoutAllDevices: logoutAll, reauthorize: reauthorize, ConsumerPlugin: "model-quality", Method: "password_totp", Intent: "import", Credentials: c, ProxyURL: a.View.ProxyURL, accountID: a.View.ID, automatic: automatic, autoEvidence: evidence, autoCommit: upload, enableCredential: action == "" || reauthorize}
 	r.accountSequence = a.View.Revision
 	if action != "" || manualLogin && (target == "" || target == a.View.AuthID) {
 		r.workspaceID = a.WorkspaceID
@@ -634,22 +613,30 @@ func (s *Service) startAccountOperationLocked(a storedAccount, target string, au
 
 func (s *Service) syncAccountJobsLocked() error {
 	s.mu.Lock()
-	adopted := map[string]storedJob{}
-	latest := map[string]storedJob{}
-	for id, j := range s.jobs {
-		adopted[id] = j.record
-		accountID := j.record.View.AccountID
-		previous, exists := latest[accountID]
-		if accountID != "" && (!exists || newerAccountJob(j.record, previous)) {
-			latest[accountID] = j.record
+	latest := make(map[string]*session, len(s.accounts))
+	for _, j := range s.jobs {
+		id := j.record.View.AccountID
+		if id == "" {
+			continue
+		}
+		current := latest[id]
+		if current == nil || newerAccountJob(&j.record, &current.record) {
+			latest[id] = j
+		}
+	}
+	records := make(map[string]storedJob, len(latest))
+	for id, a := range s.accounts {
+		current, candidate := s.jobs[a.View.LastJobID], latest[id]
+		if candidate != nil && (current == nil || newerAccountJob(&candidate.record, &current.record)) {
+			current = candidate
+		}
+		if current != nil {
+			records[id] = current.record
 		}
 	}
 	s.mu.Unlock()
-	for id, a := range s.accounts {
-		record := adopted[a.View.LastJobID]
-		if candidate, exists := latest[id]; exists && (record.View.ID == "" || newerAccountJob(candidate, record)) {
-			record = candidate
-		}
+	for id, record := range records {
+		a := s.accounts[id]
 		job := record.View
 		sameJob := job.ID == a.View.LastJobID && job.Status == a.View.LastJobStatus
 		if job.ID == "" || sameJob && (a.BindingRetryAt.IsZero() || s.opts.Now().Before(a.BindingRetryAt)) {
@@ -676,7 +663,7 @@ func (s *Service) syncAccountJobsLocked() error {
 		if job.Status == "committed" {
 			snapshot, principal, _, err := s.opts.Manager.LoginBinding(job.TargetAuthID)
 			switch {
-			case err != nil && SafeCode(err) == "storage_unavailable":
+			case err != nil && SafeCode(err) == "cpa_credential_unavailable":
 				a.BindingRetryAt = s.opts.Now().Add(15 * time.Second)
 				a.View.HealthStatus, a.View.HealthReason = "unknown", "login_target_unavailable"
 			case err != nil || snapshot.IdentityVersion != record.AdoptedIdentity || snapshot.Principal != record.AdoptedPrincipal:
@@ -727,7 +714,7 @@ func (s *Service) syncAccountJobsLocked() error {
 	return nil
 }
 
-func newerAccountJob(candidate, previous storedJob) bool {
+func newerAccountJob(candidate, previous *storedJob) bool {
 	return candidate.AccountSequence > previous.AccountSequence ||
 		candidate.AccountSequence == previous.AccountSequence && candidate.Created.After(previous.Created)
 }
@@ -742,30 +729,45 @@ func (s *Service) checkAccountRepair(a storedAccount, evidence string) error {
 	return nil
 }
 func (s *Service) InspectAccounts(id string) ([]Account, error) {
+	ids, err := s.inspectionSelection(id)
+	if err != nil {
+		return nil, err
+	}
 	s.accountMu.Lock()
-	defer s.accountMu.Unlock()
-	if err := s.accountReady(); err != nil {
+	err = s.syncAccountJobsLocked()
+	s.accountMu.Unlock()
+	if err != nil {
 		return nil, err
 	}
-	if id != "" {
-		if _, ok := s.accounts[id]; !ok {
-			return nil, errors.New("not_found")
-		}
-	}
-	if err := s.syncAccountJobsLocked(); err != nil {
-		return nil, err
-	}
-	for key, a := range s.accounts {
-		if id != "" && id != key {
-			continue
-		}
-		if err := s.inspectAccountLocked(a, false); err != nil {
+	for _, key := range ids {
+		if err := s.inspectSelectedAccount(key); err != nil {
 			return nil, err
 		}
 	}
-	return s.accountViewsLocked(id), nil
+	return s.accountList(id)
 }
+
+func (s *Service) inspectSelectedAccount(id string) error {
+	s.accountMu.Lock()
+	defer s.accountMu.Unlock()
+	if err := s.accountReady(); err != nil {
+		return err
+	}
+	a, ok := s.accounts[id]
+	if !ok {
+		return errors.New("not_found")
+	}
+	return s.inspectAccountLocked(a, false)
+}
+
 func (s *Service) inspectAccountLocked(a storedAccount, automatic bool) error {
+	current, ok := s.accounts[a.View.ID]
+	if !ok {
+		return errors.New("not_found")
+	}
+	if current.View.Revision != a.View.Revision {
+		return errors.New("conflict")
+	}
 	if !a.BindingRetryAt.IsZero() {
 		return nil
 	}
@@ -780,7 +782,21 @@ func (s *Service) inspectAccountLocked(a storedAccount, automatic bool) error {
 		a.View.HealthStatus = "not_linked"
 		a.View.HealthReason = "login_required"
 	} else {
+		// SDK reads may take arbitrarily long. Only the account revision that
+		// requested this observation can consume its health evidence.
+		s.accountMu.Unlock()
 		health, err := s.opts.Manager.LoginHealth(a.View.AuthID)
+		s.accountMu.Lock()
+		if e := s.accountReady(); e != nil {
+			return e
+		}
+		current, ok := s.accounts[a.View.ID]
+		if !ok {
+			return errors.New("not_found")
+		}
+		if current.View.Revision != a.View.Revision {
+			return errors.New("conflict")
+		}
 		if err != nil && SafeCode(err) != "not_found" {
 			a.View.HealthStatus = "unknown"
 			a.View.HealthReason = SafeCode(err)
@@ -813,7 +829,7 @@ func (s *Service) inspectAccountLocked(a storedAccount, automatic bool) error {
 			a.View.HealthReason = SafeCode(err)
 			a.NextAttempt = now.Add(time.Hour)
 			retry := err.Error() == "queue_full" || err.Error() == "rate_limited" || err.Error() == "conflict"
-			if a.View.LastJobID == previous && SafeCode(err) == "storage_unavailable" && s.accountReady() == nil {
+			if a.View.LastJobID == previous && (SafeCode(err) == "cpa_credential_unavailable" || SafeCode(err) == "storage_unavailable") && s.accountReady() == nil {
 				// Admission never recorded a job. Retry the read at a later
 				// inspection and recheck the current global and account permits.
 				retry = true
@@ -843,8 +859,13 @@ func (s *Service) maintainAccounts() {
 	now := s.opts.Now()
 	for _, a := range s.accounts {
 		if a.View.LastJobID != "" {
-			job, err := s.Detail(a.View.LastJobID)
-			if err == nil && job.Automatic && !terminal(job.Status) && job.Status != "committing" && (!s.accountAutomation.Load() || !a.View.AutoRelogin) {
+			s.mu.Lock()
+			var job Job
+			if j := s.jobs[a.View.LastJobID]; j != nil {
+				job = j.record.View
+			}
+			s.mu.Unlock()
+			if job.Automatic && !terminal(job.Status) && job.Status != "committing" && (!s.accountAutomation.Load() || !a.View.AutoRelogin) {
 				_, _ = s.Cancel(job.ID, true)
 
 			}

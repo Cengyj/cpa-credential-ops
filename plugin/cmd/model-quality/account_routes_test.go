@@ -10,6 +10,8 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"testing"
+	"testing/synctest"
+	"time"
 
 	"github.com/cliproxyapi-plugins/model-quality/login"
 	"github.com/cliproxyapi-plugins/model-quality/quality"
@@ -25,6 +27,70 @@ func TestBundledAccountRoutes(t *testing.T) {
 		if !seen["POST /v0/management/plugins/model-quality"+path] {
 			t.Errorf("missing account route %s", path)
 		}
+	}
+}
+
+func TestWorkspaceReadsAndRepeatedShutdownDrainBackgroundServices(t *testing.T) {
+	directory := t.TempDir()
+	for range 3 {
+		// A bubble fails if an owned goroutine remains blocked after Close.
+		synctest.Test(t, func(t *testing.T) {
+			cfg := quality.DefaultConfig()
+			cfg.DataDir = directory
+			starts := 0
+			var host engineRuntime
+			config := runtimeConfig{settings: cfg}
+			factory := func() (runtimeEngine, error) {
+				starts++
+				client := quality.RuntimeManagementClient("http://127.0.0.1:18379")
+				callback := func(method string, _, _ any) error {
+					t.Errorf("unexpected SDK call %s", method)
+					return errors.New("unexpected offline callback")
+				}
+				engine, err := quality.New(cfg, &quality.NativeHost{Call: callback, Management: client})
+				if err != nil {
+					return nil, err
+				}
+				accounts, err := login.New(login.Options{Dir: filepath.Join(directory, "accounts"), Call: callback})
+				if err != nil {
+					return nil, errors.Join(err, engine.Close())
+				}
+				client.Start(directory, "")
+				return &connectedApplication{runtimeEngine: &application{quality: engine, login: accounts}, management: client}, nil
+			}
+			if err := host.configure(config, false, factory); err != nil {
+				t.Fatal(err)
+			}
+			defer func() {
+				if err := host.close(); err != nil {
+					t.Error(err)
+				}
+			}()
+			for range 4 {
+				for _, path := range []string{"/login/accounts", "/connection", "/settings", "/rules"} {
+					instance, release, err := host.acquire()
+					if err != nil {
+						t.Fatal(err)
+					}
+					result := instance.engine.Handle(instance.ctx, pluginapi.ManagementRequest{Method: http.MethodGet, Path: "/v0/management/plugins/model-quality" + path})
+					release()
+					if result.StatusCode != http.StatusOK {
+						t.Fatalf("GET %s returned %d", path, result.StatusCode)
+					}
+				}
+				if err := host.configure(config, true, factory); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if starts != 1 {
+				t.Fatalf("reads and ordinary reconfiguration started %d services", starts)
+			}
+			if err := host.close(); err != nil {
+				t.Fatal(err)
+			}
+			time.Sleep(3 * time.Minute)
+			synctest.Wait()
+		})
 	}
 }
 

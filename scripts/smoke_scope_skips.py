@@ -44,7 +44,7 @@ def verify_scope_skips(prefix, request, restart, root, targets, recorded_calls, 
             raise AssertionError(('catalog observation did not complete', receipt))
         time.sleep(.1)
     before = current_rule()
-    restart()
+    restart_states = restart(await_management=True)
     deadline = time.monotonic() + 30
     while True:
         try:
@@ -59,6 +59,7 @@ def verify_scope_skips(prefix, request, restart, root, targets, recorded_calls, 
         'plugin_version': package['plugin_version'], 'host_version': package['host_version'],
         'package_sha256': package['checksums'][f"model-quality-v{package['plugin_version']}-linux-arm64.zip"],
         'network': 'none', 'model': model, 'receipt': receipt, 'rule_before_restart': before, 'rule_after_restart': after,
+        'restart_authorization_states': restart_states,
         'targets': [{k: target[k] for k in ('auth_id', 'email', 'provider', 'manual_disabled')} for target in targets],
         'runs_after_restart': rows['total'], 'fake_model_calls': len(recorded_calls()), 'cpa_writes': mutation_log(),
         'credential_hashes_unchanged': hashes == credential_hashes(), 'live_account_calls': 0,

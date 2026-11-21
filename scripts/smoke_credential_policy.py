@@ -158,7 +158,7 @@ def main(package, output, interrupt_status=False, upstream_errors=False, scope_s
                     fixture_args.append('--business-tls')
                 docker('run', '-d', '--pull=never', '--name', mock, '--network', 'container:' + name, '--mount', f'type=bind,source={root},target=/probe', CURL, 'python3', '-u', '/probe/fake.py', *fixture_args)
 
-            def restart_with_fixture(recreate_after=None):
+            def restart_with_fixture(recreate_after=None, *, await_management=False):
                 docker('rm', '-f', mock)
                 if recreate_after is None:
                     docker('restart', name)
@@ -170,6 +170,29 @@ def main(package, output, interrupt_status=False, upstream_errors=False, scope_s
                     time.sleep(max(0, recreate_after - time.time()))
                     start_host()
                 start_fixture()
+                if await_management:
+                    # The plugin can serve local queries while its verifier is
+                    # waiting for the restarted loopback relay. Observe the
+                    # saved revision before issuing a management-dependent command.
+                    deadline = time.monotonic() + 30
+                    states = []
+                    status = {}
+                    while time.monotonic() < deadline:
+                        try:
+                            status = request(PREFIX + '/connection')
+                        except (subprocess.CalledProcessError, ValueError):
+                            time.sleep(.2)
+                            continue
+                        state = status.get('state')
+                        if not states or states[-1] != state:
+                            states.append(state)
+                        if state == 'ready':
+                            assert status['source'] == 'saved' and status['revision'] == configured['revision']
+                            return states
+                        if state not in ('waiting', 'rate_limited', 'restricted'):
+                            raise AssertionError(('persisted management authorization did not load', state, status.get('code')))
+                        time.sleep(.2)
+                    raise AssertionError(('loopback authorization did not recover', states, status.get('code')))
 
             start_fixture()
             if interrupt_status:

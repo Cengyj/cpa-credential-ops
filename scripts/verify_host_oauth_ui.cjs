@@ -47,7 +47,7 @@ const responses = {
         if (url.pathname === '/management.html') return route.fulfill({ contentType: 'text/html', body: host });
         if (url.pathname.startsWith(resource)) {
           const name = url.pathname.slice(resource.length);
-          if (['index.html', 'login.js', 'app.js', 'view.js', 'client.js', 'style.css'].includes(name)) {
+          if (require('../plugin/ui/public_assets.json').includes(name)) {
             const type = name.endsWith('.js') ? 'text/javascript' : name.endsWith('.css') ? 'text/css' : 'text/html';
             return route.fulfill({ contentType: type, path: path.join(process.argv[2], name) });
           }

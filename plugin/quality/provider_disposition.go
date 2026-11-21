@@ -27,9 +27,8 @@ func groupGuard(records map[string]*CredentialDisposition, t Target) *Credential
 // A group enablement is observed as one local transition. Check the complete
 // current group independently of the old recovery plan. Unmatched historical
 // routes keep their records; they never grant new members recovery authority.
-func (en *Engine) observeEnabledProviderGroupLocked(ctx context.Context, targets []Target, old *CredentialDisposition) error {
-	h, ok := en.host.(managedHost)
-	if !ok || !en.Capabilities().ManagementSession {
+func (en *Engine) observeEnabledProviderGroupLocked(ctx context.Context, targets []Target, old *CredentialDisposition, read snapshotReader) error {
+	if read == nil || !en.Capabilities().ManagementSession {
 		return errors.New("management_session_required: background management connection is not ready")
 	}
 	byID := make(map[string]Target, len(targets))
@@ -43,7 +42,7 @@ func (en *Engine) observeEnabledProviderGroupLocked(ctx context.Context, targets
 	if !present || !anchor.identityVerified || anchor.identityConflict || !ruleSubjectEnabled(anchor) {
 		return errors.New("blocked: current provider group identity cannot be verified")
 	}
-	current, err := h.CredentialSnapshot(ctx, anchor.AuthID, anchor.AuthIndex)
+	current, err := read(ctx, anchor.AuthID, anchor.AuthIndex)
 	if err != nil {
 		return err
 	}
@@ -62,7 +61,7 @@ func (en *Engine) observeEnabledProviderGroupLocked(ctx context.Context, targets
 			t.QualityPaused || t.RetainedPause || en.localPause(RunConfig{AuthID: id}) != "" || t.ProviderGroupID != current.ProviderGroupID {
 			return errors.New("blocked: current provider group enablement cannot be verified for every current member")
 		}
-		s, err := h.CredentialSnapshot(ctx, id, t.AuthIndex)
+		s, err := read(ctx, id, t.AuthIndex)
 		if err != nil {
 			return err
 		}

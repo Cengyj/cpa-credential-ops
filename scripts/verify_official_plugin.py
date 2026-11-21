@@ -270,7 +270,7 @@ def exercise(base, output):
     for path in ["/v8/management/plugins/model-quality/settings", "/v8/management/credential-logins/capabilities"]:
         require(request(base, path)[0] == 404, f"official host unexpectedly exposes patched endpoint {path}")
     static = {}
-    for name in ["index.html", "app.js", "client.js", "view.js", "style.css", "login.js"]:
+    for name in json.loads((ROOT / "plugin/ui/public_assets.json").read_text()):
         status, _, raw, headers = request(base, "/v0/resource/plugins/model-quality/" + name, authenticated=False)
         require(status == 200 and len(raw) > 0, f"embedded UI resource missing: {name}")
         static[name] = {"sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw), "content_type": headers.get("Content-Type")}

@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"slices"
 	"sort"
 	"sync"
 )
@@ -43,11 +42,18 @@ func (en *Engine) dispatchWithInventory(ctx context.Context, id string, revision
 }
 
 func (en *Engine) dispatchOccurrence(ctx context.Context, id string, revision uint64, scheduled bool, inventory func(context.Context) ([]Target, error), occurrence *scheduledRule) (ruleDispatch, error) {
+	return en.dispatchRulePlan(ctx, id, revision, scheduled, inventory, occurrence, nil)
+}
+
+func (en *Engine) dispatchRulePlan(ctx context.Context, id string, revision uint64, scheduled bool, inventory func(context.Context) ([]Target, error), occurrence *scheduledRule, command *ruleCommandRecord) (ruleDispatch, error) {
 	en.mu.Lock()
 	defer en.mu.Unlock()
 	var result ruleDispatch
 	if err := en.mutableLocked(); err != nil {
 		return result, err
+	}
+	if reserved := en.commandAdmissions[id]; reserved != "" && (command == nil || reserved != command.Key) {
+		return result, fmt.Errorf("conflict: rule admission already accepted")
 	}
 	generation := en.scheduleGeneration
 	if occurrence != nil && occurrence.generation != generation {
@@ -59,6 +65,18 @@ func (en *Engine) dispatchOccurrence(ctx context.Context, id string, revision ui
 	}
 	if (revision != 0 || scheduled || dynamicScope(rule.TargetScope)) && revision != rule.Revision {
 		return result, fmt.Errorf("conflict: stale rule revision")
+	}
+	var manualOccurrence *scheduledRule
+	if !scheduled && occurrence == nil && ruleScheduled(rule) && en.timerAllowed(rule) && !rule.NextRun.IsZero() {
+		now := en.now()
+		due := !rule.NextRun.After(now)
+		if due || rule.PendingSchedule != nil {
+			manualOccurrence = &scheduledRule{id: rule.ID, revision: rule.Revision, generation: generation, due: rule.NextRun, checked: now, catchup: !rule.NextRun.After(en.loadedAt), remainder: !due}
+			if !due {
+				manualOccurrence.due = rule.PendingSchedule.Due
+				manualOccurrence.catchup = true
+			}
+		}
 	}
 	if occurrence != nil {
 		if !occurrence.current(rule) || !ruleScheduled(rule) || !en.timerAllowed(rule) {
@@ -81,13 +99,15 @@ func (en *Engine) dispatchOccurrence(ctx context.Context, id string, revision ui
 	}
 	if !dynamicScope(rule.TargetScope) && en.Capabilities().QualityPause {
 		if en.terminalDependencyLocked(rule.RunConfig) {
-			return result, nil
+			ch := changes()
+			ch.ruleCommand = completedDispatch(command, result)
+			return result, en.commitLocked(ch)
 		}
 		var schedRev uint64
 		if scheduled {
 			schedRev = revision
 		}
-		r, err := en.submitLocked(ctx, RunConfig{}, id, schedRev, inventory, occurrence)
+		r, err := en.submitLocked(ctx, RunConfig{}, id, schedRev, inventory, occurrence, command)
 		if err == nil {
 			result.RunID = r.ID
 			if r.SkipDetail != nil {
@@ -114,57 +134,39 @@ func (en *Engine) dispatchOccurrence(ctx context.Context, id string, revision ui
 	if scheduled && generation != en.scheduleGeneration {
 		return ruleDispatch{}, fmt.Errorf("blocked: scheduled permission was revoked during directory verification")
 	}
-	var unfinished *pendingRuleSchedule
-	if occurrence != nil {
-		current := en.rules[id]
-		if current == nil || current.Revision != revision || !occurrence.current(current) || !en.timerAllowed(current) || !ruleScheduled(current) {
-			return ruleDispatch{}, fmt.Errorf("conflict: scheduled occurrence changed during directory verification")
-		}
-		if !dynamicScope(current.TargetScope) && slices.ContainsFunc(result.SkipDetails, func(detail ScopeSkipDetail) bool {
-			return detail.Code == "credential_update_pending"
-		}) {
-			return ruleDispatch{}, fmt.Errorf("conflict: credential authorization changed during directory verification")
-		}
-		capability := en.Capabilities()
-		managementDown := capability.CredentialManagement && !capability.ManagementSession
-		missingManagement := managedRule(current) || scopeNeedsProviderDirectory(current, seen) || slices.ContainsFunc(result.SkipDetails, func(detail ScopeSkipDetail) bool {
-			return detail.Code == "management_session_required"
-		})
-		var rejection *scopeRejection
-		if errors.As(err, &rejection) && rejection.detail.Code == "management_session_required" {
-			missingManagement = true
-		}
-		if errors.Is(err, errScopeDirectoryUnavailable) || err == nil && !result.Verified || managementDown && missingManagement {
-			if result.Reason == "" {
-				result.Reason = sessionSkip().Reason
-			}
-			if err != nil || occurrence.remainder || !allowsPartialSchedule(current) {
-				en.deferOccurrenceLocked(current, occurrence, result.Reason, managementDown && missingManagement)
-				return result, nil
-			}
-			unfinished = &pendingRuleSchedule{Due: occurrence.due}
-			matches = slices.DeleteFunc(matches, func(m scopeMatch) bool { return m.target.IsProvider || m.snapshot != nil })
-			result.RecoveryCount = 0
-			if len(matches) == 0 {
-				// A new SDK-only member may arrive while management is down.
-				// Retry inventory with backoff without consuming this occurrence.
-				en.deferOccurrenceLocked(current, occurrence, result.Reason, false)
-				return result, nil
-			}
-		}
-		if occurrence.remainder && err == nil {
-			matches = result.omitAccepted(matches, current.PendingSchedule.Accepted)
-		}
-	}
-	if err != nil {
-		return result, err
-	}
 	rule = en.rules[id]
 	if rule == nil || rule.Revision != plan.Revision {
 		return ruleDispatch{}, fmt.Errorf("conflict: stale rule revision")
 	}
+	covered := occurrence
+	if covered == nil && manualOccurrence != nil && en.scheduleGeneration == generation && manualOccurrence.current(rule) && ruleScheduled(rule) && en.timerAllowed(rule) {
+		covered = manualOccurrence
+	}
+	if occurrence != nil && (!occurrence.current(rule) || !en.timerAllowed(rule) || !ruleScheduled(rule)) {
+		return ruleDispatch{}, fmt.Errorf("conflict: scheduled occurrence changed during directory verification")
+	}
+	if err != nil {
+		var rejection *scopeRejection
+		missingManagement := errors.As(err, &rejection) && rejection.detail.Code == "management_session_required"
+		if occurrence != nil && (errors.Is(err, errScopeDirectoryUnavailable) || missingManagement) {
+			en.deferOccurrenceLocked(rule, occurrence, result.Reason, missingManagement)
+			return result, nil
+		}
+		return result, err
+	}
 	if err := en.checkScopeLocked(rule, scheduled); err != nil {
 		return result, err
+	}
+	var step scopeScheduleStep
+	if covered != nil {
+		matches, step = en.scopeScheduleLocked(rule, covered, &result, matches, seen)
+		if step.deferScan {
+			en.deferOccurrenceLocked(rule, covered, result.Reason, false)
+			result.Count = 0
+			ch := changes()
+			ch.ruleCommand = completedDispatch(command, result)
+			return result, en.commitLocked(ch)
+		}
 	}
 	base := cloneConfig(rule.RunConfig)
 	if err := en.validateConfig(&base, dynamicScope(rule.TargetScope) || rule.TargetGroup != ""); err != nil {
@@ -192,8 +194,12 @@ func (en *Engine) dispatchOccurrence(ctx context.Context, id string, revision ui
 		en.compactQueueLocked()
 	}
 	full := workers > 0 && (len(en.queue) >= cap(en.queue) || pending+workers > maxScopePending)
-	if full && unfinished != nil {
-		en.deferOccurrenceLocked(rule, occurrence, queueSkip().Reason, false)
+	if full && step.pending != nil {
+		en.deferOccurrenceLocked(rule, covered, queueSkip().Reason, false)
+		if !scheduled {
+			return result, fmt.Errorf("queue_full: rule dispatch capacity exhausted")
+		}
+		result.Count = 0
 		return result, nil
 	}
 	var ids []string
@@ -233,15 +239,15 @@ func (en *Engine) dispatchOccurrence(ctx context.Context, id string, revision ui
 		}
 		ch.runs[run.ID] = run
 		ids = append(ids, run.ID)
-		if unfinished != nil {
-			unfinished.Accepted = append(unfinished.Accepted, run.Config.AuthID)
+		if step.pending != nil {
+			step.pending.Accepted = append(step.pending.Accepted, run.Config.AuthID)
 		}
 	}
 	var manualSkips []string
 	for i := range result.SkipDetails {
 		detail := &result.SkipDetails[i]
 		t := seen[detail.AuthID]
-		if unfinished != nil && (t.IsProvider || detail.Code == "provider_directory_unavailable" || detail.Code == "management_session_required") {
+		if covered != nil && step.waitsFor(*detail) {
 			detail.NotExecuted = true
 			continue
 		}
@@ -253,6 +259,9 @@ func (en *Engine) dispatchOccurrence(ctx context.Context, id string, revision ui
 		run := newScopedRun(plan, t, config, q, batch, scheduled, now, nil)
 		markDispatchSkip(run, detail, now)
 		ch.runs[run.ID] = run
+		if step.pending != nil {
+			step.pending.Accepted = append(step.pending.Accepted, run.Config.AuthID)
+		}
 		if detail.Code == "manual_disabled" {
 			manualSkips = append(manualSkips, t.AuthID)
 		}
@@ -280,10 +289,12 @@ func (en *Engine) dispatchOccurrence(ctx context.Context, id string, revision ui
 		next.LastScopeBatch, result.BatchID = batch, batch
 	}
 	ch.rules[id] = next
-	if occurrence != nil {
-		next.PendingSchedule = unfinished
+	if covered != nil && (scheduled || !full) {
+		// An explicit run and a timer can cover the same occurrence. Persist
+		// admitted members, outstanding prerequisites and its cursor together.
+		next.PendingSchedule = step.pending
+		en.consumeOccurrence(ch, next, covered)
 	}
-	en.consumeOccurrence(ch, next, occurrence)
 	if !dynamicScope(plan.TargetScope) {
 		for _, target := range seen {
 			if (target.QualityPaused || target.RetainedPause) && usesCredential(plan.RunConfig, target.AuthID) {
@@ -295,10 +306,14 @@ func (en *Engine) dispatchOccurrence(ctx context.Context, id string, revision ui
 	if err := ctx.Err(); err != nil {
 		return ruleDispatch{}, err
 	}
+	if result.RunID != "" && rule.TargetScope == "" && len(ids) == 1 {
+		result.BatchID = ""
+	}
+	ch.ruleCommand = completedDispatch(command, result)
 	if err = en.commitLocked(ch); err != nil {
 		return ruleDispatch{}, err
 	}
-	if occurrence != nil {
+	if covered != nil {
 		delete(en.scheduleRetry, id)
 	}
 	if len(ids) > 0 {
@@ -320,27 +335,7 @@ func (en *Engine) dispatchOccurrence(ctx context.Context, id string, revision ui
 			en.persistFailure(err)
 		}
 	}
-	if result.RunID != "" && rule.TargetScope == "" && len(ids) == 1 {
-		result.BatchID = ""
-	}
 	return result, nil
-}
-
-// Skip subjects already accepted for this occurrence even if their runs were
-// interrupted, completed, or removed from history while management was offline.
-func (d *ruleDispatch) omitAccepted(matches []scopeMatch, ids []string) []scopeMatch {
-	accepted := make(map[string]bool, len(ids))
-	for _, id := range ids {
-		accepted[id] = true
-	}
-	d.SkipDetails = slices.DeleteFunc(d.SkipDetails, func(detail ScopeSkipDetail) bool { return accepted[detail.AuthID] })
-	d.Skipped = len(d.SkipDetails)
-	return slices.DeleteFunc(matches, func(m scopeMatch) bool {
-		if accepted[m.target.AuthID] && m.recovery {
-			d.RecoveryCount--
-		}
-		return accepted[m.target.AuthID]
-	})
 }
 
 func (en *Engine) checkScopeLocked(rule *Rule, scheduled bool) error {
@@ -412,7 +407,15 @@ func (en *Engine) readScopeProfiles(ctx context.Context, rule *Rule, targets []T
 			en.mu.Lock()
 			live := en.managed[t.AuthID]
 			changed := live != d || disabledObject(t) && errorPolicyDisabled(live).Code != "" || en.localPause(RunConfig{AuthID: t.AuthID}) != "" || groupTargetBlocked(en.managed, t) && !activeDisposition(live)
+			bindings := rule.RunConfig
+			bindings.AuthID = t.AuthID
+			hold := en.loginWaitLocked(bindings)
 			en.mu.Unlock()
+			if hold != nil {
+				code, reason := hold.reason()
+				profiles[i].err = rejectScope("blocked: credential authorization is changing", code, reason)
+				return
+			}
 			if changed {
 				profiles[i].err = rejectScope("blocked: credential ownership changed during scan", "ownership_changed", "等待读取期间凭证处置归属已变更。")
 				return
@@ -461,6 +464,9 @@ func (en *Engine) visibleTargets(ctx context.Context) ([]Target, error) {
 		coverage = &providerInventoryStatus{Verified: true}
 		ctx = context.WithValue(ctx, providerInventoryStatusKey{}, coverage)
 	}
+	en.mu.Lock()
+	ctx = en.inventoryContextLocked(ctx)
+	en.mu.Unlock()
 	targets, err := en.host.Targets(ctx)
 	if err != nil {
 		return nil, err
@@ -470,7 +476,7 @@ func (en *Engine) visibleTargets(ctx context.Context) ([]Target, error) {
 	if err := en.observeMissingEntriesLocked(ctx, targets, coverage.Verified); err != nil {
 		return nil, err
 	}
-	failures := en.reconcileCurrentTargetsLocked(ctx, targets, nil)
+	failures := en.reconcileDirectoryLocked(ctx, targets, nil)
 	out := append([]Target(nil), targets...)
 	for i := range out {
 		if failure := failures[out[i].AuthID]; failure != nil {

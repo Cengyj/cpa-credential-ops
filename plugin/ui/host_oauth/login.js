@@ -30,6 +30,7 @@ export function createLoginWorkbench({ request, connected }) {
   }
 
   return {
+    entryResource: '/login/capabilities',
     open({ focus = true } = {}) {
       if (focus) title.focus({ preventScroll: true });
       if (open || !connected()) return;

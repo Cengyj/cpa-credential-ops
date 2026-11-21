@@ -8,14 +8,18 @@ import (
 
 type excludedCredentialIDs struct{}
 
-// Inventory must include suspended entries so every normal refresh can observe
-// CPA enablement. Suppression applies to model execution, never state reads.
-func (en *Engine) inventoryContextLocked(ctx context.Context) context.Context { return ctx }
-
 // Reconcile confirmed ordinary suspensions against current CPA state before
 // applying scope or recovery policy. Unknown writes and independent pauses stay
 // protected; an observation never writes a credential or starts a model call.
 func (en *Engine) reconcileCurrentTargetsLocked(ctx context.Context, targets []Target, ids []string) map[string]error {
+	var read snapshotReader
+	if h, ok := en.host.(managedHost); ok {
+		read = h.CredentialSnapshot
+	}
+	return en.reconcileUsingLocked(ctx, targets, ids, read)
+}
+
+func (en *Engine) reconcileUsingLocked(ctx context.Context, targets []Target, ids []string, read snapshotReader) map[string]error {
 	failures := make(map[string]error)
 	for _, t := range targets {
 		if ids != nil && !contains(ids, t.AuthID) {
@@ -29,18 +33,17 @@ func (en *Engine) reconcileCurrentTargetsLocked(ctx context.Context, targets []T
 			failures[t.AuthID] = rejectScope("blocked: current CPA identity cannot be verified", "identity_conflict", "CPA 当前对象身份或运行状态无法核实，请检查目录连接。")
 			continue
 		}
-		h, ok := en.host.(managedHost)
-		if !ok || t.IsProvider && !en.Capabilities().ManagementSession {
+		if read == nil || t.IsProvider && !en.Capabilities().ManagementSession {
 			failures[t.AuthID] = &scopeRejection{"management_session_required: background management connection is not ready", sessionSkip()}
 			continue
 		}
 		if d.Snapshot.ProviderMechanism == "group_disabled" {
-			if err := en.observeEnabledProviderGroupLocked(ctx, targets, d); err != nil {
+			if err := en.observeEnabledProviderGroupLocked(ctx, targets, d, read); err != nil {
 				failures[t.AuthID] = err
 			}
 			continue
 		}
-		snapshot, err := h.CredentialSnapshot(ctx, t.AuthID, t.AuthIndex)
+		snapshot, err := read(ctx, t.AuthID, t.AuthIndex)
 		if err == nil && snapshot.Disabled {
 			err = &scopeRejection{"blocked: credential runtime and snapshot disagree", snapshotRuntimeConflict(t, true)}
 		}
@@ -67,9 +70,9 @@ func (en *Engine) observeMissingEntriesLocked(ctx context.Context, targets []Tar
 		}
 	}
 	var files []*CredentialDisposition
-	confirmed := make(map[string]bool)
+	confirmed := make(map[string]*CredentialDisposition)
 	for id, d := range en.managed {
-		if d.State != "disabled" || present[id] || d.Snapshot.AuthID == "" || d.Snapshot.AuthIndex == "" {
+		if !en.currentDirectoryAuthority(ctx, id) || d.State != "disabled" || present[id] || d.Snapshot.AuthID == "" || d.Snapshot.AuthIndex == "" {
 			continue
 		}
 		if d.Snapshot.ProviderMechanism != "" {
@@ -77,7 +80,9 @@ func (en *Engine) observeMissingEntriesLocked(ctx context.Context, targets []Tar
 			// Retain the old source while the configured group remains disabled
 			// or unverified; absence alone must not turn it into a recoverable
 			// manual disable. This does not transfer ownership to a new ID.
-			confirmed[id] = providersVerified && !unresolvedGroups[d.Snapshot.ProviderGroupID]
+			if providersVerified && !unresolvedGroups[d.Snapshot.ProviderGroupID] {
+				confirmed[id] = d
+			}
 		} else {
 			files = append(files, d)
 		}
@@ -85,16 +90,25 @@ func (en *Engine) observeMissingEntriesLocked(ctx context.Context, targets []Tar
 	if h, ok := en.host.(interface {
 		removedCredentials(context.Context, []*CredentialDisposition, int) ([]*CredentialDisposition, error)
 	}); ok && en.Capabilities().ManagementSession && len(files) != 0 {
-		removed, err := h.removedCredentials(ctx, files, max(1, en.cfg.Workers))
+		workers := max(1, en.cfg.Workers)
+		en.mu.Unlock()
+		removed, err := h.removedCredentials(ctx, files, workers)
+		en.mu.Lock()
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := en.mutableLocked(); err != nil {
+			return err
+		}
 		if err == nil {
 			for _, d := range removed {
-				confirmed[d.AuthID] = true
+				confirmed[d.AuthID] = d
 			}
 		}
 	}
 	update := changes()
-	for id := range confirmed {
-		if !confirmed[id] {
+	for id, expected := range confirmed {
+		if en.managed[id] != expected || !en.currentDirectoryAuthority(ctx, id) {
 			continue
 		}
 		d := en.managed[id]
@@ -152,7 +166,7 @@ func (en *Engine) frozenDispositionLocked(f Frozen) error {
 	return nil
 }
 
-func (en *Engine) currentManualAccountLocked(ctx context.Context, c RunConfig, targets []Target) (string, error) {
+func (en *Engine) currentManualAccount(ctx context.Context, c RunConfig, targets []Target) (string, error) {
 	for _, t := range targets {
 		if t.AuthID != c.AuthID {
 			continue

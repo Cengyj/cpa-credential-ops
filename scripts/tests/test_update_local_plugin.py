@@ -184,7 +184,8 @@ class LocalUpdateTests(unittest.TestCase):
         (self.package / 'model-quality.so').write_bytes(b'new-library')
         ui = self.root / 'plugin/ui'
         ui.mkdir(parents=True)
-        self.assets = {name: ('synthetic asset ' + name).encode() for name in update.NAMES}
+        legacy_names = ('index.html', 'app.js', 'client.js', 'view.js', 'login.js', 'style.css')
+        self.assets = {name: ('synthetic asset ' + name).encode() for name in legacy_names}
         for name, value in self.assets.items():
             (ui / name).write_bytes(value)
         quality_source = self.root / 'plugin/quality'
@@ -285,7 +286,7 @@ class LocalUpdateTests(unittest.TestCase):
         self.assertEqual(report['status'], 'passed')
         self.assertTrue(report['all_public_assets_revalidated'])
         self.assertCountEqual(self.conditional_requests, [
-            (name, tag) for name in update.NAMES for tag in (f'W/"{update.digest(self.assets[name])}"', '"stale-resource"')
+            (name, tag) for name in self.assets for tag in (f'W/"{update.digest(self.assets[name])}"', '"stale-resource"')
         ])
         self.assertEqual(report['database_count_before'], 3)
         self.assertEqual(len(report['persistent_state']['database_comparisons']), 3)
@@ -552,6 +553,18 @@ class LocalUpdateTests(unittest.TestCase):
         self.assertFalse(self.runtime_file.exists())
         self.assertEqual(self.old_library.read_bytes(), b'previous-library')
         self.assertIn('data files disappeared', json.loads(self.report.read_text())['failure_reason'])
+
+    def test_changed_private_authorization_is_not_reported_as_preserved(self):
+        record = self.runtime / 'plugin-data/model-quality/management/connection.json'
+        record.parent.mkdir(mode=0o700)
+        record.write_bytes(b'synthetic initial authorization')
+        self.on_start = lambda: record.write_bytes(b'synthetic changed authorization')
+        with self.assertRaises(RuntimeError):
+            self.invoke()
+        report = json.loads(self.report.read_text())
+        self.assertEqual(report['persistent_state']['existing_non_database_files_changed'], 1)
+        self.assertEqual(report['status'], 'failed_rolled_back')
+        self.assertEqual(record.read_bytes(), b'synthetic changed authorization')
 
     def test_added_runtime_files_are_reported_and_preserved(self):
         added = self.runtime_file.with_name('new-runtime.bin')

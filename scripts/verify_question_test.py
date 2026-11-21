@@ -24,7 +24,7 @@ ROOT = Path(__file__).resolve().parents[1]
 OUTPUT = ROOT / "artifacts/host-alignment-4.3.0"
 PLUGIN_VERSION = re.search(r'const Version = "([^\"]+)"', (ROOT / "plugin/quality/types.go").read_text()).group(1)
 UI_VERSION = re.search(r'"ui_version":"([^\"]+)"', (ROOT / "plugin/ui/index.html").read_text()).group(1)
-UI_NAMES = ("index.html", "app.js", "client.js", "view.js", "style.css")
+UI_NAMES = json.loads((ROOT / "plugin/ui/public_assets.json").read_text())
 API_PREFIX = "/v8/management/plugins/model-quality"
 
 
@@ -155,7 +155,7 @@ def main():
             served[name] = hashlib.sha256(data).hexdigest()
             require(served[name] == report["input_sha256"]["plugin/ui/" + name], f"served {name} differs from source")
         report["served_ui_sha256"] = served
-        passed(f"native plugin {PLUGIN_VERSION} loads and serves all five UI {UI_VERSION} resources byte-identical to source")
+        passed(f"native plugin {PLUGIN_VERSION} loads and serves all {len(UI_NAMES)} UI {UI_VERSION} resources byte-identical to source")
 
         client.request(base + API_PREFIX + "/targets", expected=401)
         targets = api("/targets")["items"]

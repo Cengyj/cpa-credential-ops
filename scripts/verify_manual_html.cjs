@@ -8,7 +8,7 @@ const { createInterface } = require('node:readline');
 const { createHash } = require('node:crypto');
 const { chromium } = require(process.env.PLAYWRIGHT_MODULE || '/Users/ceng/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules/playwright');
 
-const sourceHashes = async () => Object.fromEntries(await Promise.all(['index.html', 'app.js', 'view.js', 'style.css', 'client.js', 'login.js'].map(async name => [name, createHash('sha256').update(await fs.readFile(path.join(__dirname, '../plugin/ui', name))).digest('hex')])));
+const sourceHashes = async () => Object.fromEntries(await Promise.all(require('../plugin/ui/public_assets.json').map(async name => [name, createHash('sha256').update(await fs.readFile(path.join(__dirname, '../plugin/ui', name))).digest('hex')])));
 
 const partialHTML = '<!doctype html><html><body><svg viewBox="0 0 240 160"><circle cx="120" cy="80" r="50" fill="#22604a"/></svg><!--' + 'Synthetic partial HTML. '.repeat(90);
 const completeHTML = partialHTML + '--></body></html>';

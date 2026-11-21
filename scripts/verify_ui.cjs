@@ -10,7 +10,7 @@ const { chromium } = require(
 const root = path.resolve(__dirname, '..');
 const output = process.env.UI_VERIFY_OUTPUT || path.join(root, 'artifacts/verification');
 const uiSource = process.env.UI_SOURCE_DIR || path.join(root, 'plugin/ui');
-const sourceHashes = () => Object.fromEntries(['index.html', 'app.js', 'client.js', 'view.js', 'login.js', 'style.css'].map((name) => [name, require('node:crypto').createHash('sha256').update(fs.readFileSync(path.join(uiSource, name))).digest('hex')]));
+const sourceHashes = () => Object.fromEntries(require('../plugin/ui/public_assets.json').map((name) => [name, require('node:crypto').createHash('sha256').update(fs.readFileSync(path.join(uiSource, name))).digest('hex')]));
 const initialSourceHashes = sourceHashes();
 fs.mkdirSync(output, { recursive: true });
 const calls = [];
@@ -130,7 +130,7 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://localhost');
   if (!url.pathname.startsWith('/v8/management/')) {
     const asset = url.pathname.split('/').pop() || 'index.html';
-    if (!['index.html', 'app.js', 'client.js', 'view.js', 'login.js', 'style.css'].includes(asset)) {
+    if (!require('../plugin/ui/public_assets.json').includes(asset)) {
       res.writeHead(404).end();
       return;
     }

@@ -1,5 +1,9 @@
 # 官方插件账号与密钥持久化
 
+0.32.1 源码在既有账号命令记录中增加操作路径与任务关联，在质量规则的待补周期记录中增加分支等待信息。新增字段随相应操作写入。旧账号命令只有能核对到原任务才返回其 ID，历史未知保护继续生效。升级前停止 CPA，完整备份原数据卷与插件；若升级后产生了新命令或部分派发，须先核对这些记录，旧版无法解释新的分支信息。仅替换二进制或单独还原一个 bbolt 库都不足以证明可以安全重发。备份及回滚步骤见[服务与数据契约](SERVICE_LIFECYCLE_0_32_CN.md)。
+
+0.32.0 的新增命令收据、启动恢复及回退条件见[服务生命周期与数据卷](SERVICE_LIFECYCLE_0_32_CN.md)。
+
 插件 0.15.0 将账号、代理、登录任务和巡检设置保存到**插件自己的数据目录**。按照用户要求使用明文，不需要加密密钥、加密初始化或数据迁移。关闭浏览器不会丢失已保存内容；CPA 重启后从同一目录恢复。
 
 ## 保存位置
@@ -81,6 +85,18 @@ model-quality:management-key:/v0/management/plugins/model-quality
 备份前正常停止 CPA，成套备份 CPA 配置、整个插件 `data_dir` 和 CPA 凭证目录；保留相应插件版本与构建摘要。不要只备份动态库。恢复时保持原路径或同步修改配置，恢复 `0700`/`0600` 权限，再启动核对账号和设置。
 
 未决提交收据需随账号库一起保留，不能删除收据来解除不确定状态。数据库逻辑删除不是磁盘安全擦除，旧备份中可能仍有原内容。
+
+## 0.32.2 质量库启动检查与冷备恢复
+
+首次安装可以创建 `quality.db`。具有有效 bbolt 头、仅完成文件初始化且从未另行提交写事务的空库也可初始化。已经存在的零字节文件会触发 `incomplete quality store: existing file is empty`。有提交历史却已清空所有桶的数据库也会被拒绝。如果误挂全新卷，插件只能看到新库，容器重建前须先核对原卷与 `data_dir`。标有 schema 1 的旧库继续按已有迁移升级。schema 2 要求 `meta/schema` 和 `meta`、`runs`、`rules`、`audit`、`usage`、`idempotency`、`presets` 七个桶完整。[启动检查与迁移](../plugin/quality/store.go) · [空库和缺桶回归](../plugin/quality/store_open_test.go)
+
+规则命令收据和待派发索引按使用情况建立，创建桶和写入标记共用一个 bbolt 事务。旧库只含规则创建收据时可以没有待派发索引。无标记旧库已有命令收据时，插件核对现有收据和索引，再保存标记。已有标记或运行收据证实桶应存在时，缺桶会阻止启动。若旧卷同时丢失无标记的可选桶和全部相关证据，须结合冷备查明历史。查看不到一条收据不足以证明某次外部操作从未发生。[收据和索引实现](../plugin/quality/rule_commands.go) · [旧库组合回归](../plugin/quality/rule_command_buckets_test.go)
+
+出现 `incomplete quality store` 时按以下顺序处理。
+
+1. 从 CPA 已鉴权的 `GET /v8/management/plugins` 查看 `model-quality`。若配置已启用但 `registered=false`，核对宿主的 `plugin.register failed` 诊断及其指出的缺项。此时插件管理路由可返回 404。
+2. 停止 CPA，保全当前卷，查明挂载是否正确。需要恢复时使用同一时间点的插件数据、CPA 配置和凭证冷备，保留对应插件二进制及摘要。备份之后若发生凭证保存、启停或账号安全操作，先保留相关证据并核对 CPA 或远端结果。手工补空桶或降级会让查询把丢失的收据误报为从未受理。
+3. 按原挂载和权限启动，用登记接口核对版本与 `effective_enabled=true`，再读取规则和原命令收据。官方 CPA 8.0.76 隔离夹具分别验证缺少 `idempotency` 的测试卷与零字节文件，两次失败时原文件字节均得到保留。恢复停机时保存的完好测试库后，同版插件重新注册，规则和连接状态均返回 200。[缺桶冷备恢复实测](../artifacts/verification-commercial-rounds/final/qa-quality-store-new.json) · [零字节卷冷备恢复实测](../artifacts/verification-commercial-rounds/final/qa-quality-zero-new.json)
 
 ## 本机实例已完成的升级
 

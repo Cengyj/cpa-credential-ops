@@ -53,18 +53,26 @@ func NormalizeLoginProxy(raw string) (string, error) {
 }
 
 func (s *Service) effectiveLoginProxy(override, targetID string) (string, string, error) {
-	value, source := strings.TrimSpace(override), "account"
-	if value == "" {
-		value, _ = s.loginProxy.Load().(string)
-		source = "login_default"
-	}
-	if value == "" && targetID != "" {
+	value, _ := s.loginProxy.Load().(string)
+	var bound string
+	if strings.TrimSpace(override) == "" && value == "" && targetID != "" {
 		if target, ok := s.opts.Manager.GetByID(targetID); ok {
-			value, source = target.ProxyURL, "credential"
+			bound = target.ProxyURL
 		}
 	}
+	return displayLoginProxy(override, value, bound, s.opts.Config.ProxyURL)
+}
+
+func displayLoginProxy(override, defaultProxy, bound, cpaProxy string) (string, string, error) {
+	value, source := strings.TrimSpace(override), "account"
 	if value == "" {
-		value, source = s.opts.Config.ProxyURL, "cpa"
+		value, source = defaultProxy, "login_default"
+	}
+	if value == "" {
+		value, source = bound, "credential"
+	}
+	if value == "" {
+		value, source = cpaProxy, "cpa"
 	}
 	if strings.TrimSpace(value) == "" {
 		value, source = "direct", "direct"
@@ -73,5 +81,5 @@ func (s *Service) effectiveLoginProxy(override, targetID string) (string, string
 	if err != nil {
 		return value, source, err
 	}
-	return normalized, source, err
+	return normalized, source, nil
 }

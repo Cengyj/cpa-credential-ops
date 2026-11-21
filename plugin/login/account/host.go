@@ -17,6 +17,9 @@ import (
 )
 
 type Callback func(string, any, any) error
+
+var errCredentialSDKUnavailable = errors.New("cpa_credential_unavailable")
+
 type Auth struct {
 	ID, Index, Provider, FileName, ProxyURL string
 	Metadata                                map[string]any
@@ -104,7 +107,7 @@ func (m *Manager) invoke(method string, in, out any) error {
 		return errors.New("plugin_unavailable")
 	}
 	if e := m.call(method, in, out); e != nil {
-		return errors.New("storage_unavailable")
+		return errCredentialSDKUnavailable
 	}
 	return nil
 }
@@ -114,7 +117,7 @@ func (m *Manager) entries() ([]Entry, error) {
 	}
 	e := m.invoke("host.auth.list", struct{}{}, &r)
 	if e == nil && r.Files == nil {
-		e = errors.New("storage_unavailable")
+		e = errCredentialSDKUnavailable
 	}
 	return r.Files, e
 }
@@ -349,7 +352,7 @@ func (m *Manager) LoginCommitStatus(id string) (LoginCommitResult, error) {
 			return errors.New("not_found")
 		}
 		v := ojson.ParseBytes(b)
-		r = LoginCommitResult{CommitID: v.Get("commit_id").String(), AuthID: v.Get("auth_id").String(), AuthIndex: v.Get("auth_index").String(), Name: v.Get("name").String(), IdentityVersion: v.Get("identity_version").String(), Principal: v.Get("principal").String(), State: v.Get("state").String(), CredentialEnabled: v.Get("credential_enabled").Bool()}
+		r = LoginCommitResult{CommandRef: v.Get("command_ref").String(), CommitID: v.Get("commit_id").String(), AuthID: v.Get("auth_id").String(), AuthIndex: v.Get("auth_index").String(), Name: v.Get("name").String(), IdentityVersion: v.Get("identity_version").String(), Principal: v.Get("principal").String(), State: v.Get("state").String(), CredentialEnabled: v.Get("credential_enabled").Bool()}
 		if !ojson.ValidBytes(b) || r.CommitID != id || r.State == "" {
 			return errors.New("storage_unavailable")
 		}
@@ -380,13 +383,13 @@ func (m *Manager) VerifyLoginReceipt(r LoginCommitResult) error {
 		provider = live.Auth.Type
 	}
 	if live.Auth.ID == "" || live.Auth.Index == "" || live.Auth.Status == "" {
-		return errors.New("storage_unavailable")
+		return errCredentialSDKUnavailable
 	}
 	if live.Auth.ID != actual.ID || live.Auth.Index != actual.Index || provider != actual.Provider {
 		return errors.New("identity_conflict")
 	}
 	if runtimeDisabled := live.Auth.Disabled || live.Auth.Status == "disabled"; runtimeDisabled != actual.Disabled {
-		return errors.New("storage_unavailable")
+		return errCredentialSDKUnavailable
 	}
 	return nil
 }

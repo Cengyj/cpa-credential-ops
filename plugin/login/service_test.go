@@ -423,7 +423,7 @@ func TestCandidateFailsClosedWhenExistingCodexCannotBeRead(t *testing.T) {
 		t.Fatal(e)
 	}
 	finished := waitLogin(t, s, j.ID, "failed")
-	if finished.ErrorCode != "storage_unavailable" || h.saves != 0 {
+	if finished.ErrorCode != "cpa_credential_unavailable" || h.saves != 0 {
 		t.Fatal("unreadable credential became absence evidence")
 	}
 }

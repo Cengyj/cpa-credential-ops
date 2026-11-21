@@ -52,10 +52,10 @@ export class ManagementClient {
   async requestHostLogin(path, method = 'GET', body, idempotencyKey) {
     const allowed = {
       '/capabilities': ['GET'], '/targets': ['GET'],
-      '/jobs': ['GET', 'DELETE'], '/detail': ['GET'], '/logs': ['GET'], '/candidate': ['GET'],
+      '/jobs': ['GET', 'DELETE'], '/commands': ['GET'], '/detail': ['GET'], '/logs': ['GET'], '/candidate': ['GET'],
       '/callback': ['POST'], '/cancel': ['POST'], '/commit': ['POST'], '/discard': ['POST'],
       '/vault/status': ['GET'],
-      '/accounts': ['GET'], '/accounts/detail': ['GET'], '/accounts/import': ['POST'], '/accounts/entry': ['PUT', 'DELETE'],
+      '/batches': ['GET'], '/batches/cancel': ['POST'], '/accounts': ['GET'], '/accounts/detail': ['GET'], '/accounts/import': ['POST'], '/accounts/entry': ['PUT', 'DELETE'],
       '/accounts/security': ['POST'], '/accounts/security/complete': ['POST'],
       '/conversion/preview': ['POST'], '/conversion/upload': ['POST'],
       '/accounts/start': ['POST'], '/accounts/inspect': ['POST'], '/accounts/settings': ['GET', 'PUT'],
@@ -116,6 +116,7 @@ export class ManagementClient {
     const readTimer = method === 'GET' ? setTimeout(() => { readTimedOut = true; controller.abort(); }, 15000) : null;
     const headers = { Authorization: `Bearer ${this.#key}`, Accept: 'application/json' };
     if (idempotencyKey) headers['Idempotency-Key'] = idempotencyKey;
+    if (method === 'POST' && prefix === this.prefix + '/login' && ['/conversion/upload', '/accounts/inspect'].includes(path)) headers.Prefer = 'respond-async';
     if (body !== undefined) headers['Content-Type'] = 'application/json';
     try {
       const response = await fetch(`${prefix}${path}`, {

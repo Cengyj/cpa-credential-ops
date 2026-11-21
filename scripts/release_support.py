@@ -6,7 +6,8 @@ import os
 import re
 
 ROOT = Path(__file__).resolve().parents[1]
-UI_NAMES = ('index.html', 'app.js', 'client.js', 'view.js', 'login.js', 'style.css')
+LEGACY_UI_NAMES = ('index.html', 'app.js', 'client.js', 'view.js', 'login.js', 'style.css')
+UI_NAMES = tuple(json.loads((ROOT / 'plugin/ui/public_assets.json').read_text()))
 
 
 def digest(path):
@@ -18,7 +19,8 @@ def validate_package_ui(manifest, root):
     if not isinstance(version, str) or not re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', version):
         raise ValueError('invalid plugin version in build manifest')
     assets = manifest['ui_source_sha256']
-    if set(assets) != set(UI_NAMES) or not all(isinstance(v, str) and re.fullmatch(r'[0-9a-f]{64}', v) for v in assets.values()):
+    names = UI_NAMES if tuple(map(int, version.split('.'))) >= (0, 32, 0) else LEGACY_UI_NAMES
+    if set(assets) != set(names) or not all(isinstance(v, str) and re.fullmatch(r'[0-9a-f]{64}', v) for v in assets.values()):
         raise ValueError('invalid public asset inventory in build manifest')
     checkout = re.search(r'^const Version = "([^"]+)"$', (root / 'plugin/quality/types.go').read_text(), re.M)
     if not checkout:
@@ -32,7 +34,7 @@ def validate_package_ui(manifest, root):
 
 
 def verify_public_assets(assets, revalidates, get):
-    for name in UI_NAMES:
+    for name in assets:
         path = '/v0/resource/plugins/model-quality/' + name
         expected = assets[name]
         policy = 'private, no-cache' if revalidates else 'no-store'
@@ -54,15 +56,21 @@ def verify_public_assets(assets, revalidates, get):
 
 
 def source_candidates(directory, excluded_dirs):
-    # A custom volume can be anywhere under a source tree. Reserve only the
-    # backend record and its atomic-write temporaries under a management folder.
-    excluded_dirs = excluded_dirs | {'model-quality-data'}
+    # A custom data volume can live inside a source checkout. Never traverse
+    # recognized runtime stores, including partial backups of account security receipts.
+    excluded_dirs = excluded_dirs | {'model-quality-data', 'auths', 'plugin-data', 'logs'}
     if directory.name in excluded_dirs:
         return
     for parent, dirs, names in os.walk(directory):
         dirs[:] = [name for name in dirs if name not in excluded_dirs]
         parent = Path(parent)
+        if {'quality.db', 'credential-login.db', 'login-receipts.db'}.intersection(names) or (
+                parent.name == 'security' and parent.parent.name == 'accounts'):
+            dirs.clear()
+            continue
         for name in names:
+            if name == 'config.yaml':
+                continue
             if parent.name == 'management' and (name == 'connection.json' or name.startswith('.connection-')):
                 continue
             yield parent / name

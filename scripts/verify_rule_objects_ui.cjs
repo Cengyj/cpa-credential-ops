@@ -27,7 +27,7 @@ async function main() {
     const unknown = {...account,auth_id:'uncertain',object_type:'unknown'};
     let directory = [account,a,b,c,unknown], catalogOK = true, partial = false, revision = 1, runPreviewExpected = false, resultsOffline = false;
     const rules = [], previews = [], writes = [], batches = [], unexpected = [], errors = [], layouts = [], assets = new Map();
-    const names = ['index.html','style.css','app.js','view.js','client.js','login.js'];
+    const names = require('../plugin/ui/public_assets.json');
     page.on('response', response => {
       const url = new URL(response.url()), name = path.basename(url.pathname) || 'index.html';
       if (url.origin === base.origin && names.includes(name)) assets.set(name,response.body().then(body => createHash('sha256').update(body).digest('hex')));

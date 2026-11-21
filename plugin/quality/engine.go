@@ -14,38 +14,41 @@ import (
 )
 
 type Engine struct {
-	loginHolds      map[string]*credentialLoginHold
-	loginGeneration uint64
-	managed         map[string]*CredentialDisposition
-	mu              sync.Mutex
-	store           *Store
-	host            Host
-	cfg             Config
-	runs            map[string]*Run
-	rules           map[string]*Rule
-	timers          map[string]bool
-	active          map[string]context.CancelFunc
-	busyAuth        map[string]struct{}
-	queue           chan string
-	scopeBatches    map[string][]string
-	finishedRules   map[string]bool
-	roundRemaining  map[string]int
-	roundEnded      chan struct{}
-	scanning        map[string]bool
-	snapshotSlots   chan struct{}
-	events          chan UsageEvent
-	dropped         atomic.Uint64
-	ctx             context.Context
-	cancel          context.CancelFunc
-	wg              sync.WaitGroup
-	closed          bool
-	closeDone       chan struct{}
-	closeErr        error
-	queueChanged    chan struct{}
-	fault           error
-	now             func() time.Time
-	budget          Budget
-	budgetPending   map[string]int
+	commandAdmissions map[string]string
+	summary           metricsProjection
+	directory         directoryPages
+	loginHolds        map[string]*credentialLoginHold
+	loginGeneration   uint64
+	managed           map[string]*CredentialDisposition
+	mu                sync.Mutex
+	store             *Store
+	host              Host
+	cfg               Config
+	runs              map[string]*Run
+	rules             map[string]*Rule
+	timers            map[string]bool
+	active            map[string]context.CancelFunc
+	busyAuth          map[string]struct{}
+	queue             chan string
+	scopeBatches      map[string][]string
+	finishedRules     map[string]bool
+	roundRemaining    map[string]int
+	roundEnded        chan struct{}
+	scanning          map[string]bool
+	snapshotSlots     chan struct{}
+	events            chan UsageEvent
+	dropped           atomic.Uint64
+	ctx               context.Context
+	cancel            context.CancelFunc
+	wg                sync.WaitGroup
+	closed            bool
+	closeDone         chan struct{}
+	closeErr          error
+	queueChanged      chan struct{}
+	fault             error
+	now               func() time.Time
+	budget            Budget
+	budgetPending     map[string]int
 
 	// In-flight scans and captured ticks never cross an instance-wide revocation.
 	scheduleGeneration uint64
@@ -90,6 +93,9 @@ func New(c Config, h Host) (*Engine, error) {
 }
 func (en *Engine) load() error {
 	en.loadedAt = en.now()
+	if err := en.interruptRuleCommands(); err != nil {
+		return err
+	}
 	previousProviders, err := en.previousProviderSetting()
 	if err != nil {
 		return err

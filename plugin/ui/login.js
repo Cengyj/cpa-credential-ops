@@ -1,5 +1,7 @@
+import { CommandReceipts, commandStatus, commandFinished, commandSlot, receiptLine, notAccepted } from './commands.js';
+import { createConversion } from './conversion.js';
 import { escapeHTML, date } from './view.js';
-import { isDiscarded } from './client.js';
+import { DiscardedRequest, isDiscarded } from './client.js';
 
 const labels = {
   queued: '排队中', running: '登录中', waiting_browser: '等待浏览器授权', exchanging: '兑换授权',
@@ -171,10 +173,19 @@ function saveWorkflowPreference(workflow, choices) {
 }
 
 // Authentication inputs remain in this workbench only until its request is sent.
-export function createLoginWorkbench({ request, connected, visible = () => !document.hidden && navigator.onLine !== false, onCommitted }) {
+export function createLoginWorkbench({ request, connected, visible = () => !document.hidden && navigator.onLine !== false, onCommitted, onFreshness }) {
   const $ = id => document.getElementById(id);
-  const state = { open: false, epoch: 0, capabilities: null, targets: [], jobs: [], selected: '', job: null, candidate: null, vault: null, timer: null, busy: new Set(), urls: new Map(), detailSignature: '', storageRead: 0, detailRead: 0, jobsRead: 0, view: 'accounts', accounts: [], accountSettings: null, accountRead: 0, accountsAvailable: false, accountSignature: '', accountEditing: null, accountStarting: '', accountDetailFailed: false, settingsDirty: false, settingsDraftRevision: null, accountDetailRead: 0, accountDetailLoading: false, accountQuery: '', accountFilter: 'all', accountPage: 0, jobSignature: '', revealJob: false, accountsLoaded: false, jobsAvailable: false, bootstrapReady: false, readErrors: new Map(), nextReadAt: 0, readFailures: 0 };
-  const get = path => request(path);
+  const state = { open: false, epoch: 0, capabilities: null, targets: [], jobs: [], selected: '', job: null, candidate: null, vault: null, timer: null, busy: new Set(), detailSignature: '', storageRead: 0, detailRead: 0, jobsRead: 0, view: 'accounts', accounts: [], accountSettings: null, accountRead: 0, accountsAvailable: false, accountSignature: '', accountEditing: null, accountStarting: '', accountDetailFailed: false, settingsDirty: false, settingsDraftRevision: null, accountDetailRead: 0, accountDetailLoading: false, accountQuery: '', accountFilter: 'all', accountPage: 0, jobSignature: '', revealJob: false, accountsLoaded: false, jobsAvailable: false, bootstrapReady: false, readErrors: new Map(), nextReadAt: 0, readFailures: 0 };
+  let displayReadDeferred = false;
+  function canReadDisplay() {
+    if (!state.open || !connected()) return false;
+    if (visible()) return true;
+    displayReadDeferred = true;
+    return false;
+  }
+  // Recheck at dispatch because another read in the same poll may have
+  // finished after the host hid the iframe or the browser hid the tab.
+  const get = path => canReadDisplay() ? request(path) : Promise.reject(new DiscardedRequest());
   let snapshotReads = new Map();
   function snapshotRead(path) {
     if (snapshotReads.has(path)) return snapshotReads.get(path);
@@ -188,7 +199,7 @@ export function createLoginWorkbench({ request, connected, visible = () => !docu
     state.nextReadAt = 0;
     snapshotReads.clear();
   }
-  const write = async (path, body, method = 'POST') => {
+  const write = async (path, body, method = 'POST', id = key()) => {
     if (navigator.onLine === false) {
       const error = new Error('The management connection is offline.');
       error.code = 'management_offline';
@@ -196,7 +207,7 @@ export function createLoginWorkbench({ request, connected, visible = () => !docu
     }
     const session = snapshotReads;
     invalidateSnapshot();
-    try { return await request(path, method, body, key()); }
+    try { return await request(path, method, body, id); }
     finally { if (snapshotReads === session) invalidateSnapshot(); }
   };
   const current = epoch => state.open && state.epoch === epoch && connected();
@@ -204,6 +215,7 @@ export function createLoginWorkbench({ request, connected, visible = () => !docu
   const localStorageReady = vault => vault.available !== false && vault.initialized === true && vault.storage_mode === 'plaintext';
   const storageMessage = vault => vault.available === false ? messageFor(vault.reason || 'vault_unavailable') : '当前 CPA 不支持保存账号资料，请更新后重试。';
   let loading = false;
+  let jobSummaryStale = false;
   let refreshCycle = null;
   let accountLogCycle = null;
   const accountLogs = { account: '', scope: 'current', selected: '', query: '', filter: 'all', follow: true, cache: new Map(), read: 0, loading: false, error: '', updated: '', signature: '', row: null, jobs: [], hasMore: false };
@@ -222,230 +234,139 @@ export function createLoginWorkbench({ request, connected, visible = () => !docu
   let securitySubmissionUncertain = false;
   let securityRecoveryJob = '';
   let securityRecoveryCompletable = false;
-  const convertEl = name => $('account-convert-' + name);
-  const convertLimit = 2 * 1024 * 1024;
-  const conversion = { items: [], source: '', fileName: '', busy: '', sequence: 0 };
-  const retryableConversion = new Set(['cpa_plan_excluded', 'security_pending', 'quality_authority_unavailable', 'plugin_unavailable', 'cancelled']);
-  const conversionMessages = {
-    conversion_invalid_json: 'JSON 无效、字段重复或内容过大，请检查导出文件。', conversion_unsupported_format: '未识别到 sub2api 账号或凭证，请使用包含 credentials 的导出 JSON。',
-    conversion_unsupported_version: '不支持此导出版本。', conversion_account_limit: '每次支持 1–100 个账号。', conversion_unsupported_provider: '仅支持 OpenAI / Codex。', conversion_unsupported_type: '仅支持 OAuth 凭证，不支持 API Key 或 Cookie。',
-    conversion_missing_access_token: '缺少 access_token。', conversion_missing_account_id: '缺少 ChatGPT 账号 ID，token 中也未找到。', conversion_invalid_token: 'Token 格式无效，无法解析账号信息。', conversion_invalid_expiry: '凭证有效期格式无效。', conversion_expired_without_refresh: 'Access token 已过期且没有 refresh_token。',
-    invalid_credentials: '凭证字段格式不正确。', duplicate_identity: '此账号已有凭证，未覆盖或重复上传。', identity_conflict: '凭证与 token 中的账号信息不一致。', identity_unverifiable: 'Token 缺少稳定的账号或用户身份，无法安全上传。',
-    cpa_plan_excluded: '此套餐被 CPA 上传策略排除。', security_pending: '此账号有进行中或待核对的操作，请先处理。', commit_unknown: '上传结果待核对，请在 CPA 凭证列表确认，勿重复上传。', saved_not_adopted: '文件可能已保存，运行状态待核对，勿重复上传。',
-    conversion_duplicate_source: '文件内已有相同身份的凭证。', conversion_already_present: 'CPA 已有相同凭证。', conversion_previously_uploaded: '已核对上次上传的凭证。', conversion_previous_upload_changed: '上次上传后的凭证已变化或移除，请在 CPA 核对。',
-    missing_email: '未提供邮箱', missing_expiry: '有效期未知', no_refresh_token: '无 refresh_token，到期后无法自动刷新', access_token_expired: 'Access token 已过期，由 CPA 按需刷新', kept_disabled: '保留禁用状态',
-  };
-  const conversionMessage = code => conversionMessages[code] || reasons[code] || '请在 CPA 凭证列表核对该条记录。';
-  function conversionFeedback(message = '', tone = '') {
-    const el = convertEl('feedback');
-    el.textContent = message;
-    el.dataset.tone = tone;
-    el.hidden = !message;
-  }
-  function canSelectConversion(item) {
-    return item.status === 'ready' || (item.status === 'failed' && retryableConversion.has(item.code));
-  }
-  function updateConversionControls() {
-    const { busy, items, fileName } = conversion;
-    const uploading = busy === 'upload';
-    const selected = items.filter(item => item.selected && canSelectConversion(item)).length;
-    for (const id of ['source', 'file', 'file-open', 'edit', 'close', 'cancel']) convertEl(id).disabled = uploading;
-    convertEl('preview').disabled = !!busy || !connected() || !convertEl('source').value.trim();
-    convertEl('upload').disabled = !!busy || !connected() || !selected;
-    convertEl('preview').textContent = busy === 'preview' ? '正在转换…' : '预览转换结果';
-    convertEl('upload').textContent = uploading ? '正在上传…' : selected ? `上传 ${selected} 个凭证` : '上传到 CPA';
-    convertEl('count').textContent = `已选 ${selected} 个`;
-    convertEl('count').hidden = !items.length;
-    convertEl('file-name').textContent = fileName;
-    convertEl('file-name').hidden = !fileName;
-    convertEl('dialog').setAttribute('aria-busy', String(!!busy));
-    for (const el of convertEl('list').querySelectorAll('[data-convert-select]')) {
-      el.disabled = !!busy || !canSelectConversion(items[Number(el.dataset.convertSelect)]);
+  const batches = new CommandReceipts('model-quality:account-batches:/v0/management/plugins/model-quality', key);
+  const requestedCancellations = new Set();
+  const readBatch = id => request('/batches?id=' + encodeURIComponent(id));
+  function showBatch(slot, id, batch) {
+    if (batch.id !== id || batch.kind !== (slot.startsWith('conversion:') ? 'conversion' : 'inspection') || !Object.hasOwn(commandStatus, batch.status)) throw Error('账号批次回执格式无效。');
+    const note = receiptLine($('account-batch-note'), id);
+    const prior = note.dataset.status;
+    if ((commandFinished(prior) && !commandFinished(batch.status)) ||
+        (prior === 'cancelling' && ['accepted','running'].includes(batch.status)) ||
+        (prior === 'running' && batch.status === 'accepted')) {
+      return commandFinished(prior) && prior !== 'reconciliation_required';
     }
-    for (const el of convertEl('list').querySelectorAll('[data-convert-download]')) el.disabled = !!busy;
+    note.dataset.status = batch.status;
+    const name = slot.startsWith('conversion:') ? '转换上传' : '账号巡检';
+    const count = Number.isInteger(batch.total) ? ` · ${batch.completed || 0}/${batch.total}` : '';
+    const issues = (batch.items || []).filter(item => item.code).map(item => item.code);
+    const reason = [batch.code, ...new Set(issues)].filter(Boolean).join('、');
+    const uploaded = (batch.items || []).filter(item => item.status === 'uploaded').length;
+    const uncertain = (batch.items || []).filter(item => item.status === 'uncertain').length;
+    const active = ['accepted', 'running'].includes(batch.status);
+    const cancelling = active && requestedCancellations.has(id);
+    note.textContent = [name, cancelling ? '取消回执待核对' : commandStatus[batch.status] + count, uploaded && '已上传 ' + uploaded, uncertain && '待核对 ' + uncertain, reason, id].filter(Boolean).join(' · ');
+    const settled = commandFinished(batch.status) && batch.status !== 'reconciliation_required';
+    note.dataset.finished = String(settled);
+    if (commandFinished(batch.status)) requestedCancellations.delete(id);
+    if (active && !cancelling) {
+      const cancel = document.createElement('button');
+      cancel.type = 'button'; cancel.className = 'text-button small'; cancel.textContent = '取消此批次';
+      cancel.addEventListener('click', async () => {
+        cancel.disabled = true;
+        requestedCancellations.add(id);
+        const epoch = state.epoch;
+        try {
+          const result = await write('/batches/cancel', { id }, 'POST', id + '-cancel');
+          if (!current(epoch)) return;
+          if (result?.status === 'cancelling' && result.cancel_requested === true) {
+            showBatch(slot, id, { ...batch, status: 'cancelling' });
+          }
+        } catch (error) {
+          if (!current(epoch) || isDiscarded(error)) return;
+          if (error.status >= 400 && error.status < 500 && !error.outcomeUnknown && error.status !== 408) requestedCancellations.delete(id);
+          feedback('取消结果待读取。' + error.message, true);
+        }
+        try {
+          const result = await readBatch(id);
+          if (current(epoch) && showBatch(slot, id, result)) batches.forget(slot, id);
+        } catch (error) { if (current(epoch)) batchReadError(slot, id, error); }
+      });
+      note.append(' ', cancel);
+    }
+    if (commandFinished(batch.status) && slot.startsWith('conversion:')) conversion.receive(slot, batch);
+    return settled;
   }
-  function renderConversion() {
-    const { items } = conversion;
-    convertEl('input').hidden = !!items.length;
-    convertEl('results').hidden = !items.length;
-    convertEl('upload').hidden = !items.length;
-    const counts = new Map();
-    for (const item of items) counts.set(item.status, (counts.get(item.status) || 0) + 1);
-    convertEl('results-title').textContent = items.some(item => !['ready', 'invalid'].includes(item.status)) ? '上传结果' : '凭证预览';
-    const labels = { ready: '可上传', uploaded: '已上传', existing: '已存在', invalid: '无法转换', failed: '未上传', uncertain: '待核对' };
-    convertEl('summary').textContent = [`共 ${items.length} 条`, ...Object.entries(labels).filter(([status]) => counts.has(status)).map(([status, label]) => `${counts.get(status)} 条${label}`)].join(' · ');
-    convertEl('list').innerHTML = items.map((item, index) => {
-      const name = item.email || item.name || `凭证 ${item.index + 1}`;
-      const meta = [item.name !== name && item.name, item.plan_type && item.plan_type !== 'unknown' && planLabel(item.plan_type)].filter(Boolean).join(' · ');
-      let status = labels[item.status];
-      if (item.status === 'uploaded') status = item.enabled ? '已上传并启用' : '已上传，保持禁用';
-      const issue = item.code || item.error;
-      const notes = [];
-      if (issue === 'conversion_duplicate_source' && Number.isInteger(item.duplicate_of)) notes.push(`与第 ${item.duplicate_of + 1} 条凭证重复。`);
-      else if (issue) notes.push(conversionMessage(issue));
-      if (item.status === 'failed' && canSelectConversion(item)) notes.push('处理后可重新勾选上传。');
-      for (const warning of item.warnings || []) {
-        if (warning !== 'kept_disabled' || item.status !== 'uploaded') notes.push(conversionMessage(warning));
+  function batchReadError(slot, id, error) {
+    if (isDiscarded(error)) return;
+    if (notAccepted(error) && slot.startsWith('conversion:')) conversion.missing(slot);
+    const line = receiptLine($('account-batch-note'), id);
+    if (line.dataset.finished === 'true') return;
+    const message = notAccepted(error) ? '尚未查到受理回执' : '回执待读取';
+    if (!line.textContent) line.textContent = `${slot.startsWith('conversion:') ? '转换上传' : '账号巡检'} · ${message} · ${id}`;
+    else if (!line.textContent.includes(message)) line.append(' · ' + message);
+  }
+  async function submitBatch(slot, path, body) {
+    const epoch = state.epoch;
+    const { id, reply: result } = await batches.submit(slot, id => write(path, body, 'POST', id), readBatch, () => current(epoch));
+    if (!Object.hasOwn(commandStatus, result?.status)) {
+      if (Array.isArray(result?.items)) batches.forget(slot, id);
+      return result;
+    }
+    if (state.open && showBatch(slot, id, result)) batches.forget(slot, id);
+    return result;
+  }
+  const accountCommands = new CommandReceipts('model-quality:account-commands:/v0/management/plugins/model-quality', key);
+  const readAccountCommand = id => request('/commands?id=' + encodeURIComponent(id));
+  function showAccountCommand(slot, id, receipt) {
+    const kind = slot.split(':')[0], path = kind === 'login' ? '/accounts/start' : '/accounts/security';
+    const label = { login: '账号登录', reset_totp: '重置 2FA', logout_all: '退出所有设备' }[kind];
+    const line = receiptLine($('account-command-note'), id);
+    const job = receipt?.job;
+    if (!label || receipt?.id !== id || (receipt.path !== path && !(!receipt.path && ['reconciliation_required','expired'].includes(receipt.status))) ||
+      !['accepted','failed','reconciliation_required','expired'].includes(receipt.status) ||
+      (receipt.status === 'accepted' && (!job?.id || job.id !== receipt.job_id || typeof job.status !== 'string'))) throw Error('账号命令回执格式无效。');
+    if (line.dataset.finished === 'true' && activeStates.has(job?.status)) return true;
+    const status = { accepted:'已受理', failed:'请求失败', reconciliation_required:'结果待核对', expired:'原命令已消费，历史结果已过期' }[receipt.status];
+    line.textContent = [label, status, job && jobLabel(job), job && securityResult(job), receipt.code, id].filter(Boolean).join(' · ');
+    if (job) {
+      const open = document.createElement('button');
+      open.type = 'button'; open.className = 'text-button small'; open.textContent = '查看任务 ' + job.id;
+      open.addEventListener('click', () => { selectJob(job.id); setView('tasks', open); });
+      line.append(' ', open);
+    }
+    // Unknown/consumed outcomes keep the original ID. A newly authorized
+    // account revision or explicitly different command has its own slot.
+    const finished = receipt.status === 'failed' || receipt.status === 'accepted' && !activeStates.has(job.status);
+    line.dataset.finished = String(finished);
+    return finished;
+  }
+  function accountCommandError(slot, id, error) {
+    if (isDiscarded(error)) return;
+    const line = receiptLine($('account-command-note'), id);
+    if (line.dataset.finished === 'true') return;
+    const label = { login:'账号登录', reset_totp:'重置 2FA', logout_all:'退出所有设备' }[slot.split(':')[0]] || '账号操作';
+    const issue = notAccepted(error) ? '尚未查到受理回执' : '回执待读取';
+    if (!line.textContent) line.textContent = [label, issue, id].join(' · ');
+    else if (!line.textContent.includes(issue)) line.append(' · ' + issue);
+  }
+  async function submitAccountJob(path, body, epoch) {
+    const slot = await commandSlot(body.action || 'login', body);
+    const { id, reply } = await accountCommands.submit(slot, id => write(path, body, 'POST', id), readAccountCommand, () => current(epoch));
+    if (!current(epoch)) return;
+    if (['accepted','failed','reconciliation_required','expired'].includes(reply?.status) && !reply.account_id) {
+      if (showAccountCommand(slot, id, reply)) accountCommands.forget(slot, id);
+      if (reply.status !== 'accepted') {
+        const error = Error('请核对原账号操作的结果。');
+        error.code = reply.code || 'idempotency_unknown';
+        error.outcomeUnknown = reply.status !== 'failed';
+        throw error;
       }
-      return `<div class="conversion-item" data-state="${escapeHTML(item.status)}"><input type="checkbox" data-convert-select="${index}" aria-label="选择${escapeHTML(name)}" ${item.selected ? 'checked' : ''}><div class="conversion-item-details"><strong dir="auto">${escapeHTML(name)}</strong>${meta ? `<small>${escapeHTML(meta)}</small>` : ''}<div class="conversion-item-status">${escapeHTML(status)}</div>${notes.length ? `<small>${escapeHTML(notes.join(' '))}</small>` : ''}</div>${item.credential ? `<button type="button" class="text-button small" data-convert-download="${index}" title="${escapeHTML(item.filename || '下载 CPA JSON')}" aria-label="下载 ${escapeHTML(name)} 的 CPA JSON">下载 JSON</button>` : ''}</div>`;
-    }).join('');
-    updateConversionControls();
-  }
-  function resetConversion() {
-    conversion.sequence++;
-    Object.assign(conversion, { items: [], source: '', fileName: '', busy: '' });
-    convertEl('source').value = '';
-    convertEl('file').value = '';
-    convertEl('paste').open = false;
-    delete convertEl('dropzone').dataset.dragging;
-    conversionFeedback();
-    renderConversion();
-  }
-  function closeConversion(restoreFocus = false) {
-    resetConversion();
-    if (convertEl('dialog').open) convertEl('dialog').close();
-    if (restoreFocus && !convertEl('open').disabled) convertEl('open').focus({ preventScroll: true });
-  }
-  convertEl('open').addEventListener('click', () => {
-    if (accountBusy()) return;
-    clearSecrets(); closeAccountEditors();
-    convertEl('dialog').showModal();
-    convertEl('file-open').focus({ preventScroll: true });
-  });
-  for (const id of ['close', 'cancel']) convertEl(id).addEventListener('click', () => { if (conversion.busy !== 'upload') closeConversion(true); });
-  convertEl('dialog').addEventListener('cancel', event => { event.preventDefault(); if (conversion.busy !== 'upload') closeConversion(true); });
-  convertEl('source').addEventListener('input', () => {
-    conversion.sequence++; conversion.busy = ''; conversion.fileName = ''; conversionFeedback(); updateConversionControls();
-  });
-  convertEl('edit').addEventListener('click', () => {
-    if (conversion.busy) return;
-    const pasted = conversion.fileName ? '' : conversion.source;
-    resetConversion();
-    if (pasted) {
-      convertEl('paste').open = true;
-      convertEl('source').value = pasted;
-      updateConversionControls(); convertEl('source').focus();
-    } else convertEl('file-open').focus();
-  });
-  function conversionCurrent(sequence, epoch) {
-    return sequence === conversion.sequence && current(epoch) && convertEl('dialog').open;
-  }
-  async function previewConversion(source, sequence, epoch) {
-    if (!source.trim()) { conversionFeedback('没有可读取的 JSON 内容。', 'error'); return; }
-    if (new TextEncoder().encode(source).length > convertLimit) { conversionFeedback('内容超过 2 MiB，请分批导入。', 'error'); return; }
-    conversion.busy = 'preview'; conversionFeedback('正在预览凭证…'); updateConversionControls();
-    try {
-      const result = await write('/conversion/preview', { source });
-      if (!conversionCurrent(sequence, epoch)) return;
-      const rows = result?.items;
-      if (!Array.isArray(rows) || !rows.length || rows.length > 100 || rows.some((item, i) => item?.index !== i || !['ready', 'invalid'].includes(item.status))) {
-        conversionFeedback('CPA 返回的预览不完整，请重新预览。', 'error'); return;
-      }
-      conversion.source = source;
-      conversion.items = rows.map(item => ({ ...item, selected: item.status === 'ready' }));
-      convertEl('source').value = '';
-      conversionFeedback(); renderConversion();
-      convertEl('dialog').querySelector('.conversion-scroll').scrollTop = 0;
-      convertEl('results-title').focus({ preventScroll: true });
-    } catch (error) {
-      if (conversionCurrent(sequence, epoch) && !isDiscarded(error)) {
-        conversionFeedback(conversionMessages[error.code] || reasons[error.code] || '未能取得 CPA 的转换预览，请检查面板连接后重试。', 'error');
-      }
-    } finally {
-      if (sequence === conversion.sequence) { conversion.busy = ''; updateConversionControls(); }
+      return reply.job;
     }
+    const job = reply?.job || reply;
+    if (!job?.id || job.account_id !== body.id || typeof job.status !== 'string') {
+      const error = Error('账号命令回执格式无效。'); error.outcomeUnknown = true; throw error;
+    }
+    // Acknowledged jobs are also discoverable through account history.
+    accountCommands.forget(slot, id);
+    return job;
   }
-  convertEl('preview').addEventListener('click', () => {
-    if (conversion.busy || !connected()) return;
-    void previewConversion(convertEl('source').value.trim(), ++conversion.sequence, state.epoch);
-  });
-  async function importConversionFile(files) {
-    if (conversion.busy === 'upload' || !connected() || !convertEl('dialog').open || conversion.items.length) return;
-    resetConversion();
-    if (files.length !== 1) { conversionFeedback('请每次选择一个 JSON 文件，同一文件可包含多个凭证。', 'error'); return; }
-    const [file] = files;
-    conversion.fileName = file.name;
-    updateConversionControls();
-    if (file.size > convertLimit) { conversionFeedback('文件超过 2 MiB，请分批导入。', 'error'); return; }
-    const sequence = conversion.sequence, epoch = state.epoch;
-    conversion.busy = 'read'; conversionFeedback('正在读取文件…'); updateConversionControls();
-    try {
-      const source = await file.text();
-      if (!conversionCurrent(sequence, epoch)) return;
-      await previewConversion(source, sequence, epoch);
-    } catch {
-      if (conversionCurrent(sequence, epoch)) conversionFeedback('读取失败，请重新选择 JSON 文件。', 'error');
-    } finally {
-      if (sequence === conversion.sequence) { conversion.busy = ''; updateConversionControls(); }
-    }
-  }
-  convertEl('file-open').addEventListener('click', () => convertEl('file').click());
-  convertEl('file').addEventListener('change', event => {
-    const files = Array.from(event.target.files);
-    if (files.length) void importConversionFile(files);
-  });
-  const fileDrag = event => Array.from(event.dataTransfer?.types || []).includes('Files');
-  const dropzone = convertEl('dropzone');
-  dropzone.addEventListener('dragover', event => {
-    if (!fileDrag(event)) return;
-    event.preventDefault(); event.dataTransfer.dropEffect = 'copy'; dropzone.dataset.dragging = 'true';
-  });
-  dropzone.addEventListener('dragleave', event => {
-    if (!dropzone.contains(event.relatedTarget)) delete dropzone.dataset.dragging;
-  });
-  dropzone.addEventListener('drop', event => {
-    delete dropzone.dataset.dragging;
-    if (!fileDrag(event)) return;
-    event.preventDefault(); void importConversionFile(Array.from(event.dataTransfer.files));
-  });
-  for (const type of ['dragover', 'drop']) document.addEventListener(type, event => {
-    if (convertEl('dialog').open && fileDrag(event)) event.preventDefault();
-  });
-  convertEl('list').addEventListener('change', event => {
-    if (conversion.busy || event.target.dataset.convertSelect === undefined) return;
-    const item = conversion.items[Number(event.target.dataset.convertSelect)];
-    if (item && canSelectConversion(item)) item.selected = event.target.checked;
-    updateConversionControls();
-  });
-  convertEl('list').addEventListener('click', event => {
-    const button = event.target.closest('[data-convert-download]');
-    if (!button || conversion.busy) return;
-    const item = conversion.items[Number(button.dataset.convertDownload)];
-    if (!item?.credential) return;
-    const url = URL.createObjectURL(new Blob([JSON.stringify(item.credential, null, 2) + '\n'], { type: 'application/json' }));
-    const link = document.createElement('a'); link.href = url; link.download = item.filename; link.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
-  });
-  convertEl('upload').addEventListener('click', async () => {
-    const selected = conversion.items.filter(item => item.selected && canSelectConversion(item));
-    if (conversion.busy || !selected.length || !connected()) return;
-    const sequence = ++conversion.sequence, epoch = state.epoch;
-    conversion.busy = 'upload'; conversionFeedback(); updateConversionControls();
-    const unknown = { status: 'uncertain', code: 'commit_unknown', selected: false };
-    try {
-      const result = await write('/conversion/upload', { source: conversion.source, indexes: selected.map(item => item.index) });
-      if (!conversionCurrent(sequence, epoch)) return;
-      for (const item of selected) {
-        const matches = Array.isArray(result?.items) ? result.items.filter(row => row?.index === item.index) : [];
-        const saved = matches[0];
-        if (matches.length !== 1 || !['uploaded', 'existing', 'failed', 'uncertain'].includes(saved.status) || (saved.status === 'uploaded' && typeof saved.enabled !== 'boolean')) Object.assign(item, unknown);
-        else Object.assign(item, { status: saved.status, code: saved.code || (saved.status === 'uncertain' ? 'commit_unknown' : ''), enabled: saved.enabled, selected: false });
-      }
-      renderConversion();
-      if (selected.some(item => item.status === 'uncertain')) conversionFeedback('部分上传结果尚未确认，请在 CPA 凭证列表核对。', 'error');
-    } catch (error) {
-      if (!conversionCurrent(sequence, epoch) || isDiscarded(error)) return;
-      if (error.code !== 'management_offline' && (error.outcomeUnknown || !error.status || error.status >= 500 || ['idempotency_unknown', 'storage_unavailable'].includes(error.code))) {
-        for (const item of selected) Object.assign(item, unknown);
-        renderConversion(); conversionFeedback('上传结果尚未确认，请在 CPA 凭证列表核对，勿重复上传。', 'error');
-      } else conversionFeedback(conversionMessage(error.code), 'error');
-      return;
-    } finally {
-      if (sequence === conversion.sequence) { conversion.busy = ''; updateConversionControls(); }
-    }
-    if (selected.some(item => ['uploaded', 'uncertain'].includes(item.status))) {
-      try { await reload(); if (current(epoch)) await onCommitted?.(); }
-      catch { /* Refresh errors do not change confirmed per-row receipts. */ }
-    }
+  const conversion = createConversion({
+    connected, current, epochNow: () => state.epoch, write, submitBatch, newID: key, planLabel, reasons,
+    canOpen: () => !accountBusy() && state.capabilities?.credential_conversion,
+    beforeOpen: () => { clearSecrets(); closeAccountEditors(); },
+    afterUpload: async epoch => { await reload(); if (current(epoch)) await onCommitted?.(); },
   });
 
   function importFeedback(message = '') {
@@ -595,7 +516,7 @@ export function createLoginWorkbench({ request, connected, visible = () => !docu
   function closeAccountEditors() {
     closeAccountDelete();
     closeAccountLogin();
-    closeConversion();
+    conversion.close();
     closeAccountImport(); closeAccountEditor(); closeAccountSecurity(); closeAccountMenu();
   }
   function securityScrollBox() {
@@ -792,7 +713,7 @@ export function createLoginWorkbench({ request, connected, visible = () => !docu
   function applyAccountJob(account, job) {
     Object.assign(account, { last_job_id: idOf(job), last_job_status: job.status || 'queued', last_job_created_at: job.created_at, last_job_automatic: !!job.automatic, last_job_phase: job.phase, last_job_intent: job.intent, last_job_error_code: job.error_code, last_job_error_stage: job.error_stage, last_job_error_reason: job.error_reason, last_job_auto_commit: !!job.auto_commit, last_job_credential_enabled: !!job.credential_enabled, last_job_action: job.action, last_job_security_status: job.security_status, last_job_totp_reset: !!job.totp_reset, last_job_devices_logged_out: !!job.devices_logged_out });
   }
-  function accountBusy() { return !state.open || loading || !connected() || navigator.onLine === false || !state.accountsAvailable || !state.jobsAvailable || !state.bootstrapReady || state.busy.has('account'); }
+  function accountBusy() { return !state.open || !connected() || navigator.onLine === false || !state.accountsAvailable || state.busy.has('account'); }
   function deleteUnavailable(account) {
     return !account || accountLoginPending(account) || !localStorageReady(state.vault || state.capabilities?.vault || {});
   }
@@ -849,12 +770,14 @@ export function createLoginWorkbench({ request, connected, visible = () => !docu
     const busy = accountBusy();
     for (const id of ['account-inspect', 'account-import-open', 'account-import-empty', 'account-settings-save', 'account-default-proxy', 'account-inspection-enabled', 'account-auto-enabled', 'account-interval', 'account-editor-save', 'account-login-start']) $(id).disabled = busy;
     $('account-upload-plans').disabled = busy;
-    $('account-settings-save').disabled = busy || !state.settingsDirty;
+    const settingsBusy = !state.open || !connected() || navigator.onLine === false || !state.accountSettings || state.readErrors.has('巡检设置') || state.busy.has('account');
+    for (const id of ['account-default-proxy', 'account-inspection-enabled', 'account-auto-enabled', 'account-interval', 'account-upload-plans']) $(id).disabled = settingsBusy;
+    $('account-settings-save').disabled = settingsBusy || !state.settingsDirty;
     $('account-settings-save').textContent = state.view === 'settings' && state.busy.has('account') ? '正在保存…' : '保存设置';
     $('account-settings-draft').hidden = !state.settingsDirty;
     $('login-settings-dialog').querySelectorAll('[data-account-surface-close]').forEach(button => { button.disabled = state.busy.has('account'); });
     $('account-inspect').disabled = busy || !state.accounts.length;
-    $('account-auto-enabled').disabled = busy || !$('account-inspection-enabled').checked;
+    $('account-auto-enabled').disabled = settingsBusy || !$('account-inspection-enabled').checked;
     $('account-inspect').setAttribute('aria-busy', String(state.busy.has('account')));
     const vault = state.vault || state.capabilities?.vault || {};
     const storageReady = localStorageReady(vault);
@@ -1148,7 +1071,7 @@ export function createLoginWorkbench({ request, connected, visible = () => !docu
     viewport.scrollTop = accountLogs.follow ? viewport.scrollHeight : top;
   }
   function loadAccountLogs(force = false) {
-    if (!accountLogs.account || !state.open || !connected() || navigator.onLine === false || document.hidden) return Promise.resolve();
+    if (!accountLogs.account || !canReadDisplay()) return Promise.resolve();
     if (accountLogCycle?.epoch === state.epoch && accountLogCycle.account === accountLogs.account && accountLogCycle.read === accountLogs.read) {
       accountLogCycle.pending = true;
       accountLogCycle.force ||= force;
@@ -1164,7 +1087,7 @@ export function createLoginWorkbench({ request, connected, visible = () => !docu
           const forceRead = cycle.force;
           cycle.pending = false; cycle.force = false;
           await readAccountLogSnapshot(cycle, forceRead);
-        } while (cycle.pending && valid() && navigator.onLine !== false && !document.hidden);
+        } while (cycle.pending && valid() && canReadDisplay());
       } catch (error) {
         if (valid() && !isDiscarded(error)) accountLogs.error = '日志读取未完成，已保留已加载内容。请点击刷新重试。';
       } finally {
@@ -1213,13 +1136,14 @@ export function createLoginWorkbench({ request, connected, visible = () => !docu
           return { job, response: await readLogSnapshot(job, valid) };
         }));
         if (!valid()) return;
+        if (responses.some(response => response.status === 'rejected' && isDiscarded(response.reason))) return;
         for (const response of responses) {
           if (response.status === 'rejected') { accountLogs.error = '日志读取未完成，已保留已加载内容。请点击刷新重试。'; continue; }
           const { job, response: data } = response.value;
           if (data) accountLogs.cache.set(idOf(job), data);
         }
         renderAccountLogs();
-        if (responses.every(response => response.status === 'rejected') || navigator.onLine === false || document.hidden) break;
+        if (responses.every(response => response.status === 'rejected')) break;
       }
       if (valid() && !accountLogs.error) accountLogs.updated = new Date().toISOString();
     } catch (error) {
@@ -1263,6 +1187,7 @@ export function createLoginWorkbench({ request, connected, visible = () => !docu
   }
   function renderReadStatus() {
     const failed = [...state.readErrors.keys()];
+    if (state.open) onFreshness?.(failed.length > 0, !state.accountsLoaded);
     const reasons = [...new Set(state.readErrors.values())].join('');
     const message = failed.length ? `${failed.join('、')}暂未刷新，正在等待重新读取。${reasons}` : '';
     for (const id of ['login-history-read-note', 'login-settings-read-note']) {
@@ -1290,7 +1215,7 @@ export function createLoginWorkbench({ request, connected, visible = () => !docu
         return true;
       } catch (error) {
         if (isCurrent() && !isDiscarded(error)) {
-          state.accountsAvailable = false;
+          if (label === '账号列表') state.accountsAvailable = false;
           setReadError(label, error);
         }
         return false;
@@ -1298,10 +1223,10 @@ export function createLoginWorkbench({ request, connected, visible = () => !docu
         if (isCurrent()) renderAccounts();
       }
     }
-    const [validAccounts, validSettings] = await Promise.all([
+    await Promise.all([
       read(initialAccounts ?? readAccountList(), '账号列表', accounts => {
         state.accounts = accounts;
-        state.accountsLoaded = true;
+        state.accountsLoaded = state.accountsAvailable = true;
       }),
       read(snapshotRead('/accounts/settings'), '巡检设置', data => {
         if (!Number.isSafeInteger(data?.revision) || typeof data.inspection_enabled !== 'boolean' || typeof data.auto_relogin_enabled !== 'boolean' || !Number.isFinite(data.interval_minutes)) throw new Error('invalid_settings');
@@ -1310,11 +1235,10 @@ export function createLoginWorkbench({ request, connected, visible = () => !docu
       }),
     ]);
     if (!isCurrent()) return;
-    state.accountsAvailable = validAccounts && validSettings;
     updateAccountControls();
   }
-  async function accountAction(action) {
-    if (accountBusy()) return;
+  async function accountAction(action, requireAccount = true) {
+    if (requireAccount ? accountBusy() : state.busy.has('account') || !current(state.epoch) || navigator.onLine === false) return;
     const epoch = state.epoch;
     state.busy.add('account'); updateAccountControls(); feedback(); editorFeedback();
     try { await action(epoch); }
@@ -1415,7 +1339,7 @@ export function createLoginWorkbench({ request, connected, visible = () => !docu
     state.accountStarting = account.id;
     renderAccounts();
     await accountAction(async requestEpoch => {
-      const result = await write('/accounts/start', { id: account.id, revision: account.revision, upload_to_cpa: upload, ...(targetID ? { target_auth_id: targetID } : {}) });
+      const result = await submitAccountJob('/accounts/start', { id: account.id, revision: account.revision, upload_to_cpa: upload, ...(targetID ? { target_auth_id: targetID } : {}) }, requestEpoch);
       if (!current(requestEpoch)) return;
       const job = result.job || result;
       const saved = state.accounts.find(item => item.id === account.id);
@@ -1502,11 +1426,10 @@ export function createLoginWorkbench({ request, connected, visible = () => !docu
     updateHistoryDelete();
     if (!job) return;
     const candidate = state.candidate;
-    const signature = JSON.stringify([idOf(job), job.revision, job.email, job.status, job.phase, job.error_code, job.error_stage, job.error_reason, job.runtime_code, job.vault_error, job.auto_commit, job.enable_credential, job.credential_enabled, job.action, job.security_status, job.totp_reset, job.devices_logged_out, job.reauthorize, candidate, state.urls.get(idOf(job))]);
+    const id = idOf(job), url = safeAuthorizationURL(job.authorization_url);
+    const signature = JSON.stringify([idOf(job), job.revision, job.email, job.status, job.phase, job.error_code, job.error_stage, job.error_reason, job.runtime_code, job.vault_error, job.auto_commit, job.enable_credential, job.credential_enabled, job.action, job.security_status, job.totp_reset, job.devices_logged_out, job.reauthorize, candidate, url]);
     if (!force && state.detailSignature === signature) return;
     state.detailSignature = signature;
-    const id = idOf(job);
-    const url = safeAuthorizationURL(job.authorization_url || state.urls.get(id));
     const awaiting = job.status === 'awaiting_commit';
     const restrictions = Array.isArray(candidate?.restrictions) ? candidate.restrictions : [];
     const tone = taskTone(job);
@@ -1517,7 +1440,7 @@ export function createLoginWorkbench({ request, connected, visible = () => !docu
     if (securityResult(job) && !['committed', 'succeeded'].includes(job.status)) body += `<p class="account-security-result">${escapeHTML(securityResult(job))}。${job.reauthorize ? '后续授权结果请结合当前任务状态核对。' : '本次未选择重新授权 CPA。'}</p>`;
     if (job.status === 'security_uncertain' && !job.error_code) body += '<div class="notice error">安全操作结果尚未确认，请在账号资料中核对保留的信息，勿重复重置或退出。</div>';
     if (job.vault_error) body += '<p class="field-error">授权提交已完成，但登录资料未保存。请核对凭证状态后单独保存资料，无需重复登录。</p>';
-    if (job.status === 'waiting_browser' && job.method === 'browser') body += `<div class="login-browser-action">${url ? `<a class="login-auth-link" href="${escapeHTML(url)}" target="_blank" rel="noopener noreferrer">打开 OpenAI 官方授权页面<svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M14 4h6v6M20 4 10 14M10 4H4v16h16v-6"/></svg></a>` : '<p class="field-note">授权链接暂不可用，请刷新此任务。</p>'}<p class="field-note">完成官方登录后，复制地址栏中的完整回调地址。即使回调页面无法打开，也可在这里提交。</p><label for="login-callback">回调地址<input id="login-callback" type="text" autocomplete="off" maxlength="8192" placeholder="http://localhost:1455/auth/callback?…"></label><button type="button" class="subtle small" data-login-action="callback">提交回调并核验</button></div>`;
+    if (job.status === 'waiting_browser' && job.method === 'browser') body += `<div class="login-browser-action">${url ? `<a class="login-auth-link" href="${escapeHTML(url)}" target="_blank" rel="noopener noreferrer">打开 OpenAI 官方授权页面<svg class="nav-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M14 4h6v6M20 4 10 14M10 4H4v16h16v-6"/></svg></a>` : '<p class="field-note">授权链接暂不可用，请刷新此任务。</p>'}<p class="field-note">完成官方登录后，复制地址栏中的完整回调地址。即使回调页面无法打开，也可在这里提交。</p><label for="login-callback">回调地址<input id="login-callback" data-job-id="${escapeHTML(id)}" type="text" autocomplete="off" maxlength="8192" placeholder="http://localhost:1455/auth/callback?…"></label><button type="button" class="subtle small" data-login-action="callback">提交回调并核验</button></div>`;
     if (awaiting && candidate) body += `<div class="login-candidate"><h4>核对待上传凭证</h4><dl class="evidence-facts"><div><dt>账号</dt><dd>${escapeHTML(candidate.email || '未提供')}</dd></div><div><dt>账号／工作区</dt><dd>${escapeHTML(candidate.account_id || '未提供')}</dd></div><div><dt>授权套餐</dt><dd>${escapeHTML(planLabel(candidate.plan_type))}</dd></div><div><dt>用户 ID</dt><dd>${escapeHTML(candidate.user_id || '未提供')}</dd></div><div><dt>提交动作</dt><dd>${job.enable_credential ? '保存并启用 CPA 凭证' : candidate.intent === 'reauthorize' || job.intent === 'reauthorize' ? '更新已有凭证的授权' : '创建默认人工禁用的新凭证'}</dd></div><div><dt>目标凭证</dt><dd>${escapeHTML(candidate.target_auth_id || '导入时创建')}</dd></div><div><dt>授权有效至</dt><dd>${escapeHTML(date(job.expires_at))}</dd></div></dl>${restrictions.length ? `<ul class="restriction-list">${restrictions.map(value => `<li>${escapeHTML(reasonLabel(value))}</li>`).join('')}</ul>` : ''}<div class="button-row login-candidate-actions"><button type="button" class="primary" data-login-action="commit" ${restrictions.includes('cpa_plan_excluded') ? 'data-plan-blocked' : ''}>确认上传 CPA</button><button type="button" class="subtle" data-login-action="discard">放弃授权</button></div></div>`;
     else if (awaiting) body += '<p class="field-note">正在读取待保存的账号信息…</p>';
     if (job.status === 'committed') body += '<p class="login-task-result-note">授权已保存到 CPA，相关检测规则保持停止。</p>';
@@ -1526,6 +1449,11 @@ export function createLoginWorkbench({ request, connected, visible = () => !docu
     if (job.status === 'committing') body += `<p class="field-note">${job.enable_credential ? '正在保存并启用 CPA 凭证。' : '正在保存 CPA 凭证。'}此阶段不能取消。</p>`;
     if (activeStates.has(job.status) && job.phase) body += `<div class="login-current-phase field-note" role="status"><span class="login-phase-indicator" aria-hidden="true"></span><span><small>当前步骤</small><strong>${escapeHTML(phaseLabel(job.phase))}</strong></span></div>`;
     if (cancellableStates.has(job.status)) body += '<button type="button" class="subtle small" data-login-action="cancel">取消登录任务</button>';
+    // Reuse only the unsent input for the same waiting job. Authorization
+    // navigation always comes from the latest successful detail response.
+    const priorInput = $('login-callback');
+    const keepInput = priorInput?.dataset.jobId === id && job.method === 'browser' && job.status === 'waiting_browser';
+    const wasFocused = keepInput && document.activeElement === priorInput;
     const logPanel = $('login-job-detail').querySelector('.login-task-logs');
     if (logPanel) {
       $('login-job-detail').querySelector('.login-detail-header').outerHTML = heading;
@@ -1534,10 +1462,15 @@ export function createLoginWorkbench({ request, connected, visible = () => !docu
       $('login-job-detail').innerHTML = `${heading}<div class="login-detail-body">${body}</div>`;
       mountTaskLogs();
     }
+    if (keepInput) {
+      $('login-callback').replaceWith(priorInput);
+      if (wasFocused) priorInput.focus({ preventScroll: true });
+    }
     renderTaskLogs();
     $('login-job-detail').querySelectorAll('[data-login-action]').forEach(button => { button.disabled = taskActionBlocked() || button.hasAttribute('data-plan-blocked'); });
   }
   function clearSelectedDetail() {
+    jobSummaryStale = false;
     state.job = null; state.candidate = null; state.detailSignature = ''; state.detailRead++;
     taskLogs.signature = '';
     $('login-job-detail').innerHTML = state.selected ? '<p class="empty-line" role="status">正在读取任务…</p>' : '<p class="empty-line">请选择一条记录。</p>';
@@ -1570,7 +1503,6 @@ export function createLoginWorkbench({ request, connected, visible = () => !docu
   }
   function removeHistoryJob(id) {
     state.jobs = state.jobs.filter(job => idOf(job) !== id);
-    state.urls.delete(id);
     taskLogs.cache.delete(id);
     accountLogs.cache.delete(id);
     accountLogs.jobs = accountLogs.jobs.filter(job => idOf(job) !== id);
@@ -1677,11 +1609,11 @@ export function createLoginWorkbench({ request, connected, visible = () => !docu
     if (focused) [...viewport.querySelectorAll('details')].find(item => item.dataset.logKey === focused)?.querySelector('summary').focus({ preventScroll: true });
     viewport.scrollTop = taskLogs.follow ? viewport.scrollHeight : top;
   }
-  async function readLogSnapshot(job, valid = () => true) {
+  async function readLogSnapshot(job, valid, readPage = get) {
     const entries = new Map();
     let cursor = 0, data;
     for (let page = 0; page < 20; page++) {
-      data = await get(`/logs?id=${encodeURIComponent(idOf(job))}${cursor ? `&cursor=${cursor}` : ''}`);
+      data = await readPage(`/logs?id=${encodeURIComponent(idOf(job))}${cursor ? `&cursor=${cursor}` : ''}`);
       if (!valid()) return null;
       if (data.job_id !== idOf(job) || !Array.isArray(data.entries)) throw new Error('invalid_log_response');
       for (const raw of data.entries) {
@@ -1698,7 +1630,7 @@ export function createLoginWorkbench({ request, connected, visible = () => !docu
     }
     throw new Error('log_read_incomplete');
   }
-  function loadTaskLogs(force = false) {
+  function loadTaskLogs(force = false, readPage = get) {
     if (state.view !== 'tasks' || !state.job || !current(state.epoch)) return Promise.resolve();
     const job = state.job, id = idOf(job), epoch = state.epoch, read = taskLogs.read;
     if (taskLogs.cycle?.id === id && taskLogs.cycle.epoch === epoch && taskLogs.cycle.read === read) return taskLogs.cycle.promise;
@@ -1708,7 +1640,7 @@ export function createLoginWorkbench({ request, connected, visible = () => !docu
     taskLogs.cycle = cycle; taskLogs.loading = true; taskLogs.error = ''; renderTaskLogs();
     cycle.promise = (async () => {
       try {
-        const saved = await readLogSnapshot(job, valid);
+        const saved = await readLogSnapshot(job, valid, readPage);
         if (!valid() || !saved) return;
         taskLogs.cache.set(id, saved); taskLogs.updated = new Date().toISOString();
       } catch (error) {
@@ -1723,12 +1655,13 @@ export function createLoginWorkbench({ request, connected, visible = () => !docu
   async function exportTaskLog(action = 'export') {
     if (!state.job || taskLogs.loading) return;
     const id = state.selected, epoch = state.epoch;
-    await loadTaskLogs(true);
+    // An export explicitly requested by the user can finish after a tab switch.
+    await loadTaskLogs(true, request);
     if (!current(epoch) || state.selected !== id || !state.job) return;
     const report = buildLogReport([state.job], taskLogs.cache, {
       ui_version: JSON.parse($('build-info').textContent).ui_version,
       runtime_version: state.capabilities?.runtime?.runtime_version || 'unknown',
-      scope: 'current', read_incomplete: !!taskLogs.error || !taskLogs.cache.has(id),
+      scope: 'current', read_incomplete: jobSummaryStale || !!taskLogs.error || !taskLogs.cache.has(id),
     });
     try {
       if (action === 'copy') await navigator.clipboard.writeText(logReportText(report));
@@ -1743,14 +1676,20 @@ export function createLoginWorkbench({ request, connected, visible = () => !docu
     const epoch = state.epoch;
     const sequence = ++state.detailRead;
     const selected = state.selected;
+    let summaryRead = false;
     try {
       const result = await get(`/detail?id=${encodeURIComponent(selected)}`);
       if (!current(epoch) || state.selected !== selected || sequence !== state.detailRead) return;
       const job = result.job || result;
       if (idOf(job) !== selected || typeof job.status !== 'string') throw new Error('invalid_job_response');
       state.job = job;
-      if (job.authorization_url) state.urls.set(selected, safeAuthorizationURL(job.authorization_url));
+      summaryRead = true;
+      jobSummaryStale = false;
       if (job.status === 'awaiting_commit') {
+        // Withdraw any previous browser navigation immediately, even when
+        // the optional candidate read is slow or unavailable.
+        if (state.candidate?.id !== job.candidate_id || state.candidate?.revision !== job.revision) state.candidate = null;
+        renderDetail();
         const candidate = await get(`/candidate?id=${encodeURIComponent(job.candidate_id || selected)}`);
         if (!current(epoch) || state.selected !== selected || sequence !== state.detailRead) return;
         state.candidate = candidate.candidate || candidate;
@@ -1759,7 +1698,8 @@ export function createLoginWorkbench({ request, connected, visible = () => !docu
       renderDetail();
       void loadTaskLogs();
     } catch (error) {
-      if (!current(epoch) || state.selected !== selected || sequence !== state.detailRead) return;
+      if (!current(epoch) || state.selected !== selected || sequence !== state.detailRead || isDiscarded(error)) return;
+      if (!summaryRead) jobSummaryStale = true;
       if (error.status === 404 && error.code === 'not_found' && state.jobsAvailable) {
         removeHistoryJob(selected);
         setReadError('任务详情', null);
@@ -1772,24 +1712,43 @@ export function createLoginWorkbench({ request, connected, visible = () => !docu
   }
   async function refreshBootstrap() {
     const epoch = state.epoch;
-    try {
-      const [capabilities, targets, vault] = await Promise.all([snapshotRead('/capabilities'), snapshotRead('/targets'), snapshotRead('/vault/status')]);
-      if (!current(epoch)) return;
-      if (typeof capabilities?.available !== 'boolean' || !capabilities.methods || !Array.isArray(targets?.items) || typeof vault?.available !== 'boolean') throw new Error('invalid_capabilities');
-      state.capabilities = capabilities; state.targets = targets.items; state.vault = vault;
-      state.bootstrapReady = true; setReadError('登录服务', null);
-    } catch (error) {
-      if (!current(epoch) || isDiscarded(error)) return;
-      state.bootstrapReady = false; setReadError('登录服务', error);
+    async function resource(path, label, apply) {
+      try {
+        const data = await snapshotRead(path);
+        if (!current(epoch)) return false;
+        apply(data);
+        setReadError(label, null);
+        return true;
+      } catch (error) {
+        if (current(epoch) && !isDiscarded(error)) setReadError(label, error);
+        return false;
+      }
     }
+    const result = await Promise.all([
+      resource('/capabilities', '登录能力', data => {
+        if (typeof data?.available !== 'boolean' || !data.methods) throw Error('invalid_capabilities');
+        state.capabilities = data;
+      }),
+      resource('/targets', '绑定目录', data => {
+        if (!Array.isArray(data?.items)) throw Error('invalid_targets');
+        state.targets = data.items;
+      }),
+      resource('/vault/status', '账号存储', data => {
+        if (typeof data?.available !== 'boolean') throw Error('invalid_storage');
+        state.vault = data;
+      }),
+    ]);
+    if (current(epoch)) state.bootstrapReady = result.every(Boolean);
   }
   async function refreshSnapshot(initialAccounts) {
+    displayReadDeferred = false;
     const epoch = state.epoch;
     const sequence = ++state.jobsRead;
     const detailReadAtStart = state.detailRead;
     const previous = new Map(state.jobs.map(job => [idOf(job), job.status]));
     state.readErrors.delete('网络连接'); state.readErrors.delete('登录状态');
-    const reads = [loadAccounts(initialAccounts), (async () => {
+    const reads = [batches.reconcile(readBatch, showBatch, batchReadError, () => current(epoch) && canReadDisplay()),
+      accountCommands.reconcile(readAccountCommand, showAccountCommand, accountCommandError, () => current(epoch) && canReadDisplay()), loadAccounts(initialAccounts), (async () => {
       let selectedFirstJob = false;
       try {
         const result = await snapshotRead('/jobs?limit=200');
@@ -1833,7 +1792,7 @@ export function createLoginWorkbench({ request, connected, visible = () => !docu
     state.nextReadAt = state.readErrors.size ? 0 : performance.now() + pollDelay();
   }
   function reload(initialAccounts) {
-    if (!state.open || !connected()) return Promise.resolve();
+    if (!canReadDisplay()) return Promise.resolve();
     if (refreshCycle?.epoch === state.epoch) { refreshCycle.pending = true; return refreshCycle.promise; }
     const cycle = { epoch: state.epoch, pending: false, promise: null };
     refreshCycle = cycle;
@@ -1841,7 +1800,7 @@ export function createLoginWorkbench({ request, connected, visible = () => !docu
     cycle.promise = (async () => {
       try {
         do { cycle.pending = false; await refreshSnapshot(initialAccounts); initialAccounts = undefined; }
-        while (cycle.pending && current(cycle.epoch));
+        while (cycle.pending && current(cycle.epoch) && visible());
       } catch (error) {
         if (current(cycle.epoch)) setReadError('登录状态', error);
       } finally {
@@ -1853,7 +1812,7 @@ export function createLoginWorkbench({ request, connected, visible = () => !docu
     return cycle.promise;
   }
   function pollDelay() {
-    return state.readFailures ? Math.min(30000, 3000 * 2 ** (state.readFailures - 1)) : state.jobs.some(job => activeStates.has(job.status)) ? 2000 : 6000;
+    return connected() && batches.records().size ? 2000 : state.readFailures ? Math.min(30000, 3000 * 2 ** (state.readFailures - 1)) : state.jobs.some(job => activeStates.has(job.status)) ? 2000 : 6000;
   }
   function schedule(delay = pollDelay()) {
     clearTimeout(state.timer);
@@ -1862,7 +1821,11 @@ export function createLoginWorkbench({ request, connected, visible = () => !docu
   }
   function resumeReads(initialAccounts) {
     if (!state.open || !connected() || !visible()) return;
-    if (refreshCycle?.epoch === state.epoch) return refreshCycle.promise;
+    if (refreshCycle?.epoch === state.epoch) {
+      if (displayReadDeferred) refreshCycle.pending = true;
+      return refreshCycle.promise;
+    }
+    if (displayReadDeferred) return reload(initialAccounts);
     const remaining = state.nextReadAt - performance.now();
     if (!initialAccounts && remaining > 0 && state.accountsAvailable && state.jobsAvailable && state.bootstrapReady && !state.readErrors.size) {
       updateControls();
@@ -1894,7 +1857,6 @@ export function createLoginWorkbench({ request, connected, visible = () => !docu
     state.epoch++;
     clearTimeout(state.timer);
     clearSecrets();
-    state.urls.clear();
     state.accountStarting = '';
     resetAccountLogs();
     taskLogs.read++; taskLogs.cache.clear(); taskLogs.cycle = null; taskLogs.loading = false; taskLogs.signature = ''; taskLogs.error = '';
@@ -1906,6 +1868,10 @@ export function createLoginWorkbench({ request, connected, visible = () => !docu
     closeAccountSurface(false, true);
     $('login-job-detail').innerHTML = '<p class="empty-line">选择任务，查看进度和结果。</p>';
     if (reset) {
+      displayReadDeferred = false;
+      $('account-batch-note').textContent = ''; $('account-batch-note').hidden = true;
+      $('account-command-note').textContent = ''; $('account-command-note').hidden = true;
+      requestedCancellations.clear();
       snapshotReads.clear();
       snapshotReads = new Map();
       state.capabilities = null; state.targets = []; state.jobs = []; state.selected = ''; state.vault = null;
@@ -1982,7 +1948,7 @@ export function createLoginWorkbench({ request, connected, visible = () => !docu
     securityFeedback();
     accountAction(async epoch => {
       let result;
-      try { result = await write('/accounts/security', body); }
+      try { result = await submitAccountJob('/accounts/security', body, epoch); }
       catch (error) {
         if (current(epoch) && (error instanceof TypeError || error.outcomeUnknown || ['management_network_error', 'network_error', 'idempotency_unknown', 'security_pending'].includes(error.code))) {
           securitySubmissionUncertain = true;
@@ -2102,7 +2068,8 @@ export function createLoginWorkbench({ request, connected, visible = () => !docu
     });
   });
   $('account-inspect').addEventListener('click', () => accountAction(async epoch => {
-    await write('/accounts/inspect', {});
+    const batch = await submitBatch('inspect', '/accounts/inspect', {});
+    if (batch?.status) { if (current(epoch)) await reload(); return; }
     if (!current(epoch)) return;
     await loadAccounts();
     if (current(epoch)) feedback('巡检完成，已更新 CPA 账号状态。');
@@ -2132,7 +2099,7 @@ export function createLoginWorkbench({ request, connected, visible = () => !docu
       state.settingsDirty = false; state.settingsDraftRevision = null;
       await loadAccounts();
       if (current(epoch)) $('account-settings-note').textContent = '设置已保存，上传前将按最新排除套餐检查。';
-    });
+    }, false);
   });
   for (const id of ['account-password', 'account-totp']) $(id).addEventListener('input', () => {
     syncEditorCredentials();
@@ -2213,7 +2180,8 @@ export function createLoginWorkbench({ request, connected, visible = () => !docu
     if (action === 'edit') { await showAccountEditor(account); return; }
     if (action === 'inspect') {
       await accountAction(async epoch => {
-        await write('/accounts/inspect', { id: account.id });
+        const batch = await submitBatch('inspect:' + account.id, '/accounts/inspect', { id: account.id });
+        if (batch?.status) { if (current(epoch)) await reload(); return; }
         if (!current(epoch)) return;
         await loadAccounts();
         if (current(epoch)) feedback('已更新此账号的 CPA 状态。');
@@ -2299,7 +2267,7 @@ export function createLoginWorkbench({ request, connected, visible = () => !docu
       if (taskLogs.follow) viewport.scrollTop = viewport.scrollHeight;
     } else if (['copy', 'export'].includes(action)) void exportTaskLog(action);
   });
-  return { open, close, syncVisibility, refresh: () => { state.bootstrapReady = false; return reload(); }, reset: () => close({ reset: true, focus: false }) };
+  return { entryResource: '/login/accounts', open, close, syncVisibility, refresh: () => { state.bootstrapReady = false; return reload(); }, reset: () => close({ reset: true, focus: false }) };
 }
 
 function phaseLabel(phase) {

@@ -349,6 +349,8 @@ def update(package, output):
             report['persistent_state'] = state_summary
             if changed_private_database:
                 raise ValueError('logical persistent database state changed during deployment; review the digest summary')
+            if state_summary['existing_non_database_files_changed']:
+                raise ValueError('existing plugin data files changed during deployment; review the stopped backup')
             after = json.loads(docker('inspect', 'cli-proxy-api'))[0]
             if (after['Id'] != container_id or after['Image'] != container['Image'] or
                     after['Mounts'] != container['Mounts'] or after['Config'].get('Cmd') != container['Config'].get('Cmd')):

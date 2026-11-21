@@ -204,10 +204,10 @@ func (j securityJournal) complete(job Job) bool {
 }
 
 func (s *Service) StartAccountSecurity(id string, revision uint64, action string, logoutAll, reauthorize bool) (Job, error) {
-	return s.startManualSecurity(id, revision, action, logoutAll, reauthorize, reauthorize)
+	return s.startManualSecurity(id, revision, action, logoutAll, reauthorize, reauthorize, "")
 }
 
-func (s *Service) startManualSecurity(id string, revision uint64, action string, logoutAll, reauthorize, upload bool) (Job, error) {
+func (s *Service) startManualSecurity(id string, revision uint64, action string, logoutAll, reauthorize, upload bool, commandID string) (Job, error) {
 	if !validSecurityAction(action) || action == "logout_all" && logoutAll || upload && !reauthorize {
 		return Job{}, errors.New("invalid_request")
 	}
@@ -229,7 +229,7 @@ func (s *Service) startManualSecurity(id string, revision uint64, action string,
 	if a.View.SecurityPending {
 		return Job{}, errors.New("security_pending")
 	}
-	return s.startAccountOperationLocked(a, "", false, "", action, logoutAll, reauthorize, upload)
+	return s.startAccountOperationLocked(a, "", false, "", action, logoutAll, reauthorize, upload, commandID)
 }
 
 // Resolve the CPA destination only after the security operation has finished
@@ -250,9 +250,6 @@ func (s *Service) resolveSecurityCredential(j *session, principal auth.LoginPrin
 		// Selecting upload in this manual operation authorizes a new grant
 		// for the same identity when the original file is absent.
 		return nil
-	}
-	if SafeCode(err) == "storage_unavailable" {
-		return errors.New("cpa_credential_unavailable")
 	}
 	if err != nil {
 		return err

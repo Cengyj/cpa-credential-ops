@@ -1,3 +1,6 @@
+import { CommandReceipts, commandFinished, commandSlot, commandStatus, creationSlot, notAccepted, receiptLine, unknownReceipt } from './commands.js';
+import { patchView, hydrateInlinePreviews } from './markup.js';
+import { BrowserAuthorization, WorkspaceAdmission, readDirectory } from './workspace.js';
 import { ManagementClient, isDiscarded } from './client.js';
 import { createLoginWorkbench } from './login.js';
 import {
@@ -49,6 +52,7 @@ import {
 
 const $ = (id) => document.getElementById(id);
 let ruleGroupGrants = new Set();
+let workspaceGeneration = 0;
 const manualTargetDraft = { id: '', provider: '', authIndex: '', isProvider: false, label: '', models: new Map() };
 let manualReasoning = '';
 const state = {
@@ -92,41 +96,46 @@ const checked = (id) => $(id).checked;
 const findTarget = (id) => state.targets.find((target) => targetID(target) === id);
 const ruleHeld = (rule) => holdsPause(rule, state.targets);
 const managementPrefix = '/v0/management/plugins/model-quality';
-const managementKeyStorage = `model-quality:management-key:${managementPrefix}`;
-const migrationStorage = `model-quality:connection-migration:${managementPrefix}`;
-const connectionRevisionStorage = `model-quality:connection-revision:${managementPrefix}`;
+const browserAuth = new BrowserAuthorization(managementPrefix);
 const workspaceStorage = `model-quality:workspace:${managementPrefix}`;
 const manualReceiptStorage = `model-quality:manual-receipt:${managementPrefix}`;
+const manualCommands = new CommandReceipts('model-quality:manual-commands:' + managementPrefix, newKey);
 let manualReceiptKey = '';
-try { manualReceiptKey = sessionStorage.getItem(manualReceiptStorage) || ''; } catch { /* Use page memory when storage is unavailable. */ }
-
-function rememberManualReceipt(key) {
-  manualReceiptKey = key;
+function restoreManualReceipt() {
+  if (!state.connected) return;
   try {
-    if (key) sessionStorage.setItem(manualReceiptStorage, key);
-    else sessionStorage.removeItem(manualReceiptStorage);
-  } catch { /* The receipt still survives a reconnect within this page. */ }
+    const legacy = sessionStorage.getItem(manualReceiptStorage);
+    if (legacy && manualCommands.remember('legacy', legacy)) sessionStorage.removeItem(manualReceiptStorage);
+  } catch { /* The active tab can still retain an in-memory reference. */ }
+  const refs = manualCommands.records();
+  if (!refs.has(manualReceiptKey)) manualReceiptKey = refs.keys().next().value || '';
 }
 
+function clearManualReceipt() {
+  if (manualReceiptKey) manualCommands.forget(manualCommands.records().get(manualReceiptKey), manualReceiptKey);
+  manualReceiptKey = '';
+}
+
+const ruleCommands = new CommandReceipts('model-quality:rule-commands:' + managementPrefix, newKey);
 const shortcutStorage = `model-quality:rule-model-shortcuts:${managementPrefix}`;
 let selectedRuleModels = [], customShortcuts = [], shortcutsLoaded = false, shortcutStorageNote = '';
 const client = new ManagementClient(managementPrefix, key => {
-  const saved = savedBrowserKey();
-  if (pageAccess && saved !== null && saved !== pageAccess.expectedStorage) return syncStoredAccess();
+  if (pageAccess && syncStoredAccess()) return;
   disconnect('当前浏览器的管理鉴权已失效，请输入有效密钥。后台授权状态需在登录后核对。', true, { expectedKey: key });
 });
 const api = async (path, method = 'GET', body, options) => {
-  try { return await client.request(path, method, body, options); }
+  try { return await (method === 'GET' && !options?.fresh && pageAccess?.admission?.take(state.page, path) || client.request(path, method, body, options)); }
   catch (error) {
     if (error.detail?.startsWith('blocked: provider ')) error.message = reasonLabel(error.detail);
     throw error;
   }
 };
 const loginWorkbench = createLoginWorkbench({
-  request: (path, method = 'GET', body, idempotencyKey) => client.requestHostLogin(path, method, body, idempotencyKey),
+  request: (path, method = 'GET', body, idempotencyKey) => method === 'GET' && pageAccess?.admission?.take('login', '/login' + path) || client.requestHostLogin(path, method, body, idempotencyKey),
   connected: () => state.connected,
   visible: () => pageDisplayed(),
-  onCommitted: () => refresh(),
+  onFreshness: (failed, loading) => { if (state.connected && state.page === 'login') renderFreshness(failed, loading); },
+  onCommitted: () => { targetsReadAt = 0; state.targetsFresh = false; if (state.page !== 'login') return refresh(); },
 });
 
 let stopThemeFollowing = () => {};
@@ -247,7 +256,7 @@ function protectEditor(action) {
   actionDialog({ title: '放弃未保存的更改？', description: '当前编辑尚未保存。放弃后将关闭这些更改，已保存的规则和预算不受影响。', confirm: '放弃更改', danger: true, submit: action });
 }
 
-const uncertainRuleSaveMessage = '保存结果未确认，草稿已保留，已禁止重复保存。请关闭草稿并核对规则列表；列表暂时没有此规则不代表保存失败。';
+const uncertainRuleSaveMessage = '保存结果未确认，草稿已保留。正在按原请求标识读取受理回执。';
 async function saveEditor(action) {
   const editor = state.editor;
   if (!editor || editor.saving) return;
@@ -329,32 +338,14 @@ async function safely(action, key = '', button = null) {
 }
 
 function updateFreshness() {
-  const statuses = Object.values(state.resourceStatus);
-  const failed = statuses.includes('error');
-  if (!failed && statuses.includes('loading')) return;
-  $('data-state').textContent = failed ? '部分数据更新失败，请刷新重试' : `更新于 ${new Date().toLocaleTimeString('zh-CN', { hour12: false })}`;
+  if (state.page === 'login') return;
+  const resources = state.page === 'manual' ? ['targets','questions','history'] : ['targets','questions','actions','rules','activity','metrics','settings'];
+  const statuses = resources.map(name => state.resourceStatus[name]);
+  renderFreshness(statuses.includes('error'), statuses.includes('loading'));
+}
+function renderFreshness(failed, loading) {
+  $('data-state').textContent = failed ? '部分数据更新失败，请刷新重试' : loading ? '正在读取页面数据…' : `更新于 ${new Date().toLocaleTimeString('zh-CN', { hour12: false })}`;
   $('data-state').classList.toggle('stale', failed);
-}
-
-function saveManagementKey(key) {
-  try {
-    localStorage.setItem(managementKeyStorage, key);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function forgetManagementKey(expectedKey) {
-  try {
-    // An expired session in another tab must not remove a newly saved credential.
-    if (expectedKey === undefined || localStorage.getItem(managementKeyStorage) === expectedKey) {
-      localStorage.removeItem(managementKeyStorage);
-    }
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 const backendLabels = {
@@ -367,37 +358,6 @@ let pageAccess = null, connectionTimer = null, candidateClient = null;
 let statusSequence = 0, statusNextRead = 0, statusError = '', statusFailures = 0;
 let editorRevision = null, backendWritePending = false, pageSuspended = false;
 
-function savedBrowserKey() {
-  try { return localStorage.getItem(managementKeyStorage)?.trim() || ''; }
-  catch { return null; }
-}
-
-let localSetupIntent = null;
-function setupIntent() {
-  try {
-    const value = localStorage.getItem(migrationStorage);
-    return value ? JSON.parse(value) : localSetupIntent;
-  } catch { return localSetupIntent; }
-}
-
-function rememberSetup(intent) {
-  localSetupIntent = intent;
-  try { localStorage.setItem(migrationStorage, JSON.stringify(intent)); } catch { /* A blocked browser store still permits an in-page retry. */ }
-}
-
-function initialSetup(access, backend, first) {
-  const previous = setupIntent();
-  if (previous?.retryAt && previous.revision === backend.revision && (backend.can_migrate || backend.state === 'invalid')) {
-    if (Date.now() >= previous.retryAt) return previous;
-    statusNextRead = Math.min(statusNextRead, previous.retryAt);
-    return null;
-  }
-  if (!first) return null;
-  if (!access.restoring && (backend.can_migrate || backend.state === 'invalid')) return { revision: backend.revision, mode: 'configure' };
-  if (access.restoring && backend.can_migrate && !previous) return { revision: backend.revision, mode: 'migrate' };
-  return null;
-}
-
 function validBackend(data) {
   if (!data || !Number.isSafeInteger(data.revision) || data.revision < 0 ||
       !Object.hasOwn(backendLabels, data.state) || typeof data.configured !== 'boolean') {
@@ -406,14 +366,23 @@ function validBackend(data) {
   return data;
 }
 
+function accessStatusLabel(backend) {
+  if (pageAccess?.readError && state.connected) return '后台状态更新失败';
+  return backend ? backendLabels[backend.state] : '后台状态待读取';
+}
+
 function renderConnection() {
   const backend = state.backend;
-  const label = backendWritePending ? '正在核实后台配置' : backend ? backendLabels[backend.state] : '后台状态待读取';
+  const label = backendWritePending ? '正在核实后台配置' : accessStatusLabel(backend);
   const browser = state.connected ? '当前浏览器已通过 CPA 鉴权。' : '当前浏览器尚未验证。';
   const source = backend?.source === 'deployment' ? '（部署 Secret）' : '';
-  const diagnostic = backend?.code && backend.state === 'error' ? `（${backend.code}）` : '';
-  $('connection-status').textContent = [browser, backend && label + source + diagnostic + '。', pageAccess?.readError, statusError].filter(Boolean).join(' ');
-  $('connection-state').textContent = pageAccess?.readError ? '页面数据暂不可达' : !backendWritePending && backend?.state === 'ready' ? '已连接' : label;
+  const problem = { management_invalid_response: 'CPA 管理接口返回的格式无效', connection_invalidation_save_failed: '失效密钥已停用，后台正在等待私有目录可写以保存失效标记' }[backend?.code] || backend?.code;
+  const diagnostic = problem ? `（${problem}）` : '';
+  const retryAt = Date.parse(backend?.next_attempt_at);
+  const retryLabel = backend?.code === 'connection_invalidation_save_failed' ? '下次保存失效标记' : '后台下次核验时间';
+  const retry = Number.isFinite(retryAt) ? `${retryLabel} ${new Date(retryAt).toLocaleTimeString('zh-CN', { hour12: false })}。` : '';
+  $('connection-status').textContent = [browser, backend && label + source + diagnostic + '。', retry, pageAccess?.readError, statusError].filter(Boolean).join(' ');
+  $('connection-state').textContent = pageAccess?.readError ? (state.connected ? label : '页面数据暂不可达') : !backendWritePending && backend?.state === 'ready' ? '已连接' : label;
   $('connection-state').parentElement.dataset.backend = pageAccess?.readError ? 'stale' : backend?.state || '';
   $('connection-submit').textContent = state.connected ? (backend?.configured ? '更新后台密钥' : '保存后台连接') : '连接';
   $('connection-clear').hidden = !state.connected || !backend || (backend.state === 'unconfigured' && !backend.can_migrate);
@@ -426,21 +395,17 @@ function showConnectionDialog() {
   editorRevision = state.backend?.revision ?? null;
   renderConnection();
   $('connection-dialog').showModal();
-  if (pageAccess && !backendWritePending) void readConnection(pageAccess);
-}
-
-function publishRevision() {
-  try { localStorage.setItem(connectionRevisionStorage, String(state.backend.revision)); } catch { /* GET still returns the durable revision. */ }
+  if (pageAccess && !backendWritePending && (state.connected || !pageAccess.admitting)) void readConnection(pageAccess);
 }
 
 function scheduleConnectionRead() {
   clearTimeout(connectionTimer);
-  if (!pageAccess || !pageDisplayed() || backendWritePending || pageAccess.reading) return;
+  if (!pageAccess || !pageDisplayed() || backendWritePending || pageAccess.reading || !state.connected && pageAccess.admitting) return;
   connectionTimer = setTimeout(() => readConnection(pageAccess), Math.max(0, statusNextRead - Date.now()));
 }
 
 function restoreManagementConnection() {
-  const key = savedBrowserKey();
+  const key = browserAuth.savedKey();
   if (key) return connectManagement(key, { restoring: true });
   document.body.removeAttribute('data-resuming');
   if (key === null) notice('浏览器未允许本地存储，本次页面需输入管理密钥。');
@@ -448,20 +413,43 @@ function restoreManagementConnection() {
 
 function establishBrowserAccess(access) {
   if (state.connected || pageAccess !== access) return;
+  if (syncStoredAccess()) return;
+  browserAuth.verified(access);
   state.connected = true;
   document.body.classList.add('connected');
   document.body.removeAttribute('data-resuming');
   $('data-state').textContent = '正在读取页面数据…';
   $('management-key').value = '';
-  $('connection-dialog').close();
+  if (!access.restoring) $('connection-dialog').close();
+  renderConnection();
   rememberWorkspace();
   renderAdmission();
   renderHistory();
   renderRules();
   renderActivityState();
   openCurrentWorkbench();
-  if (manualReceiptKey) void checkManualReceipt(manualSelection(), false);
-  else schedulePoll();
+  if (state.page === 'manual') resumeManualReceipts();
+  schedulePoll();
+  if (!access.expectedStorage) notice('当前浏览器未能保存身份。重新打开页面时需要再次输入管理密钥。');
+}
+
+function admitWorkspace(access, fetchStatus = true) {
+  if (pageAccess !== access || access.admitting) return access.admitting;
+  const firstPage = { login: loginWorkbench.entryResource, manual: '/targets?limit=100&offset=0', operations: '/rules?limit=100&offset=0' }[state.page];
+  const admission = access.admission = new WorkspaceAdmission(state.page, firstPage, path => client.request(path));
+  access.admitting = (async () => {
+    try {
+      await admission.response;
+      if (pageAccess !== access) return;
+      establishBrowserAccess(access);
+    } catch (error) {
+      if (pageAccess !== access || isDiscarded(error)) return;
+      // A failure in one resource cannot decide the browser's access to another.
+      // A definitive host rejection has already ended this session in the client.
+    }
+    if (fetchStatus && pageAccess === access && !access.reading) await readConnection(access);
+  })().finally(() => { access.admitting = null; if (pageAccess === access) scheduleConnectionRead(); });
+  return access.admitting;
 }
 
 async function readConnection(access) {
@@ -472,33 +460,35 @@ async function readConnection(access) {
     try {
       const backend = validBackend(await api('/connection'));
       if (pageAccess !== access || sequence !== statusSequence) return;
-      const saved = savedBrowserKey();
-      if (saved !== null && saved !== access.expectedStorage) return syncStoredAccess();
-      const first = !state.connected;
-      if (first && !access.restoring && saveManagementKey(access.key)) access.expectedStorage = access.key;
+      if (syncStoredAccess()) return;
+      const first = !access.seenBackend;
+      access.seenBackend = true;
       const previous = state.backend?.state;
       state.backend = backend;
       if (state.connected) {
         if (previous !== backend.state) renderAdmission();
-        recoverVisibleData(previous !== backend.state);
+        if (!first) recoverVisibleData(previous !== backend.state);
       }
       if (editorRevision === null && $('connection-dialog').open) editorRevision = backend.revision;
       statusFailures = 0;
       if (access.readError && !state.connected) clearNotice();
       access.readError = '';
       statusNextRead = Date.now() + (backend.state === 'waiting' ? 5000 : 30000);
-      const setup = initialSetup(access, backend, first);
+      const { command: setup, retryAt } = browserAuth.setupPlan(access, backend, first);
+      if (retryAt) statusNextRead = Math.min(statusNextRead, retryAt);
       establishBrowserAccess(access);
       if (setup) await changeBackend(access, 'PUT', backend.revision, setup.mode, '', setup);
-      if (first && !access.expectedStorage) notice('当前浏览器未能保存身份。重新打开页面时需要再次输入管理密钥。');
     } catch (error) {
       if (pageAccess !== access || sequence !== statusSequence || isDiscarded(error)) return;
-      access.readError = `页面数据暂不可达。${error.message}`;
+      access.readError = `${state.connected ? '后台授权状态更新失败。' : '页面数据暂不可达。'}${error.message}`;
       statusFailures++;
       const delay = Math.min(60000, 2000 * 2 ** Math.min(statusFailures - 1, 5));
       statusNextRead = Date.now() + Math.max(error.retryAfterMs || 0, error.status === 403 ? 30000 : delay);
       document.body.removeAttribute('data-resuming');
-      if (!state.connected) notice(access.readError + ' 将自动重试读取。', true);
+      if (!state.connected) {
+        notice(access.readError + ' 将自动重试读取。', true);
+        if (!access.admitting && ![401, 403, 429].includes(error.status)) void admitWorkspace(access, false);
+      }
     } finally {
       if (pageAccess === access) {
         access.reading = null;
@@ -516,18 +506,18 @@ function connectManagement(key, { restoring = false } = {}) {
   if (pageAccess?.key === key) return readConnection(pageAccess);
   clearTimeout(connectionTimer);
   client.open(key);
-  pageAccess = { key, restoring, reading: null, expectedStorage: savedBrowserKey() };
+  pageAccess = browserAuth.open(key, restoring);
   statusFailures = 0;
   statusNextRead = 0;
   statusError = '';
   document.body.toggleAttribute('data-resuming', restoring);
-  return readConnection(pageAccess);
+  return restoring ? admitWorkspace(pageAccess) : readConnection(pageAccess);
 }
 
 async function changeBackend(access, method, revision, mode, replacement = '', setup = null) {
   if (pageAccess !== access || !Number.isSafeInteger(revision) || backendWritePending) return;
-  const saved = savedBrowserKey();
-  if (saved !== null && saved !== access.expectedStorage) return syncStoredAccess();
+  if (syncStoredAccess()) return;
+  const saved = browserAuth.savedKey();
   const switching = !!replacement && replacement !== access.key;
   const transport = switching ? new ManagementClient(managementPrefix, () => {
     throw Object.assign(new Error('输入的密钥未通过 CPA 鉴权。'), { status: 401 });
@@ -540,16 +530,14 @@ async function changeBackend(access, method, revision, mode, replacement = '', s
   renderConnection();
   try {
     // An interrupted page may only reconcile an attempted write with a read.
-    rememberSetup({ attempted: true });
+    browserAuth.rememberIntent({ attempted: true });
     const body = method === 'PUT' ? { revision, mode } : { revision };
     const next = validBackend(await transport.request('/connection', method, body));
     if (!current()) return;
-    if (savedBrowserKey() !== saved) return syncStoredAccess();
+    if (browserAuth.savedKey() !== saved) return syncStoredAccess();
     if (switching) {
-      const remembered = saveManagementKey(replacement);
+      const remembered = browserAuth.remember(access, replacement);
       client.open(replacement);
-      access.key = replacement;
-      access.expectedStorage = savedBrowserKey();
       if (!remembered) notice('已更新后台授权，但浏览器未能保存新身份。', true);
     }
     const backendChanged = next.state !== state.backend?.state;
@@ -563,7 +551,7 @@ async function changeBackend(access, method, revision, mode, replacement = '', s
     editorRevision = next.revision;
     statusNextRead = Date.now() + (next.state === 'waiting' ? 5000 : 30000);
     $('management-key').value = '';
-    publishRevision();
+    browserAuth.notifyRevision(next.revision);
     if (mode === 'configure') $('connection-dialog').close();
     if (method === 'DELETE') notice('已清除后台管理配置。当前浏览器仍可查询账号、规则和任务。');
   } catch (error) {
@@ -571,21 +559,11 @@ async function changeBackend(access, method, revision, mode, replacement = '', s
     if (error.status === 409 || error.outcomeUnknown) editorRevision = null;
     const note = error.outcomeUnknown ? '后台配置写入结果待核对。页面将只读取状态。' :
       error.status === 409 ? '后台配置版本已变化，请核对最新状态后重新操作。' :
-      error.status === 507 ? '保存失败，后台重启恢复尚未配置成功。' : '后台连接未更新。';
+      error.status === 507 ? '本次配置保存失败。请检查插件数据卷是否可写以及剩余空间。' : '后台连接未更新。';
     const detail = { management_key_invalid: '提交的密钥未通过后台 CPA 鉴权。', management_restricted: 'CPA 限制回环访问。', management_temporarily_banned: 'CPA 暂时封禁了回环访问。', management_rate_limited: 'CPA 管理接口正在限流。', management_network: '后台暂时无法连接 CPA。', management_unavailable: 'CPA 管理接口暂未就绪。' }[error.code];
     statusError = note + (detail || (error.status === 401 ? error.message : ''));
-    // CPA positively rejected this candidate before persistence. Retry only initial setup
-    // at the same revision. A lost or malformed receipt always goes through GET alone.
-    const prewrite = setup && !error.outcomeUnknown && error.source === 'backend_management' &&
-      ['management_network', 'management_unavailable', 'management_restricted', 'management_temporarily_banned', 'management_rate_limited'].includes(error.code);
-    if (prewrite) {
-      const attempts = Math.min((setup.attempts || 0) + 1, 6);
-      const minimum = ['management_restricted', 'management_temporarily_banned', 'management_rate_limited'].includes(error.code) ? 30000 : 2000;
-      const delay = Math.min(120000, minimum * 2 ** (attempts - 1)) * (1 + Math.random() * 0.25);
-      statusNextRead = Date.now() + Math.max(error.retryAfterMs || 0, delay);
-      rememberSetup({ revision, mode, attempts, retryAt: statusNextRead });
-      statusError += ' 页面将在 CPA 就绪后继续首次配置。';
-    } else statusNextRead = 0;
+    statusNextRead = browserAuth.retrySetup(setup, error);
+    if (statusNextRead) statusError += ' 页面将在 CPA 就绪后继续首次配置。';
     notice(statusError, true);
   } finally {
     if (switching) { transport.clear(); if (candidateClient === transport) candidateClient = null; }
@@ -598,10 +576,10 @@ async function changeBackend(access, method, revision, mode, replacement = '', s
 }
 
 function syncStoredAccess() {
-  const saved = savedBrowserKey();
-  if (saved === null || saved === (pageAccess?.expectedStorage || '')) return;
-  disconnect(saved ? '' : '已退出此浏览器。后台任务继续按原许可执行。', false, { forgetKey: false });
-  if (saved) void connectManagement(saved, { restoring: true });
+  return browserAuth.changed(pageAccess, saved => {
+    disconnect(saved ? '' : '已退出此浏览器。后台任务继续按原许可执行。', false, { forgetKey: false });
+    if (saved) void connectManagement(saved, { restoring: true });
+  });
 }
 
 function disconnect(
@@ -616,9 +594,13 @@ function disconnect(
   backendWritePending = false;
   statusSequence++;
   state.backend = null;
+  $('rule-command-note').hidden = true;
+  $('rule-command-note').textContent = '';
+  $('manual-command-note').hidden = true;
+  $('manual-command-note').textContent = '';
   statusError = '';
   editorRevision = null;
-  const forgotten = !forgetKey || forgetManagementKey(expectedKey);
+  const forgotten = !forgetKey || browserAuth.forget(expectedKey);
   document.body.removeAttribute('data-resuming');
   if (forgetKey && window.self !== window.top) {
     try { sessionStorage.removeItem(workspaceStorage); } catch { /* Storage is optional. */ }
@@ -729,13 +711,15 @@ function openCurrentWorkbench() {
     loginWorkbench.open({ focus: false });
   } else {
     loginWorkbench.close({ focus: false });
-    if (state.connected && !state.resourceStatus.questions) void safely(refresh);
+    if (!state.connected) return;
+    if (!state.resourceStatus.questions || state.page === 'operations' && !state.resourceStatus.rules) void safely(refresh);
+    else if (state.page === 'manual' && !state.resourceStatus.history) void safely(loadHistory);
   }
 }
 
 function setPage(page) {
   const previous = state.page;
-  if (page !== state.page) clearNotice();
+  if (page !== state.page) { workspaceGeneration++; clearNotice(); }
   state.page = ['login', 'manual', 'operations'].includes(page) ? page : 'login';
   openCurrentWorkbench();
   $('page-manual').classList.toggle('hidden', state.page !== 'manual');
@@ -751,7 +735,12 @@ function setPage(page) {
   history.replaceState(null, '', `#${state.page}`);
   rememberWorkspace();
   scheduleWorkspaceLayout();
-  if (previous !== state.page) syncOperationsVisibility();
+  if (previous !== state.page) {
+    if (state.page === 'manual') resumeManualReceipts();
+    if (state.connected) updateFreshness();
+    if (pageAccess && !state.connected && pageAccess.admitting) void readConnection(pageAccess);
+    syncOperationsVisibility();
+  }
 }
 
 let workspaceLayoutFrame = 0;
@@ -1129,7 +1118,7 @@ function renderTarget(selectModel = false) {
     $('target-summary').textContent = resourceMessage('targets', `测试${subject}`) ||
       (missingSelection ? missing : state.targets.length ? '' : empty);
   } else {
-    const reason = !state.targetsFresh ? '凭证目录读取失败，当前状态未确认。请刷新重试。' : credentialBlock({ auth_id: targetID(target), models: selected ? [selected] : [] }, state.targets, { manual: true });
+    const reason = provider && !state.providerDirectoryVerified ? '供应商目录更新失败，显示上次已读数据。' : !state.targetsFresh ? '凭证目录读取失败，当前状态待核实。' : credentialBlock({ auth_id: targetID(target), models: selected ? [selected] : [] }, state.targets, { manual: true });
     $('target').title = target.is_provider ? providerTargetName(target) : target.email || targetID(target);
     $('target-summary').classList.toggle('field-state', !reason && !provider);
     patchView($('target-summary'), reason ? `<span class="error-note">${escapeHTML(reason)}</span>` : provider ? '通过 CPA 原生路由测试' : '凭证可用');
@@ -1277,9 +1266,10 @@ function manualBindingProblem(config, target) {
   return '';
 }
 
-function blockedManualConfig(config) {
+function blockedManualConfig(config, verified = false) {
   const target = findTarget(config.auth_id);
-  if (target?.is_provider && state.backend?.state !== 'ready') return (backendLabels[state.backend?.state] || '后台状态待读取') + '，暂不能核实供应商配置。';
+  if (verified && target?.is_provider && !state.providerDirectoryVerified) return '供应商目录暂不可核实，未提交测试。';
+  if (!verified && target?.is_provider && state.backend && state.backend.state !== 'ready') return (backendLabels[state.backend?.state] || '后台状态待读取') + '，暂不能核实供应商配置。';
   const binding = manualBindingProblem(config, target);
   if (binding) return binding;
   if ((config.provider_name || config.provider_observation || config.expected_object_type === 'provider') &&
@@ -1293,11 +1283,12 @@ function blockedManualConfig(config) {
 
 function canRefreshManualState(config) {
   const target = findTarget(config.auth_id);
-  if (target?.is_provider && state.backend?.state !== 'ready') return false;
-  if (!state.connected || !state.targetsFresh || state.resourceStatus.questions !== 'ready' || !target ||
-    target.quality_paused || target.retained_pause || target.handling_state_reason ||
+  if (!state.connected || state.resourceStatus.questions !== 'ready' || !target ||
+    target.quality_paused || target.retained_pause || target.handling_state_reason || target.reasons?.includes('identity_conflict') ||
     target.credential_handling && !['disabled', 'restored', 'acknowledged', 'externally_enabled'].includes(target.credential_handling)) return false;
-  if (!(target.manual_disabled || target.runtime_status === 'disabled')) return false;
+  const needsRead = !state.targetsFresh || (target.is_provider && (!state.providerDirectoryVerified || state.backend?.state !== 'ready'));
+  const disabled = target.manual_disabled || target.runtime_status === 'disabled';
+  if (!disabled && (!needsRead || credentialBlock(config, state.targets, { manual: true }))) return false;
   if (manualBindingProblem(config, target) || config.provider && config.provider !== target.provider) return false;
   return config.models?.length > 0 && config.models.every(model => availableModels(target).includes(model) ||
     manualTargetDraft.models.get(targetID(target)) === model);
@@ -1326,7 +1317,7 @@ function renderAdmission() {
   $('release-confirm').disabled = state.releaseBlocked || state.busy.has('release') || !state.connected;
   const ruleSave = $('rule-form').querySelector('button[type="submit"]');
   ruleSave.disabled = !state.connected || !!state.editor?.saving || !!state.editor?.saveUncertain;
-  ruleSave.title = state.editor?.saveUncertain ? '保存结果未确认，请先关闭草稿并核对规则列表。' : '';
+  ruleSave.title = state.editor?.saveUncertain ? '保存结果未确认，正在核对请求回执。' : '';
   for (const id of [
     'ops-all-rules',
     'run-export',
@@ -1343,17 +1334,56 @@ function renderAdmission() {
 }
 
 function newKey() {
-  return globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  return globalThis.crypto.randomUUID?.() || Array.from(globalThis.crypto.getRandomValues(new Uint8Array(16)), byte => byte.toString(16).padStart(2, '0')).join('');
 }
 
 function manualSelection() {
   return { sequence: state.reads.run, scope: feedbackScope() };
 }
 
+function resumeManualReceipts() {
+  if (!state.connected || state.pendingManual) return;
+  restoreManualReceipt();
+  if (manualReceiptKey) void checkManualReceipt(manualSelection(), false);
+  const epoch = client.epoch, generation = workspaceGeneration;
+  void (async () => {
+    for (const [id, slot] of manualCommands.records()) {
+      const current = () => state.connected && epoch === client.epoch && state.page === 'manual' && workspaceGeneration === generation && pageDisplayed();
+      if (!current()) return;
+      if (id === manualReceiptKey) continue;
+      let label, finished = false;
+      try {
+        const run = await readManualReceipt(id);
+        label = '已受理 · 任务 ' + run.id;
+        finished = !active(run);
+      } catch (error) {
+        if (isDiscarded(error)) return;
+        finished = error.status === 410 && error.code === 'gone';
+        label = finished ? '历史记录已清理' : missingManualReceipt(error) ? '尚未查到受理回执' : '回执待读取';
+      }
+      if (!current()) return;
+      const line = receiptLine($('manual-command-note'), id);
+      line.textContent = `手动测试 · ${label} · ${id}`;
+      line.dataset.finished = String(finished);
+      if (finished) manualCommands.forget(slot, id);
+    }
+  })();
+}
+
+function missingManualReceipt(error) {
+  return notAccepted(error) || error.status === 404 && error.code === 'not_found' && error.detail === 'not_found: submission receipt';
+}
+async function readManualReceipt(key) {
+  const reply = await api(`/runs/detail?idempotency_key=${encodeURIComponent(key)}`);
+  const run = reply?.run || reply;
+  if (!run?.id || run.source !== 'manual_test' || run.config?.idempotency_key !== key) throw new Error('任务回执尚未确认。');
+  return run;
+}
+
 function trackManualRun(run, selection, focus) {
   state.pollFailures = 0;
   state.pendingManual = active(run) ? { id: run.id, status: run.status } : null;
-  if (!state.pendingManual) rememberManualReceipt('');
+  if (!state.pendingManual) clearManualReceipt();
   if (selection.sequence === state.reads.run) {
     ++state.reads.run;
     state.historyOrigin = null;
@@ -1367,7 +1397,7 @@ function trackManualRun(run, selection, focus) {
   }
   renderAdmission();
   schedulePoll(0);
-  void safely(loadHistory);
+  if (state.page === 'manual' && pageDisplayed()) void safely(loadHistory);
 }
 
 // Only an explicit submit may send a POST. A missing receipt can still be
@@ -1378,20 +1408,20 @@ async function checkManualReceipt(selection, focus) {
   state.pendingManual = pending;
   renderAdmission();
   try {
-    const reply = await api(`/runs/detail?idempotency_key=${encodeURIComponent(key)}`);
+    const run = await readManualReceipt(key);
     if (state.pendingManual !== pending) return;
-    const run = reply.run || reply;
-    if (!run?.id || run.source !== 'manual_test' || run.config?.idempotency_key !== key) throw new Error('任务回执尚未确认。');
     trackManualRun(run, selection, focus);
   } catch (error) {
     if (state.pendingManual !== pending || isDiscarded(error)) return;
-    if (error.status === 404 || error.status === 410) {
+    const missing = missingManualReceipt(error);
+    const removed = error.status === 410 && error.code === 'gone';
+    if (missing || removed) {
       state.pendingManual = null;
       state.pollFailures = 0;
-      if (error.status === 410) rememberManualReceipt('');
+      if (removed) clearManualReceipt();
       renderAdmission();
       schedulePoll();
-      return error.status === 404 ? 'missing' : 'removed';
+      return missing ? 'missing' : 'removed';
     }
     state.pollFailures = Math.min(state.pollFailures + 1, 4);
     schedulePoll();
@@ -1401,8 +1431,14 @@ async function checkManualReceipt(selection, focus) {
 async function submitRun(config, binding = config) {
   if (state.pendingManual) return;
   const selection = manualSelection(), epoch = client.epoch;
-  const retry = !!manualReceiptKey;
+  const current = () => state.connected && client.epoch === epoch && state.page === 'manual' && pageDisplayed();
+  const slot = await commandSlot('manual', config);
+  if (!current()) return;
+  const previous = Array.from(manualCommands.records()).find(([id,known]) => known === slot || (known === 'legacy' && id === manualReceiptKey));
+  let retry = !!previous;
+  manualReceiptKey = previous?.[0] || '';
   if (retry && await checkManualReceipt(selection, true) !== 'missing') return;
+  if (!current()) return;
   let targetRead = loadTargets({ fresh: true });
   for (;;) {
     try { await targetRead; }
@@ -1411,11 +1447,17 @@ async function submitRun(config, binding = config) {
     if (targetRead === latestTargetsRead) break;
     targetRead = latestTargetsRead;
   }
-  if (epoch !== client.epoch) return;
-  const blocked = blockedManualConfig(binding);
+  if (!current()) return;
+  const blocked = blockedManualConfig(binding, true);
   if (blocked) throw new Error(blocked);
-  const key = manualReceiptKey || newKey();
-  rememberManualReceipt(key);
+  if (!retry) {
+    const claim = await manualCommands.claim(slot, current);
+    manualReceiptKey = claim.id;
+    retry = claim.existing;
+    if (retry && await checkManualReceipt(selection, true) !== 'missing') return;
+  }
+  if (!current()) return;
+  const key = manualReceiptKey;
   let id;
   try {
     const reply = await api('/runs', 'POST', { ...config, idempotency_key: key });
@@ -1423,7 +1465,7 @@ async function submitRun(config, binding = config) {
   } catch (error) {
     if (isDiscarded(error)) return;
     if (!error.outcomeUnknown && error.status < 500 && error.status !== 408 && !(retry && error.status === 409)) {
-      if (!retry || error.status === 410) rememberManualReceipt('');
+      if (!retry || error.status === 410) clearManualReceipt();
       if (error.code === 'blocked') error.message = manualIssueLabel(error.detail);
       throw error;
     }
@@ -1443,7 +1485,7 @@ function updateRunProgress(run) {
   const id = run.id || run.run_id;
   if (id === state.pendingManual?.id) {
     state.pendingManual = active(run) ? { id, status: run.status } : null;
-    if (!state.pendingManual) rememberManualReceipt('');
+    if (!state.pendingManual) clearManualReceipt();
   }
   const row = state.runs.findIndex(item => (item.id || item.run_id) === id);
   if (row >= 0) {
@@ -1480,7 +1522,7 @@ async function loadRun(id, show = true, historyOrigin = null) {
 function schedulePoll(delay = Math.min(10000, 1200 * 2 ** state.pollFailures)) {
   clearTimeout(state.poll);
   state.poll = null;
-  if (!state.connected || !pageDisplayed()) return;
+  if (!state.connected || state.page !== 'manual' || !pageDisplayed()) return;
   const pending = state.pendingManual;
   if (pending?.status === 'checking_receipt') {
     state.poll = setTimeout(() => {
@@ -1506,7 +1548,7 @@ function schedulePoll(delay = Math.min(10000, 1200 * 2 ** state.pollFailures)) {
         const missing = error.code === 'not_found' || error.status === 404;
         if (missing && id === state.pendingManual?.id) {
           state.pendingManual = null;
-          rememberManualReceipt('');
+          clearManualReceipt();
         }
         if (missing && id === selected) {
           state.run = { ...state.run, status: 'unavailable' };
@@ -1532,7 +1574,7 @@ function schedulePoll(delay = Math.min(10000, 1200 * 2 ** state.pollFailures)) {
     state.pollFailures = retry ? Math.min(state.pollFailures + 1, 4) : 0;
     renderAdmission();
     schedulePoll();
-    if (finished) await Promise.allSettled([loadHistory(), loadOperations()]);
+    if (finished && state.page === 'manual' && pageDisplayed()) await loadHistory();
   }, delay);
 }
 
@@ -1609,76 +1651,6 @@ $('quality-detail-cancel').addEventListener('click', event => {
     await readQualityDetail(detail);
   }, `cancel:${detail.id}`, event.currentTarget);
 });
-
-// Reconcile trusted view templates without replacing stable reading and editing nodes.
-function patchView(target, html) {
-  const template = document.createElement('template');
-  template.innerHTML = html;
-  const key = (node) => node.nodeType === 1 ? node.dataset.key || node.dataset.part ||
-    (node.matches('input,select') && node.closest('.sample-review') ? node.localName : node.id) || '' : '';
-  function patchChildren(parent, incoming) {
-    const existing = [...parent.childNodes];
-    const used = new Set();
-    let cursor = parent.firstChild;
-    const nextNodes = [...incoming.childNodes];
-    if (parent.nodeType === 1 && parent.matches('.comparison-grid')) {
-      nextNodes.sort((a, b) => {
-        const position = (node) => { const index = existing.findIndex((old) => key(old) === key(node)); return index < 0 ? existing.length : index; };
-        return position(a) - position(b);
-      });
-    }
-    for (const next of nextNodes) {
-      const nextKey = key(next);
-      const current = existing.find((node) => !used.has(node) && node.nodeType === next.nodeType &&
-        (nextKey ? key(node) === nextKey : !key(node) && node.nodeName === next.nodeName));
-      if (!current) { parent.insertBefore(next.cloneNode(true), cursor); continue; }
-      used.add(current);
-      if (current !== cursor) parent.insertBefore(current, cursor);
-      cursor = current.nextSibling;
-      if (current.nodeType === 3) {
-        if (current.nodeValue !== next.nodeValue) current.nodeValue = next.nodeValue;
-        continue;
-      }
-      if (current.nodeType !== 1) continue;
-      const field = current.matches('input,select,textarea');
-      const fieldValue = field ? current.value : null;
-      const preservedClasses = ['expanded', ...(current.matches('.model-result,.sample') ? ['hidden'] : [])].filter((name) => current.classList.contains(name));
-      for (const attribute of [...current.attributes]) {
-        if (['open', 'style', 'aria-busy'].includes(attribute.name)) continue;
-        if (attribute.name === 'srcdoc' && current.matches('iframe[data-inline-preview]')) continue;
-        if (!next.hasAttribute(attribute.name)) current.removeAttribute(attribute.name);
-      }
-      for (const attribute of [...next.attributes]) {
-        if (attribute.name === 'open') continue;
-        if (current.getAttribute(attribute.name) !== attribute.value) current.setAttribute(attribute.name, attribute.value);
-      }
-      current.classList.add(...preservedClasses);
-      const expandedButton = current.matches('[data-expand-sample]') && current.closest('.sample')?.querySelector('.answer-text.expanded');
-      if (expandedButton) current.setAttribute('aria-expanded', 'true');
-      else patchChildren(current, next);
-      if (field) current.value = fieldValue;
-    }
-    existing.filter((node) => !used.has(node)).forEach((node) => node.remove());
-  }
-  patchChildren(target, template.content);
-}
-
-const inlinePreviewDocuments = new WeakMap();
-function hydrateInlinePreviews(container, run) {
-  for (const frame of container.querySelectorAll('iframe[data-inline-preview]')) {
-    const sample = run.samples?.[Number(frame.dataset.inlinePreview) - (run.pruned_samples || 0)];
-    const output = sample?.output || '';
-    if (inlinePreviewDocuments.get(frame) === output) continue;
-    inlinePreviewDocuments.set(frame, output);
-    try {
-      frame.srcdoc = safePreview(output);
-    } catch {
-      const source = frame.nextElementSibling;
-      if (source?.matches('[data-source-sample]')) source.open = true;
-      frame.replaceWith(Object.assign(document.createElement('p'), { className: 'field-note', textContent: '作品预览暂不可用，原文仍可查看和复制。' }));
-    }
-  }
-}
 
 function renderRun() {
   const run = state.run;
@@ -1923,7 +1895,7 @@ function focusAfterCleanup(id) {
 function forgetManualRun(id) {
   if (state.readingRun?.id === id && state.readingRun.sequence === state.reads.run) ++state.reads.run;
   if ((state.run?.id || state.run?.run_id) === id) { state.run = null; renderRun(); }
-  if (state.pendingManual?.id === id) { state.pendingManual = null; rememberManualReceipt(''); }
+  if (state.pendingManual?.id === id) { state.pendingManual = null; clearManualReceipt(); }
   schedulePoll();
 }
 
@@ -2082,21 +2054,10 @@ function renderMetrics() {
     .join(''));
 }
 
-async function allPages(path, key, options) {
-  const list = [], seen = new Set(); let total, providerDirectoryVerified = true, orphanedHandling = [];
-  for (;;) {
-    const page = await api(`${path}?limit=100&offset=${list.length}`, 'GET', undefined, options);
-    providerDirectoryVerified &&= page.provider_directory_verified !== false;
-    if (path === '/rules' && !list.length) {
-      if (page.orphaned_handling !== undefined && !Array.isArray(page.orphaned_handling)) throw Error('处置目录格式无效，请刷新。');
-      orphanedHandling = page.orphaned_handling || [];
-    }
-    if (!Array.isArray(page.items) || !Number.isSafeInteger(page.total) || page.total < 0 || (total !== undefined && total !== page.total)) throw Error('目录已变化，请刷新。');
-    total = page.total;
-    for (const row of page.items) { const id = row[key]; if (!id || seen.has(id)) throw Error('目录已变化，请刷新。'); seen.add(id); list.push(row); }
-    if (list.length === total) return { items:list, total, providerDirectoryVerified, orphanedHandling };
-    if (!page.items.length || list.length > total) throw Error('目录读取不完整，请刷新。');
-  }
+function allPages(path, key, options) {
+  const generation = workspaceGeneration, epoch = client.epoch;
+  return readDirectory(path, key, url => api(url, 'GET', undefined, options), options?.fresh,
+    () => workspaceGeneration === generation && epoch === client.epoch && pageDisplayed());
 }
 
 async function loadActivity() {
@@ -2169,9 +2130,10 @@ function operationsVisible() {
   return state.connected && state.page === 'operations' && pageDisplayed();
 }
 
-function scheduleOperationsPoll(delay = 5000) {
+function scheduleOperationsPoll(delay) {
   clearTimeout(operationsPoll);
   if (operationsReading || !operationsVisible()) return;
+  delay ??= ruleCommands.records().size ? 1500 : state.activityRows?.some(qualityDetailActive) ? 5000 : 15000;
   operationsPoll = setTimeout(() => {
     if (operationsVisible()) void loadOperations(true).catch(() => {}); // Resource errors are displayed in their panels.
   }, delay);
@@ -2195,6 +2157,7 @@ function syncOperationsVisibility() {
   schedulePoll();
   loginWorkbench.syncVisibility?.();
   if (!pageDisplayed() || !state.connected) {
+    workspaceGeneration++;
     clearTimeout(operationsPoll);
     clearTimeout(qualityDetail?.timer);
     return;
@@ -2224,7 +2187,10 @@ function loadTargets(options) {
         state.targetsFresh = data !== undefined;
         state.resourceStatus.targets = data === undefined ? 'error' : 'ready';
         if (data) {
-          state.targets = items(data);
+          const rows = items(data);
+          const present = new Set(rows.map(targetID));
+          const retained = data.providerDirectoryVerified ? [] : state.targets.filter(t => t.is_provider && !present.has(targetID(t)));
+          state.targets = [...rows, ...retained];
           state.providerDirectoryVerified = data.providerDirectoryVerified;
         }
         renderTargetSelectors();
@@ -2275,6 +2241,7 @@ async function loadOperations(live = false) {
     renderActivityState();
   });
   const requests = [
+    ruleCommands.reconcile(readRuleCommand, showRuleCommand, ruleReceiptError, () => current() && operationsVisible()),
     rulesRead,
     read('metrics', api('/metrics?view=summary'), data => {
       if (data) state.metrics = data;
@@ -2326,9 +2293,11 @@ async function loadQuestions() {
 
 async function refresh() {
   const sequence = ++state.reads.refresh, runRead = state.reads.run;
-  await Promise.allSettled([loadQuestions(), loadOperations(), loadHistory()]);
+  if (state.page === 'login') return;
+  const requests = state.page === 'operations' ? [loadQuestions(), loadOperations()] : [loadQuestions(), loadTargets(), loadHistory()];
+  await Promise.allSettled(requests);
   if (sequence !== state.reads.refresh) return;
-  if (state.run && runRead === state.reads.run) await loadRun(state.run.id || state.run.run_id, false);
+  if (state.page === 'manual' && state.run && runRead === state.reads.run) await loadRun(state.run.id || state.run.run_id, false);
   const deletion = $('notice').dataset.ruleDeleteReceipt;
   if (deletion && state.page === 'operations' && state.resourceStatus.rules === 'ready' && state.resourceStatus.activity === 'ready') {
     notice(deletion, false, 'ops-all-rules');
@@ -2680,6 +2649,59 @@ function editRule(rule = {}) {
   openEditor('rule-dialog');
 }
 
+const readRuleCommand = id => api('/rules/commands?idempotency_key=' + encodeURIComponent(id));
+
+function showRuleCommand(slot, id, command) {
+  const kind = slot.startsWith('create:') ? 'create' : 'run';
+  if (command?.idempotency_key !== id || command.kind !== kind || !Object.hasOwn(commandStatus, command.state)) throw Error('规则操作回执格式无效。');
+  const node = receiptLine($('rule-command-note'), id);
+  if (node.dataset.finished === 'true' && !commandFinished(command.state)) return true;
+  const action = slot.startsWith('create:') ? '创建规则' : '立即执行';
+  const code = command.error?.code || command.code || '';
+  node.textContent = `${action} · ${commandStatus[command.state]}${code ? ' · ' + code : ''} · ${id}`;
+  node.hidden = false;
+  node.dataset.finished = String(commandFinished(command.state));
+  if (command.state === 'completed') {
+    if (slot.startsWith('create:') && state.editor?.commandID === id && state.editor.saveUncertain) closeSurface('rule-dialog', true);
+    const rule = state.rules.find(item => item.id === command.rule_id);
+    if (rule && command.result && scopeNumber(command.result.count)) showScopeReceipt(rule, command.result);
+  }
+  return commandFinished(command.state);
+}
+
+function ruleReceiptError(slot, id, error) {
+  if (isDiscarded(error)) return;
+  const node = receiptLine($('rule-command-note'), id);
+  if (node.dataset.finished === 'true') return;
+  if (notAccepted(error) && state.editor?.commandID === id) {
+    state.editor.saveUncertain = false;
+    notice('尚未查到本次保存的受理回执。可用原参数和请求标识再次提交。', true);
+    renderAdmission();
+  }
+  const issue = notAccepted(error) ? '尚未查到受理回执' : '回执待读取';
+  if (!node.textContent) node.textContent = `${slot.startsWith('create:') ? '创建规则' : '立即执行'} · ${issue} · ${id}`;
+  else if (!node.textContent.includes(issue)) node.append(' · ' + issue);
+  node.hidden = false;
+}
+
+async function submitRuleCommand(slot, send, editor) {
+  const epoch = client.epoch;
+  const { id, reply } = await ruleCommands.submit(slot, id => {
+    if (editor) editor.commandID = id;
+    return send(id);
+  }, readRuleCommand, () => state.connected && client.epoch === epoch);
+  if (!operationsVisible()) return { pending: true };
+  if (Object.hasOwn(commandStatus, reply?.state)) {
+    if (showRuleCommand(slot, id, reply)) ruleCommands.forget(slot, id);
+    return reply.state === 'completed' ? (reply.result || { id: reply.rule_id, revision: reply.revision }) : { pending: true };
+  }
+  // Older synchronized responses use the rule or batch body directly.
+  const valid = slot.startsWith('create:') ? reply?.id && Number.isSafeInteger(reply.revision) && reply.revision > 0 :
+    (typeof reply?.run_id === 'string' && reply.run_id || scopeNumber(reply?.count) && scopeNumber(reply.skipped) && (!reply.count || reply.scope_batch_id));
+  if (valid) ruleCommands.forget(slot, id);
+  return reply;
+}
+
 async function saveRule(editor) {
   const config = runConfig('rule-');
   const body = {
@@ -2712,7 +2734,9 @@ async function saveRule(editor) {
   }
   if (value('rule-id')) Object.assign(body, { id: value('rule-id'), revision: number('rule-revision') });
   try {
-    const saved = await api('/rules', body.id ? 'PUT' : 'POST', body);
+    const saved = body.id ? await api('/rules', 'PUT', body) :
+      await submitRuleCommand(await creationSlot(body), id => api('/rules', 'POST', { ...body, idempotency_key: id }), editor);
+    if (saved?.pending) { editor.saveUncertain = true; return; }
     if (!saved || typeof saved.id !== 'string' || !saved.id || !Number.isSafeInteger(saved.revision) || saved.revision < 1 ||
         body.id && (saved.id !== body.id || saved.revision <= body.revision)) {
       const failure = new Error('保存回执缺少有效规则标识或版本，请核对规则列表。');
@@ -2721,7 +2745,7 @@ async function saveRule(editor) {
     }
   }
   catch (error) {
-    if (!body.id && !isDiscarded(error) && (error.outcomeUnknown || !Number.isInteger(error.status) || error.status === 408 || error.status >= 500)) {
+    if (!body.id && !isDiscarded(error) && unknownReceipt(error)) {
       // A failed receipt does not prove creation failed. Retrying this POST
       // could create a second scheduled rule, so preserve the draft for review.
       editor.saveUncertain = true;
@@ -2974,7 +2998,7 @@ async function dispatchClick(event) {
     const config = rule.config || rule;
     if (!rule?.enabled || ruleHeld(rule))
       throw new Error('检测已停止。请先人工解除凭证暂停，再显式恢复检测规则。');
-    const run = () => api('/rules/run', 'POST', { id: rule.id, revision: rule.revision });
+    const run = () => submitRuleCommand('run:' + rule.id + ':' + rule.revision, key => api('/rules/run', 'POST', { id: rule.id, revision: rule.revision, idempotency_key: key }));
     if (dynamicScopeLabel(rule.target_scope) || rule.target_group || rule.authorized_groups?.length) {
       const epoch = client.epoch;
       const draft = {id:rule.id,revision:rule.revision,object_types:rule.object_types,target_scope:rule.target_scope,
@@ -3000,6 +3024,7 @@ async function dispatchClick(event) {
         let receipt;
         try {
           receipt = await run();
+          if (receipt?.pending) { scheduleOperationsPoll(1000); return; }
           if (!Number.isSafeInteger(receipt?.count) || receipt.count < 0 || !Number.isSafeInteger(receipt.skipped) || receipt.skipped < 0 || (receipt.count > 0 && !receipt.scope_batch_id)) throw Error('invalid receipt');
         } catch (error) {
           if (isDiscarded(error) || (error.status >= 400 && error.status < 500 && !error.outcomeUnknown)) throw error;
@@ -3018,6 +3043,7 @@ async function dispatchClick(event) {
       } }); return;
     }
     const reply = await run();
+    if (reply?.pending) { scheduleOperationsPoll(1000); return; }
     if (scopeNumber(reply.count)) showScopeReceipt(rule, reply);
     if (reply.run_id || reply.id) await Promise.all([openQualityDetail(reply.run_id || reply.id), loadActivity()]);
     else await loadOperations();
@@ -3362,10 +3388,9 @@ window.addEventListener('beforeunload', (event) => {
   if (editorDirty()) { event.preventDefault(); event.returnValue = ''; }
 });
 window.addEventListener('storage', event => {
-  if (event.key === managementKeyStorage || event.key === null) syncStoredAccess();
-  if (event.key === connectionRevisionStorage && pageAccess && pageDisplayed()) {
-    void readConnection(pageAccess);
-  }
+  browserAuth.storageEvent(event.key, syncStoredAccess, () => {
+    if (pageAccess && pageDisplayed()) void readConnection(pageAccess);
+  });
 });
 window.addEventListener('pagehide', event => {
   pageSuspended = true;

@@ -12,6 +12,7 @@ import (
 
 // changeSet publishes a state transition only after all of its records are durable.
 type changeSet struct {
+	ruleCommand  *ruleCommandRecord
 	hostInput    *Config
 	settings     *Config
 	disposition  *CredentialDisposition
@@ -27,13 +28,18 @@ type changeSet struct {
 func changes() *changeSet { return &changeSet{rules: map[string]*Rule{}, runs: map[string]*Run{}} }
 func (en *Engine) commitLocked(c *changeSet) error {
 	en.cancelRevokedSchedulesLocked(c)
-	if len(c.rules) == 0 && len(c.runs) == 0 && len(c.audits) == 0 && c.settings == nil && c.timers == nil && c.intent == nil && c.loginHold == nil && c.disposition == nil && len(c.dispositions) == 0 {
+	if c.ruleCommand == nil && len(c.rules) == 0 && len(c.runs) == 0 && len(c.audits) == 0 && c.settings == nil && c.timers == nil && c.intent == nil && c.loginHold == nil && c.disposition == nil && len(c.dispositions) == 0 {
 		return nil
 	}
 	if c.disposition != nil {
 		c.dispositions = append(c.dispositions, c.disposition)
 	}
 	err := en.store.Write(func(tx *bolt.Tx) error {
+		if c.ruleCommand != nil {
+			if err := putRuleCommand(tx, c.ruleCommand); err != nil {
+				return err
+			}
+		}
 		if c.hostInput != nil {
 			if err := putQualityHostInput(tx, *c.hostInput); err != nil {
 				return err
@@ -106,12 +112,20 @@ func (en *Engine) commitLocked(c *changeSet) error {
 		}
 		en.managed[d.AuthID] = d
 	}
+	// Continuations keep their immutable rows. The next unpinned query must
+	// reflect a locally observed enable, new ownership or credential login.
+	directoryChanged := len(c.dispositions) != 0 || c.loginHold != nil
 	for id, r := range c.rules {
 		if old := en.rules[id]; old != nil {
+			directoryChanged = directoryChanged || old.ActionID != r.ActionID || old.BlockedAuthID != r.BlockedAuthID || old.ActionID != "" && old.AuthID != r.AuthID
 			*old = *r
 		} else {
+			directoryChanged = directoryChanged || r.ActionID != "" || r.BlockedAuthID != ""
 			en.rules[id] = r
 		}
+	}
+	if directoryChanged {
+		en.directory.revision.Add(1)
 	}
 	for id, r := range c.runs {
 		if old := en.runs[id]; old != nil {
@@ -388,7 +402,7 @@ func (en *Engine) checkExecution(ctx context.Context, runID string, f Frozen) er
 		}
 	}
 	en.mu.Lock()
-	stateErr := currentTargetError(en.reconcileCurrentTargetsLocked(ctx, targets, dependencies(f.RunConfig)), dependencies(f.RunConfig))
+	stateErr := currentTargetError(en.reconcileDirectoryLocked(ctx, targets, dependencies(f.RunConfig)), dependencies(f.RunConfig))
 	if stateErr == nil {
 		stateErr = en.frozenDispositionLocked(f)
 	}
@@ -428,6 +442,13 @@ func (en *Engine) checkExecution(ctx context.Context, runID string, f Frozen) er
 			return fmt.Errorf("blocked: credential changed after dispatch")
 		}
 	}
+	var manualAccount string
+	if f.RuleID == "" && f.ManualAccountFingerprint != "" && f.ManualPolicyActionID == "" {
+		manualAccount, err = en.currentManualAccount(ctx, f.RunConfig, targets)
+		if err != nil {
+			return err
+		}
+	}
 	en.mu.Lock()
 	defer en.mu.Unlock()
 	r := en.runs[runID]
@@ -439,13 +460,6 @@ func (en *Engine) checkExecution(ctx context.Context, runID string, f Frozen) er
 	}
 	if err := en.frozenDispositionLocked(f); err != nil {
 		return err
-	}
-	var manualAccount string
-	if f.RuleID == "" && f.ManualAccountFingerprint != "" && f.ManualPolicyActionID == "" {
-		manualAccount, err = en.currentManualAccountLocked(ctx, f.RunConfig, targets)
-		if err != nil {
-			return err
-		}
 	}
 	if manualAccount != f.ManualAccountFingerprint {
 		return fmt.Errorf("blocked: 测试提交后 CPA 凭证绑定的账号已变化，请重新核对。")

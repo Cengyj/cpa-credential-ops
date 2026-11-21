@@ -96,6 +96,11 @@ func TestDeleteLoginHistoryRejectsActiveAndUnreconciledRecords(t *testing.T) {
 	} {
 		record := historyJob(tc.status, "", 0, time.Now())
 		record.View.Status, record.View.Action = tc.status, tc.action
+		// Public job detail is a journal read. Seed the accepted record as well
+		// as the live session on which deletion admission operates.
+		if err := s.journal.save(record); err != nil {
+			t.Fatal(err)
+		}
 		s.mu.Lock()
 		s.jobs[record.View.ID] = &session{record: record}
 		s.mu.Unlock()

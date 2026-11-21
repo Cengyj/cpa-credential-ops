@@ -1,3 +1,19 @@
+# 官方 CPA 插件管理接口
+
+以下 0.32.2 接口使用已鉴权前缀 `/v0/management/plugins/model-quality`。
+
+`GET /login/logs?id=任务ID` 可带 `cursor` 和 `limit`（1 至 200）。服务从同一条持久化记录核对任务 ID、删除标记和日志。返回的事件序号大于游标。整段保留窗口的范围由 `first_id`、`last_id`、`retained_count`、`truncated` 描述，本页由 `has_more`、`next_cursor` 描述。早期日志可省略 `event` 和部分字段，原记录的级别和 `legacy` 标志照常返回。[日志实现](../plugin/login/logs.go) · [分页兼容测试](../plugin/login/logs_test.go)
+
+任务历史已删除或任务不存在时返回 `404 not_found`。记录内 ID 错配、序号损坏、未知日志格式或诊断字段含未识别文本时，返回 HTTP 503，顶层字段为 `code=storage_unavailable`、`source=plugin`、`outcome_unknown=false`。坏行保持原样，相邻健康任务可以独立查询。同步失败时可重读同一任务，无需提交新的登录命令。[日志完整性与旧版回归](../plugin/login/logs_integrity_test.go)
+
+任务摘要独立于事件日志。正式详情、包含该任务的历史页和原键回执在摘要诊断字段损坏时返回 `503 storage_unavailable`，修复存储前保留原命令。干净的事件仍可按任务 ID 读取。账号列表会对关联的异常任务提示存储故障，保留该账号其他资料。页面只能取得旧摘要时，导出用 `read_incomplete=true` 标注；重新取得当前摘要及对应修订的事件后可以恢复完整状态。[摘要投影规则](../plugin/login/job_diagnostics.go) · [查询与回执回归](../plugin/login/job_projection_integrity_test.go)
+
+规则创建与立即执行通过 `GET /rules/commands?idempotency_key=原命令键` 查询收据，手动测试通过 `GET /runs/detail?idempotency_key=原命令键` 查询。已注册的插件返回结构化 `404 command_not_accepted` 才表示本次查询未找到收据。若收到普通路由 404，先从 `GET /v8/management/plugins` 核实插件已注册。质量库启动检查失败时，宿主仍可正常鉴权并返回插件登记信息，插件路由暂不可用。保留原命令键，恢复完整数据后再查。[官方宿主验收](../artifacts/verification-commercial-rounds/final/qa-quality-store-new.json) · [持久化与恢复](PERSISTENCE_CN.md)
+
+> 0.32.1 源码增加鉴权只读接口 `GET /v0/management/plugins/model-quality/login/commands?id=原请求键`。返回 `accepted` 和确切任务 ID 时，从 `job.status` 读取执行进度；`failed`、`expired` 与 `reconciliation_required` 保留各自含义。专用 `404 command_not_accepted` 表示查询时没有该命令。关联缺失时不得使用账号最近任务代替。该查询不创建新任务。[账号命令实现](../plugin/login/job_commands.go)
+>
+> 规则创建、异步派发、账号批次、稳定分页及后台连接状态见[服务和命令契约](SERVICE_LIFECYCLE_0_32_CN.md)。
+
 > 官方插件新增 `GET /connection`、`PUT /connection` 和 `DELETE /connection`，前缀均为 `/v0/management/plugins/model-quality`。请求字段、配置修订、回执及错误码见[后台连接和恢复](BACKGROUND_CONNECTION_CN.md)。
 >
 > 当前官方 CPA：`GET /v0/management/plugins/model-quality/rules/question-preview?id=logic-candy` 在管理鉴权后只读返回固定题的 ID、版本、题面和参考答案；未知、随机、自定义或视觉题返回 404。一般 `/questions` 列表仍不含参考答案。规则范围、Cron、保留条数及官方能力限制以[质量观察说明](QUALITY_SCOPE_CN.md)为准；下文 v8 业务路由表是早期补丁宿主的历史记录。
@@ -44,6 +60,8 @@
 | GET / PUT | /settings | 当前配置与更新 |
 
 分页为 offset（默认0）、limit（默认50，最大100），返回 `{items,total,offset,limit}`。GET /runs 支持 source=manual_test或scheduled_probe，其他值返回400；相同时间以ID稳定排序，先分页后复制输出。创建运行返回202与 `{run_id}`，再鉴权轮询；不是 SSE。JSON body 最大128KiB，拒绝重复字段和未知字段。
+
+`GET /targets` 的首页另返回 `snapshot`。续页携带原值可读取当时的有序目录，原快照过期或被淘汰后返回 `409 snapshot_expired`。多个首页读取共享一次扫描。若扫描期间插件确认了凭证重新授权或处置归属变化，服务会让这些读取共享一次新扫描。两次扫描都遇到变化时，首页返回 `503 unavailable`、`source=plugin`、`retryable=true`。此前签发的续页仍按原有效期读取。正式准入和外部写入各自读取当前证据。[目录实现](../plugin/quality/directory_pages.go) · [并发分页回归](../plugin/quality/directory_pages_test.go)
 
 错误结构 `{error:{code,message}}`；参数错误400，not_found为404，版本/幂等键冲突409，暂停状态冲突409，队列/预算429，不可用503，存储准入超限507，不支持能力422，幂等结果已过保留期410。对暂停凭证的新调用不能返回202后再消耗额度。
 

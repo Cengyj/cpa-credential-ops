@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"time"
 
 	"github.com/MoeForge/moego/ojson"
 	auth "github.com/cliproxyapi-plugins/model-quality/login/account"
@@ -45,84 +46,138 @@ func (s *Service) conversionPreview(raw []byte) (conversion.Result, error) {
 	if err := s.accountReady(); err != nil {
 		return conversion.Result{}, err
 	}
-	return conversion.Convert([]byte(source), s.opts.Now())
+	result, err := conversion.Convert([]byte(source), s.opts.Now())
+	if err == nil {
+		result.SourceRef = s.journal.fingerprint("conversion-source", source)
+	}
+	return result, err
 }
 
-func (s *Service) uploadConversion(ctx context.Context, raw []byte) (any, error) {
+// A conversion reserves only its principal while the SDK call is in flight.
+type conversionLease struct {
+	email, accountID, principal string
+}
+
+func (l conversionLease) matches(email, accountID, principal string) bool {
+	return l.email != "" && strings.EqualFold(email, l.email) || accountID != "" && accountID == l.accountID || principal != "" && principal == l.principal
+}
+
+func (s *Service) reserveConversion(item conversion.Item) error {
+	lease := conversionLease{item.Email, item.AccountID, (auth.LoginPrincipal{AccountID: item.AccountID, UserID: item.UserID}).Key()}
+	s.accountMu.Lock()
+	defer s.accountMu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || s.fault {
+		return errors.New("storage_unavailable")
+	}
+	if s.activeConversion != nil {
+		return errors.New("conflict")
+	}
+	guarded := map[string]bool{}
+	for id, a := range s.accounts {
+		if lease.matches(a.Credentials.Email, "", a.Principal) {
+			if a.View.SecurityPending {
+				return errors.New("security_pending")
+			}
+			guarded[id] = true
+		}
+	}
+	rateKey := s.journal.fingerprint(item.Email)
+	for _, job := range s.jobs {
+		r := job.record
+		matches := guarded[r.View.AccountID] || lease.matches(job.displayEmail, r.SecurityAccountID, r.AdoptedPrincipal) ||
+			item.Email != "" && rateKey == r.RateKey
+		if matches && (securityBlocks(r) || !terminal(r.View.Status) || r.View.Status == "commit_unknown" || r.View.Status == "saved_not_adopted") {
+			return errors.New("security_pending")
+		}
+	}
+	s.activeConversion = &lease
+	return nil
+}
+
+func selectedConversions(raw []byte, now time.Time) ([]conversion.Item, error) {
 	source, indexes, err := conversionSource(raw, true)
 	if err != nil {
 		return nil, err
 	}
-	converted, err := conversion.Convert([]byte(source), s.opts.Now())
+	converted, err := conversion.Convert([]byte(source), now)
 	if err != nil {
 		return nil, err
 	}
+	items := make([]conversion.Item, 0, len(indexes))
 	for _, index := range indexes {
 		if index >= len(converted.Items) || converted.Items[index].Status != "ready" {
 			return nil, errors.New("invalid_request")
 		}
+		items = append(items, converted.Items[index])
 	}
-	s.accountMu.Lock()
-	defer s.accountMu.Unlock()
-	if err := s.accountReady(); err != nil {
-		return nil, err
+	return items, nil
+}
+
+type conversionOutcome struct {
+	CommitRef string `json:"-"`
+	Index     int    `json:"index"`
+	Filename  string `json:"filename"`
+	AuthID    string `json:"auth_id"`
+	Code      string `json:"code"`
+	Status    string `json:"status"`
+	Enabled   *bool  `json:"enabled,omitempty"`
+}
+
+func (s *Service) uploadConvertedItem(ctx context.Context, owner Owner, item conversion.Item, batchID string) conversionOutcome {
+	out := conversionOutcome{Index: item.Index, Filename: item.Filename, Status: "failed"}
+	commitID := "conversion:" + conversion.Identity(item)
+	blocked, err := s.journal.unconfirmedConversion(commitID)
+	if err != nil {
+		out.Code = SafeCode(err)
+		return out
 	}
-	owner, err := s.opts.Owner()
-	if err != nil || owner.Valid == nil || owner.Prepare == nil || !owner.Valid() {
-		return nil, errors.New("plugin_unavailable")
+	if blocked {
+		out.Status, out.Code = "uncertain", "commit_unknown"
+		return out
 	}
-	results := []map[string]any{}
-	for _, index := range indexes {
-		item := converted.Items[index]
-		principal := auth.LoginPrincipal{AccountID: item.AccountID, UserID: item.UserID}
-		guard := func() error {
-			if err := s.accountReady(); err != nil {
-				return err
-			}
-			if !owner.Valid() || s.ctx.Err() != nil || ctx.Err() != nil {
-				return errors.New("cancelled")
-			}
-			for _, a := range s.accounts {
-				matches := item.Email != "" && strings.EqualFold(a.Credentials.Email, item.Email) || a.Principal == principal.Key()
-				if matches && (a.View.SecurityPending || s.accountBusyLocked(a)) {
-					return errors.New("security_pending")
-				}
-			}
-			s.mu.Lock()
-			defer s.mu.Unlock()
-			for _, job := range s.jobs {
-				matches := item.Email != "" && (job.record.RateKey == s.journal.fingerprint(item.Email) || strings.EqualFold(job.displayEmail, item.Email)) || job.record.SecurityAccountID == item.AccountID || job.record.AdoptedPrincipal == principal.Key()
-				if matches && (securityBlocks(job.record) || !terminal(job.record.View.Status) || job.record.View.Status == "commit_unknown" || job.record.View.Status == "saved_not_adopted") {
-					return errors.New("security_pending")
-				}
-			}
-			return s.checkUploadPlans(&auth.Auth{Provider: "codex", Metadata: item.Credential}, auth.LoginSnapshot{}, nil)
+	if err := s.reserveConversion(item); err != nil {
+		out.Code = SafeCode(err)
+		return out
+	}
+	defer func() {
+		s.mu.Lock()
+		s.activeConversion = nil
+		s.mu.Unlock()
+	}()
+	guard := func() error {
+		if err := s.accountReady(); err != nil {
+			return err
 		}
-		prepared := ""
-		commitID := "conversion:" + conversion.Identity(item)
-		result, uploadErr := s.opts.Manager.ImportConverted(ctx, item, guard, func(ctx context.Context, id, identity string) error {
-			prepared = id
-			return owner.Prepare(ctx, id, identity, commitID)
-		})
-		if prepared != "" {
-			if finishErr := s.finishCredentialWrite(prepared, commitID, result); finishErr != nil && uploadErr == nil {
-				uploadErr = errors.New("quality_reconciliation_pending")
-			}
+		if !owner.Valid() || ctx.Err() != nil {
+			return errors.New("cancelled")
 		}
-		row := map[string]any{"index": index, "filename": item.Filename, "auth_id": result.AuthID, "code": SafeCode(uploadErr)}
-		switch {
-		case result.State == auth.ConversionAlreadyPresent || result.State == auth.ConversionPreviouslyUploaded:
-			row["status"], row["code"] = "existing", result.State
-		case result.State == "commit_unknown" || result.State == "saved_not_adopted":
-			row["status"] = "uncertain"
-		case uploadErr != nil:
-			row["status"] = "failed"
-		default:
-			row["status"], row["enabled"] = "uploaded", result.CredentialEnabled
-		}
-		results = append(results, row)
+		return s.checkUploadPlans(&auth.Auth{Provider: "codex", Metadata: item.Credential}, auth.LoginSnapshot{}, nil)
 	}
-	return map[string]any{"items": results}, nil
+	prepared := ""
+	result, uploadErr := s.opts.Manager.ImportConvertedForCommand(ctx, item, batchID, guard, func(ctx context.Context, id, identity string) error {
+		prepared = id
+		return owner.Prepare(ctx, id, identity, commitID)
+	})
+	if prepared != "" {
+		if finishErr := s.finishCredentialWrite(prepared, commitID, result); finishErr != nil && uploadErr == nil {
+			uploadErr = errors.New("quality_reconciliation_pending")
+		}
+	}
+	out.AuthID, out.Code = result.AuthID, SafeCode(uploadErr)
+	switch {
+	case result.State == auth.ConversionAlreadyPresent || result.State == auth.ConversionPreviouslyUploaded:
+		out.Status, out.Code = "existing", result.State
+	case result.State == "commit_unknown" || result.State == "saved_not_adopted" || out.Code == "quality_reconciliation_pending":
+		out.Status = "uncertain"
+		if out.Code != "quality_reconciliation_pending" {
+			out.CommitRef = commitID
+		}
+	case uploadErr == nil:
+		out.Status, out.Enabled = "uploaded", &result.CredentialEnabled
+	}
+	return out
 }
 
 func isConversionPath(path string) bool {

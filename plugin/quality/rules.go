@@ -32,6 +32,7 @@ func (en *Engine) ruleForDisplayLocked(r *Rule) Rule {
 	next := cloneRule(r)
 	if next.PendingSchedule != nil {
 		next.PendingSchedule.Accepted = nil
+		next.PendingSchedule.WaitingLogins = nil
 	}
 	if next.LastScopeDispatch != nil {
 		for i, detail := range next.LastScopeDispatch.Details {
@@ -51,7 +52,7 @@ func (en *Engine) ruleForDisplayLocked(r *Rule) Rule {
 			next.timerWaitReason = retry.reason
 		}
 		if next.timerWaitReason == "" && r.PendingSchedule != nil {
-			next.timerWaitReason = "部分对象已受理，其余对象等待后台管理目录就绪。"
+			next.timerWaitReason = en.pendingScheduleReasonLocked(r.PendingSchedule)
 		}
 	}
 	if next.Status == "detecting" {
@@ -75,6 +76,13 @@ func (en *Engine) saveRule(ctx context.Context, in Rule, update bool, activation
 func (en *Engine) saveRuleLocked(ctx context.Context, in Rule, update bool, activation string) (*Rule, error) {
 	if en.closed || en.fault != nil {
 		return nil, fmt.Errorf("unavailable")
+	}
+	var command *ruleCommandRecord
+	if !update {
+		command = ruleCreation(in, activation)
+		if prior, err := en.previousCreationLocked(command); err != nil || prior != nil {
+			return prior, err
+		}
 	}
 	if en.unsupportedRule(&in) {
 		return nil, unsupportedQuality()
@@ -157,21 +165,44 @@ func (en *Engine) saveRuleLocked(ctx context.Context, in Rule, update bool, acti
 	if in.Action != "observe_only" && in.Action != "pause_credential" && !credentialMutation(in.Action) {
 		return nil, fmt.Errorf("unsupported action")
 	}
+	needsCurrentState := false
 	if old != nil {
-		needsCurrentState := false
 		for _, d := range en.managed {
-			needsCurrentState = needsCurrentState || d.RuleID == old.ID && d.State == "disabled"
-		}
-		if needsCurrentState {
-			targets, readErr := en.host.Targets(ctx)
-			if readErr != nil {
-				return nil, fmt.Errorf("unavailable: cannot read current CPA targets: %w", readErr)
+			if d.RuleID == old.ID && d.State == "disabled" {
+				needsCurrentState = true
+				break
 			}
-			failures := en.reconcileCurrentTargetsLocked(ctx, targets, nil)
-			for id, failure := range failures {
-				if d := en.managed[id]; d != nil && d.RuleID == old.ID {
-					return nil, failure
-				}
+		}
+	}
+	newGroup := in.TargetGroup != "" && (old == nil || in.TargetGroup != old.TargetGroup)
+	for _, group := range in.AuthorizedGroups {
+		newGroup = newGroup || old == nil || !contains(old.AuthorizedGroups, group)
+	}
+	checkSelection := in.expectedTargetObjectType != ""
+	var targets []Target
+	fence := en.admissionFenceLocked(old)
+	ctx = en.inventoryContextLocked(ctx)
+	if needsCurrentState || !scoped && !en.terminalDependencyLocked(in.RunConfig) || newGroup || checkSelection {
+		var err error
+		targets, err = en.readAdmissionTargetsLocked(ctx, en.host.Targets, in.RunConfig, old)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if needsCurrentState {
+		var ownedIDs []string
+		for id, d := range en.managed {
+			if d.RuleID == old.ID {
+				ownedIDs = append(ownedIDs, id)
+			}
+		}
+		failures := en.reconcileDirectoryLocked(ctx, targets, ownedIDs)
+		if err := en.checkAdmissionFenceLocked(ctx, fence, dependencies(in.RunConfig)); err != nil {
+			return nil, err
+		}
+		for id, failure := range failures {
+			if d := en.managed[id]; d != nil && d.RuleID == old.ID {
+				return nil, failure
 			}
 		}
 	}
@@ -253,18 +284,8 @@ func (en *Engine) saveRuleLocked(ctx context.Context, in Rule, update bool, acti
 			return nil, fmt.Errorf("conflict: one credential permits one pause rule")
 		}
 	}
-	var targets []Target
 	retired := !scoped && en.terminalDependencyLocked(in.RunConfig)
-	newGroup := in.TargetGroup != "" && (old == nil || in.TargetGroup != old.TargetGroup)
-	for _, group := range in.AuthorizedGroups {
-		newGroup = newGroup || old == nil || !contains(old.AuthorizedGroups, group)
-	}
-	checkSelection := in.expectedTargetObjectType != ""
 	if !scoped && !retired || newGroup || checkSelection {
-		targets, err = en.host.Targets(en.inventoryContextLocked(ctx))
-		if err != nil {
-			return nil, err
-		}
 		if err = validateRuleGroups(&in, old, targets); err != nil {
 			return nil, err
 		}
@@ -349,6 +370,16 @@ func (en *Engine) saveRuleLocked(ctx context.Context, in Rule, update bool, acti
 		en.cancelRuleChangesLocked(c, in.ID, "rule_changed")
 	}
 	c.audits = append(c.audits, en.audit(kind, in.ID, "", "", fmt.Sprintf("revision=%d", in.Revision)))
+	if command != nil {
+		if prior, err := en.previousCreationLocked(command); err != nil || prior != nil {
+			return prior, err
+		}
+		command.RuleID, command.Revision = in.ID, in.Revision
+		c.ruleCommand = command
+	}
+	if err = ctx.Err(); err != nil {
+		return nil, err
+	}
 	if err = en.commitLocked(c); err != nil {
 		return nil, err
 	}
@@ -410,10 +441,6 @@ func (en *Engine) PauseRule(id string, rev uint64, paused bool) error {
 	if r.Revision != rev {
 		return fmt.Errorf("conflict: stale rule revision")
 	}
-	next := cloneRule(r)
-	next.Enabled = !paused
-	next.Revision++
-	resetRule(next)
 	if !paused {
 		if en.unsupportedRule(r) {
 			return unsupportedQuality()
@@ -422,7 +449,7 @@ func (en *Engine) PauseRule(id string, rev uint64, paused bool) error {
 			return fmt.Errorf("blocked: owned pause requires manual release")
 		}
 		if !en.terminalDependencyLocked(r.RunConfig) {
-			targets, err := en.host.Targets(en.inventoryContextLocked(en.ctx))
+			targets, err := en.readAdmissionTargetsLocked(en.ctx, en.host.Targets, r.RunConfig, r)
 			if err != nil {
 				return err
 			}
@@ -449,6 +476,12 @@ func (en *Engine) PauseRule(id string, rev uint64, paused bool) error {
 				return err
 			}
 		}
+	}
+	next := cloneRule(r)
+	next.Enabled = !paused
+	next.Revision++
+	resetRule(next)
+	if !paused {
 		next.BlockedAuthID = ""
 	}
 	next.Status = ruleStatus(next)
@@ -574,6 +607,7 @@ func (en *Engine) DeleteRule(ctx context.Context, id string, rev uint64) error {
 		return err
 	}
 	delete(en.rules, id)
+	en.directory.revision.Add(1)
 	delete(en.scheduleRetry, id)
 	delete(en.finishedRules, id)
 	for _, authID := range clearHandling {

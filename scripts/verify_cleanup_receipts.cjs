@@ -25,7 +25,7 @@ async function main() {
     browser = await chromium.launch({ executablePath: process.env.CHROME_PATH || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' });
     const out = process.env.UI_OUTPUT, report = { source: {}, scenarios: {} };
     if (out) await fs.mkdir(out, { recursive: true });
-    for (const file of ['app.js', 'index.html', 'client.js', 'view.js', 'style.css', 'login.js']) {
+    for (const file of require('../plugin/ui/public_assets.json')) {
       report.source[file] = createHash('sha256').update(await fs.readFile(path.join(__dirname, '../plugin/ui', file))).digest('hex');
     }
     const observed = process.argv.includes('--observe');
@@ -240,6 +240,8 @@ async function main() {
       const [refresh] = await Promise.all([page.waitForResponse(response => response.url().includes('/runs?') && response.url().includes('source=scheduled_probe')), page.click('#refresh')]);
       await refresh.finished();
       await page.locator('#refresh:not([aria-busy])').waitFor();
+      await page.click('[data-page=manual]');
+      await page.locator('#history-list [data-run=manual]').waitFor({ state: 'attached' });
       const refreshed = await snapshot();
       assert.deepEqual(refreshed.activity, []);
       assert.deepEqual(refreshed.history.sort(), ['manual', 'other-manual']);
@@ -300,10 +302,12 @@ async function main() {
       assert(!deleted.dialog); assert.match(deleted.notice,/已删除/); assert.equal(deleted.scope,'全部规则');
       const targets = await verifyDeletedAfterRefresh(page,[b],['fixture-quality-primary']);
       assert(await page.locator('[data-rule-select=rule-b]').isVisible());
+      await page.click('[data-page=manual]');
+      await page.locator('#history-list [data-run=manual]').waitFor({ state: 'attached' });
       const end = await snapshot();
       assert.deepEqual(end.activity.sort(),['in-progress','protected','second']);
       assert.deepEqual(end.history.sort(),['manual','other-manual']);
-      assert.deepEqual(writes,deleteA); await screenshot('refreshed');
+      assert.deepEqual(writes,deleteA); await page.click('[data-page=operations]'); await screenshot('refreshed');
       return {description,deleted,refreshed_targets:targets,end,cpa_writes:0};
     }, {confirmedHandling:true});
     await scenario('delete_rule_with_handling_read_failure', async ({page,control,confirm,snapshot,screenshot,writes}) => {

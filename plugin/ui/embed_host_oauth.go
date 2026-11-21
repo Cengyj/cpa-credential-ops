@@ -10,7 +10,7 @@ import (
 	"text/template"
 )
 
-//go:embed index.html app.js client.js view.js style.css host_oauth/accounts.html host_oauth/login.js
+//go:embed index.html app.js client.js view.js style.css workspace.js commands.js conversion.js markup.js host_oauth/accounts.html host_oauth/login.js
 var assets embed.FS
 
 // HTML comment delimiters keep index.html usable as the full edition's static page.

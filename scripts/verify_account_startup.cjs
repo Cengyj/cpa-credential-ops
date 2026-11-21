@@ -35,7 +35,7 @@ async function checkWaiting(view, restoring = false) {
   await checkShell(view);
   assert(await view.locator('#account-import-open').isDisabled());
   if (restoring) {
-    assert(await view.getByRole('button', { name: '已连接', exact: true }).isVisible());
+    assert(await view.getByRole('button', { name: /^(管理连接|已连接)$/ }).isVisible());
     assert(await view.locator('#account-import-empty').isHidden(), 'The empty directory invitation needs a confirmed empty account list');
   } else {
     assert(await view.locator('#account-empty').isVisible());
@@ -88,6 +88,28 @@ function changeVisibility(page, hidden) {
     Object.defineProperty(document, 'hidden', { configurable: true, value: hidden });
     Object.defineProperty(document, 'visibilityState', { configurable: true, value: hidden ? 'hidden' : 'visible' });
     document.dispatchEvent(new Event('visibilitychange'));
+  }, hidden);
+}
+
+function changeFrameVisibility(page, hidden) {
+  return page.evaluate(hidden => {
+    const frame = document.getElementById('fixture-plugin');
+    const child = frame.contentWindow;
+    return new Promise((resolve, reject) => {
+      const observer = new child.IntersectionObserver(([entry]) => {
+        if (entry.isIntersecting === !hidden) {
+          observer.disconnect();
+          clearTimeout(timer);
+          resolve(child.document.hidden);
+        }
+      });
+      const timer = setTimeout(() => {
+        observer.disconnect();
+        reject(new Error('The iframe did not report its new intersection state'));
+      }, 6000);
+      observer.observe(child.document.documentElement);
+      frame.style.display = hidden ? 'none' : '';
+    });
   }, hidden);
 }
 
@@ -292,6 +314,19 @@ async function main() {
       } finally { await other.close(); }
     }, { connection: { state: 'ready', revision: 10, configured: true, can_migrate: false } });
 
+    await scenario('account list and controls work throughout a connection status outage', async (page, hold, reads, writes) => {
+      await rememberKey(page, key);
+      await page.goto(origin);
+      await page.locator(accountRow).waitFor();
+      await page.locator('#account-import-open:enabled').waitFor();
+      await page.locator('#connection-state').filter({ hasText: '后台状态更新失败' }).waitFor();
+      assert.equal(reads.filter(path => path === '/login/accounts').length, 1);
+      assert.deepEqual(writes, []);
+      await page.click('#account-import-open');
+      await page.locator('#account-import-dialog[open]').waitFor();
+      return { accountReads: 1, connectionWrites: 0, importAvailable: true };
+    }, { failures: { '/connection': Array(50).fill(503) } });
+
     await scenario('a temporary page outage recovers on safe reads without another key', async (page, hold, reads, writes) => {
       await rememberKey(page, key);
       await page.clock.install();
@@ -309,7 +344,111 @@ async function main() {
       assert.equal(await page.locator('#account-import-text').inputValue(), 'local unsaved draft');
       assert.equal(writes.length, 0);
       return { hiddenReads: 0, writes: 0, preservedDraft: true, recoveredAccount: true };
-    }, { failures: { '/connection': [503] } });
+    }, { failures: { '/connection': [503], '/login/accounts': [503] } });
+
+    for (const [display, blocked] of [['tab', '/login/jobs'], ['iframe', '/login/detail']]) {
+      const job = { id: 'fixture-job-active', account_id: 'fixture-active', email: 'fixture-active@example.test', revision: 1,
+        created_at: '2026-11-17T02:00:00Z', method: 'password_totp', intent: 'import', status: 'awaiting_commit', candidate_id: 'fixture-candidate' };
+      const candidate = { id: job.candidate_id, job_id: job.id, revision: 1, email: job.email, user_id: 'synthetic-before' };
+      await scenario('hidden account history stops after ' + blocked + ' in ' + display, async (page, hold, reads, writes) => {
+        await rememberKey(page, key);
+        await page.clock.install();
+        await page.goto(origin + (display === 'iframe' ? hostPage : '/#login'));
+        const view = display === 'iframe' ? page.frameLocator('#fixture-plugin') : page;
+        const change = display === 'iframe' ? changeFrameVisibility : changeVisibility;
+        const detail = view.locator('#login-job-detail'), search = view.locator('#login-task-search');
+        await view.locator('#account-history-open:enabled').click();
+        await detail.getByText('synthetic-before', { exact: true }).waitFor();
+        await detail.locator('[data-task-log-update]').filter({ hasText: '更新于' }).waitFor();
+        await search.fill(job.email);
+        await page.waitForLoadState('networkidle');
+
+        const release = hold(blocked);
+        const started = nextRead(page, blocked);
+        const delivered = page.waitForResponse(response => new URL(response.url()).pathname === api + blocked);
+        job.revision++;
+        candidate.revision = job.revision;
+        candidate.user_id = 'synthetic-after';
+        await page.clock.fastForward(6500);
+        await started;
+        const documentHidden = await change(page, true);
+        if (display === 'iframe') assert.equal(documentHidden, false, 'CSS hiding has its own visibility signal');
+        const before = reads.length;
+        release(); await (await delivered).finished();
+        // The document may already have fired networkidle. Observe new requests
+        // after the held response has reached the renderer.
+        await page.waitForTimeout(500);
+        const hiddenReads = reads.slice(before);
+        assert.deepEqual(hiddenReads, [], 'Hidden follow-up requests after ' + blocked + ': ' + JSON.stringify(hiddenReads));
+
+        const logs = page.waitForResponse(response => new URL(response.url()).pathname === api + '/login/logs');
+        await change(page, false);
+        await detail.getByText('synthetic-after', { exact: true }).waitFor({ timeout: 2500 });
+        await (await logs).finished();
+        await detail.locator('[data-task-log-update]').filter({ hasText: '更新于' }).waitFor();
+        const resumed = reads.slice(before);
+        for (const path of ['/login/detail', '/login/candidate', '/login/logs']) assert.equal(resumed.filter(read => read === path).length, 1);
+        assert.equal(await search.inputValue(), job.email);
+        assert.equal(await view.locator('[data-login-job]').count(), 1);
+        assert.deepEqual(writes, []);
+        return { blocked, display, hiddenReads, resumed, sameSelectionAndSearch: true, resumedCandidateRevision: candidate.revision, writes: 0 };
+      }, { responses: { '/login/jobs': { items: [job], has_more: false }, '/login/detail': job, '/login/candidate': candidate } });
+    }
+
+    await scenario('hidden account log panel stops after account history in iframe', async (page, hold, reads, writes) => {
+      await rememberKey(page, key);
+      await page.goto(origin + hostPage);
+      const view = page.frameLocator('#fixture-plugin');
+      const toggle = view.locator('.account-logs-action[data-account-id="fixture-active"]');
+      await toggle.waitFor();
+      await page.waitForLoadState('networkidle');
+      const release = hold('/login/jobs');
+      const accountHistory = url => new URL(url).searchParams.get('account_id') === 'fixture-active';
+      const started = page.waitForRequest(request => accountHistory(request.url()));
+      const delivered = page.waitForResponse(response => accountHistory(response.url()));
+      await toggle.click(); await started;
+      const search = view.locator('[data-log-search]');
+      await search.fill('running');
+      assert.equal(await changeFrameVisibility(page, true), false);
+      const before = reads.length;
+      release(); await (await delivered).finished();
+      await page.waitForTimeout(500);
+      const hiddenReads = reads.slice(before);
+      assert.deepEqual(hiddenReads, [], 'Hidden account log requests: ' + JSON.stringify(hiddenReads));
+      await changeFrameVisibility(page, false);
+      await view.locator('[data-log-update]').filter({ hasText: '更新于' }).waitFor({ timeout: 2500 });
+      assert.match(await view.locator('.account-log-overview').innerText(), /fixture-job-active/);
+      assert.equal(await search.inputValue(), 'running');
+      assert.deepEqual(writes, []);
+      const resumed = reads.slice(before);
+      assert.equal(resumed.filter(read => read === '/login/logs').length, 1);
+      return { hiddenReads, resumed, sameLogAndSearch: true, writes: 0 };
+    });
+
+    const exportPages = [];
+    await scenario('hidden account tab finishes an explicit log export', async (page, hold, reads, writes) => {
+      await rememberKey(page, key);
+      await page.goto(origin + '/#login');
+      await page.locator('#account-history-open:enabled').click();
+      await page.locator('#login-job-detail .login-detail-identity').filter({ hasText: 'fixture-active@example.test' }).waitFor();
+      await page.locator('[data-task-log-update]').filter({ hasText: '更新于' }).waitFor();
+      // Two valid pages exercise the export's cursor read after hiding the tab.
+      const id = 'fixture-job-active';
+      for (const index of [1, 2]) exportPages.push({ json: { job_id: id, first_id: 1, last_id: 2, retained_count: 2,
+        has_more: index === 1, next_cursor: index, entries: [{ id: index, status: 'running', phase: 'session' }] } });
+      const release = hold('/login/logs'), started = nextRead(page, '/login/logs'), download = page.waitForEvent('download');
+      await page.click('#login-export'); await started;
+      await changeVisibility(page, true);
+      const before = reads.length;
+      release();
+      const report = JSON.parse(await fs.readFile(await (await download).path(), 'utf8'));
+      assert.equal(report.jobs[0].id, id);
+      assert.deepEqual(report.jobs[0].events.map(event => event.id), [1, 2]);
+      assert.equal(report.read_incomplete, false);
+      assert.deepEqual(reads.slice(before), ['/login/logs']);
+      assert.deepEqual(writes, []);
+      return { requestedExportCursorReads: 1, exportedEvents: 2, displayPollsWhileHidden: 0, writes: 0 };
+    }, { failures: { 'GET /login/logs': exportPages } });
 
     await scenario('account workspace in the first HTML paint', async page => {
       await page.goto(origin);
@@ -348,7 +487,7 @@ async function main() {
       await page.reload();
       await requested;
       await checkWaiting(view, true);
-      await emptyAccountLayout(view, '已连接');
+      await emptyAccountLayout(view, '管理连接');
       release();
       await view.locator('#account-import-empty:enabled').waitFor();
       assert.equal(await view.locator('#account-status-filter option:checked').textContent(), '全部状态 · 0');
@@ -398,7 +537,8 @@ async function main() {
       await checkSavedConnection(view);
       releaseAccounts();
       await view.locator(accountRow).waitFor();
-      assert(await view.locator('#account-import-open').isDisabled());
+      await view.locator('#account-import-open:enabled').waitFor();
+      assert(await view.locator('#account-settings-save').isDisabled(), 'Only submitting settings depends on their own revision');
       releaseSettings();
       await view.locator('#account-import-open:enabled').waitFor();
       assert.deepEqual(reads.filter(resource => !resource.startsWith('/login/')), ['/connection']);
@@ -429,7 +569,7 @@ async function main() {
       }
       for (const hidden of [true, false, true, false]) await changeVisibility(page, hidden);
       await checkReturning(page);
-      assert.equal(count('/settings'), previousSettings);
+      assert.equal(count('/settings'), previousSettings + 1, 'Only the first operations visit needs handling settings');
       assert.equal(count('/login/accounts'), previousAccounts + 1, 'Tab and visibility changes share the pending account poll');
       release();
       await page.locator('#account-import-open:enabled').waitFor();
@@ -458,7 +598,7 @@ async function main() {
         await returnToPlugin();
         await requested;
         await checkWaiting(frame, true);
-        assert.equal(reads.slice(before)[0], '/connection');
+        assert.equal(reads.slice(before)[0], '/login/accounts');
         assert.equal(reads.slice(before).filter(resource => resource === '/login/accounts').length, 1);
         await checkSavedConnection(frame);
         release();
@@ -481,13 +621,13 @@ async function main() {
       await frame.getByRole('button', { name: '未连接', exact: true }).waitFor();
       await checkWaiting(frame);
       assert.equal(await page.evaluate(name => localStorage.getItem(name), storedKey), null);
-      assert.deepEqual(reads.slice(beforeExpiry), ['/connection'], 'Expired credentials never trigger a second validation endpoint');
+      assert.deepEqual(reads.slice(beforeExpiry), ['/login/accounts'], 'Expired credentials never trigger a second validation endpoint');
       await leavePlugin();
       const afterExpiry = reads.length;
       await returnToPlugin();
       await frame.getByRole('button', { name: '未连接', exact: true }).waitFor();
       assert.deepEqual(reads.slice(afterExpiry), []);
-      return { returns, expiredRead: '/connection' };
+      return { returns, expiredRead: '/login/accounts' };
     });
 
     await scenario('temporary account error preserves verified browser access and needs no quality authentication', async (page, hold, reads) => {
@@ -498,7 +638,7 @@ async function main() {
       await accountsRead;
       const frame = page.frameLocator('#fixture-plugin');
       await checkWaiting(frame, true);
-      assert.equal(reads[0], '/connection');
+      assert.equal(reads[0], '/login/accounts');
       releaseAccounts();
       await frame.locator('body.connected').waitFor();
       assert.equal(reads.filter(path => path === '/settings').length, 0);
@@ -527,7 +667,7 @@ async function main() {
       assert(await view.locator('body.connected').count());
       assert.equal(await page.evaluate(name => localStorage.getItem(name), storedKey), key);
       assert.equal(await view.locator('[data-page][aria-current=page]').getAttribute('data-page'), 'manual');
-      assert.equal(reads.filter(name => name === '/settings').length, 1);
+      assert.equal(reads.filter(name => name === '/settings').length, 0);
       return { delayedAccountStatus: 403, lateResponseChangedSession: false };
     }, { failures: { '/login/accounts': [403] } });
 
@@ -618,7 +758,7 @@ async function main() {
       await view.getByRole('button', { name: '已连接', exact: true }).waitFor();
       await view.locator('#account-list-summary').filter({ hasText: '403' }).waitFor();
       assert.equal(await page.evaluate(name => localStorage.getItem(name), storedKey), key);
-      assert.equal(reads[0], '/connection');
+      assert.equal(reads[0], '/login/accounts');
       assert.equal(reads.includes('/settings'), false);
       assert.equal(await view.locator('[data-account-row]').count(), 0);
       return { forbiddenStatus: 403, secondaryValidationRequests: 0 };
@@ -655,7 +795,7 @@ async function main() {
 
     await scenario('commercial navigation keeps a pending disconnect effective', async (page, hold, reads) => {
       await rememberKey(page, key);
-      const release = hold('/connection'), started = nextRead(page, '/connection');
+      const release = hold('/login/accounts'), started = nextRead(page, '/login/accounts');
       await page.goto(origin + hostPage);
       await started;
       const view = page.frameLocator('#fixture-plugin');
@@ -667,7 +807,8 @@ async function main() {
       await view.locator('[data-page=login]').click();
       assert.equal(await page.evaluate(name => localStorage.getItem(name), storedKey), null);
       assert.equal(await view.locator('[data-account-row]').count(), 0);
-      assert.deepEqual(reads, ['/connection']);
+      assert.deepEqual(reads, ['/login/accounts', '/connection'].slice(0, reads.length));
+      assert(reads.length <= 2);
       return { disconnectedBeforeReply: true };
     });
 
@@ -684,16 +825,16 @@ async function main() {
         await page.locator('#fixture-plugin').waitFor({ state: 'detached' });
         const before = reads.length;
         const release = hold('/metrics', '/runs');
-        const metricsStarted = nextRead(page, '/metrics');
+        const viewRead = nextRead(page, section === 'manual' ? '/runs' : '/metrics');
         await page.getByRole('link', { name: 'Credential Ops' }).click();
-        await metricsStarted;
+        await viewRead;
         await frame.locator('body.connected').waitFor();
         assert.equal(await frame.locator('[data-page][aria-current=page]').getAttribute('data-page'), section);
         assert(await frame.locator(`#page-${section}`).isVisible());
         assert(await frame.locator('#page-login').isHidden());
         assert.equal(reads.slice(before).some(path => path.startsWith('/login/')), false);
         const whilePending = reads.slice(before);
-        assert.equal(whilePending.filter(path => path === '/metrics').length, 1);
+        assert.equal(whilePending.filter(path => path === '/metrics').length, section === 'manual' ? 0 : 1);
         assert(whilePending.includes('/questions') && whilePending.includes('/targets') && whilePending.includes('/runs'));
         release();
         await frame.locator('#target option[value="fixture-quality-primary"]').waitFor({ state: 'attached' });
@@ -722,7 +863,7 @@ async function main() {
         await frame.getByRole('button', { name: '未连接', exact: true }).waitFor();
         assert.equal(await frame.locator('[data-page][aria-current=page]').getAttribute('data-page'), 'login');
         assert.equal(reads.length, afterDisconnect);
-        return { restoredWorkspace: section, slowReads: ['/metrics','/runs'], independentTab: 'login', explicitWorkspace: explicit };
+        return { restoredWorkspace: section, slowReads: section === 'manual' ? ['/runs'] : ['/metrics','/runs'], independentTab: 'login', explicitWorkspace: explicit };
       });
     }
 

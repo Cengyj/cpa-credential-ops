@@ -10,7 +10,7 @@ const root = path.resolve(__dirname, '..');
 const output = path.resolve(process.env.UI_VERIFY_OUTPUT || path.join(root, 'artifacts/samepage-4.6.0/verification'));
 const demoDirectory = path.resolve(process.env.MQ_DEMO_DIR || path.join(root, 'artifacts/samepage-4.6.0/host-ui-demo'));
 const preview = process.env.HOST_UI_PREVIEW_SOURCE === '1';
-const names = ['index.html', 'app.js', 'client.js', 'view.js', 'login.js', 'style.css'];
+const names = require('../plugin/ui/public_assets.json');
 const source = Object.fromEntries(names.map(name => [name, fs.readFileSync(path.join(root, 'plugin/ui', name))]));
 const hash = value => crypto.createHash('sha256').update(value).digest('hex');
 const sourceHashes = Object.fromEntries(names.map(name => [name, hash(source[name])]));

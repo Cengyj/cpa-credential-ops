@@ -137,7 +137,7 @@ func TestProviderGroupExternalEnableReconciliationIsAtomic(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			err = en.observeEnabledProviderGroupLocked(context.Background(), targets, en.managed["a"])
+			err = en.observeEnabledProviderGroupLocked(context.Background(), targets, en.managed["a"], host.CredentialSnapshot)
 			wantEnabled := scenario == "complete" || scenario == "new-membership"
 			if (err == nil) != wantEnabled || len(host.writes) != 0 {
 				t.Fatal(scenario, err, host.writes)

@@ -9,7 +9,7 @@ const { createInterface } = require('node:readline');
 const { createHash } = require('node:crypto');
 const { chromium } = require(process.env.PLAYWRIGHT_MODULE || '/Users/ceng/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules/playwright');
 
-const assetNames = ['index.html', 'app.js', 'view.js', 'style.css', 'client.js', 'login.js'];
+const assetNames = require('../plugin/ui/public_assets.json');
 const sourceHashes = async () => Object.fromEntries(await Promise.all(assetNames.map(async name => [name,
   createHash('sha256').update(await fs.readFile(path.join(__dirname, '../plugin/ui', name))).digest('hex')])));
 

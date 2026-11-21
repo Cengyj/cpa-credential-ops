@@ -104,13 +104,19 @@ func (en *Engine) PrepareCredentialLogin(ctx context.Context, request Credential
 	// Only a confirmed ordinary disable can become stale after a CPA operator
 	// enables the entry. Pending writes and independent pauses need no query.
 	if record := en.managed[request.AuthID]; record != nil && record.State == "disabled" {
-		targets, err := en.host.Targets(ctx)
+		targets, err := en.readAdmissionTargetsLocked(ctx, en.host.Targets, probe, nil)
 		if err != nil {
 			return reply, loginPreparationError{"quality_authority_unavailable", err}
 		}
-		if err := currentTargetError(en.reconcileCurrentTargetsLocked(ctx, targets, []string{request.AuthID}), []string{request.AuthID}); err != nil {
+		if err := currentTargetError(en.reconcileDirectoryLocked(ctx, targets, []string{request.AuthID}), []string{request.AuthID}); err != nil {
 			return reply, loginPreparationError{"quality_authority_unavailable", err}
 		}
+	}
+	if err := en.mutableLocked(); err != nil {
+		return reply, err
+	}
+	if !en.Capabilities().QualityPause && en.localPause(probe) != "" {
+		return reply, loginPreparationError{"retained_quality_pause", unsupportedQuality()}
 	}
 	if record := en.managed[request.AuthID]; activeDisposition(record) {
 		code := "credential_handling_pending"

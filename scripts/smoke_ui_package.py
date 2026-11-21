@@ -56,7 +56,7 @@ def check(package, output, quality_scope=False, provider_targets=False, provider
     name = 'mq-ui-check-' + uuid.uuid4().hex[:12]
     key = secrets.token_urlsafe(32)
 
-    def get(route, auth=False, payload=None, idempotency=None, method=None, *, headers=False, etag=None, if_match=None):
+    def get(route, auth=False, payload=None, idempotency=None, method=None, *, headers=False, etag=None, if_match=None, prefer_async=False):
         args = ['run', '--rm', '--pull=never', '--network', f'container:{name}', '-i', CURL, 'curl', '-qsS', '--noproxy', '*', '--max-time', '5', '-w', '\n%{http_code}']
         # Send the disposable token through stdin, not process arguments.
         if auth:
@@ -71,6 +71,8 @@ def check(package, output, quality_scope=False, provider_targets=False, provider
             args.extend(['--dump-header', '-'])
         if etag:
             args.extend(['--header', 'If-None-Match: ' + etag])
+        if prefer_async:
+            args.extend(['--header', 'Prefer: respond-async'])
         if if_match:
             args.extend(['--header', 'If-Match: ' + if_match])
         raw = docker(*args, 'http://127.0.0.1:18379' + route, input=(f'Authorization: Bearer {key}\n'.encode() if auth else b''), stderr=subprocess.PIPE)
@@ -84,6 +86,18 @@ def check(package, output, quality_scope=False, provider_targets=False, provider
         status, body = get(route, True)
         assert status == 200, (route, status)
         return json.loads(body)
+
+    commands_supported = tuple(map(int, manifest['plugin_version'].split('.'))) >= (0, 32, 0)
+
+    def wait_receipt(path, field):
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            receipt = fetch(path)
+            if receipt[field] not in ('accepted', 'running'):
+                assert receipt[field] == 'completed', (path, receipt[field])
+                return receipt
+            time.sleep(.1)
+        raise AssertionError('offline command did not complete: ' + path)
 
     with tempfile.TemporaryDirectory(prefix='mq-ui-check-') as tmp:
         root = Path(tmp)
@@ -160,9 +174,14 @@ def check(package, output, quality_scope=False, provider_targets=False, provider
                     assert all(set(registered_models) <= set(t['models']) for t in active)
                     if phase == 'load':
                         body = {'name': 'scope-fixture', 'enabled': True, 'target_scope': 'all_enabled', 'models': registered_models, 'question_id': 'logic-boxes', 'samples': 2, 'parameters': {'reasoning_effort': 'high'}}
-                        status, data = get(PREFIX + '/rules', True, body)
+                        creation = dict(body, idempotency_key='fixture-create-rule') if commands_supported else body
+                        status, data = get(PREFIX + '/rules', True, creation)
                         assert status == 200, (status, data)
                         rule = json.loads(data)
+                        if commands_supported:
+                            status, duplicate = get(PREFIX + '/rules', True, creation)
+                            assert status == 200 and json.loads(duplicate)['id'] == rule['id']
+                            assert fetch(PREFIX + '/rules/commands?idempotency_key=fixture-create-rule')['rule_id'] == rule['id']
                         assert rule['target_scope'] == 'all_enabled' and not rule.get('auth_id') and fetch(PREFIX + '/runs')['total'] == 0
                         assert rule['cron'] == '*/30 * * * *' and rule['max_results'] == 100 and rule['next_run'].startswith('0001-') and not rule['scheduling_enabled']
                         assert not any(k in rule for k in ('interval_seconds', 'timezone', 'retention_days'))
@@ -203,8 +222,16 @@ ThreadingHTTPServer(('127.0.0.1',18887),Mock).serve_forever()"""
                                     assert status == 200, (status, data)
                                     rule = json.loads(data)
                                 assert rule['parameters']['reasoning_effort'] == requested
-                                status, data = get(PREFIX + '/rules/run', True, {'id': rule['id'], 'revision': rule['revision']})
+                                command = {'id': rule['id'], 'revision': rule['revision']}
+                                if commands_supported:
+                                    command['idempotency_key'] = 'fixture-run-' + requested
+                                status, data = get(PREFIX + '/rules/run', True, command)
                                 receipt = json.loads(data)
+                                if commands_supported:
+                                    path = PREFIX + '/rules/commands?idempotency_key=' + command['idempotency_key']
+                                    receipt = wait_receipt(path, 'state')['result']
+                                    repeat_status, repeated = get(PREFIX + '/rules/run', True, command)
+                                    assert repeat_status == 202 and json.loads(repeated)['result']['scope_batch_id'] == receipt['scope_batch_id']
                                 assert status == 202 and receipt['count'] == 2 and receipt['skipped'] == 0, receipt
                                 batch = receipt['scope_batch_id']; history[batch] = requested
                                 batch_path = PREFIX + '/runs?source=scheduled_probe&scope_batch_id=' + batch
@@ -291,9 +318,20 @@ ThreadingHTTPServer(('127.0.0.1',18887),Mock).serve_forever()"""
                     candidates = json.loads(data)['items']
                     assert [(c['index'], c['status']) for c in candidates] == [(0, 'ready'), (1, 'ready')]
                     assert all(c['credential']['type'] == 'codex' for c in candidates) and 'id_token' not in candidates[1]['credential']
-                    status, data = get(upload, True, {'source': source, 'indexes': [0, 1]}, 'synthetic-' + phase)
-                    assert status == 200
-                    receipts = json.loads(data)['items']
+                    request = {'source': source, 'indexes': [0, 1]}
+                    if commands_supported and phase == 'load':
+                        status, data = get(upload, True, request, 'synthetic-load', prefer_async=True)
+                        assert status == 202 and json.loads(data)['id'] == 'synthetic-load'
+                        saved_batch = wait_receipt(PREFIX + '/login/batches?id=synthetic-load', 'status')
+                        status, data = get(upload, True, request, 'synthetic-load', prefer_async=True)
+                        assert status == 202 and json.loads(data)['completed'] == 2
+                        receipts = saved_batch['items']
+                    else:
+                        if commands_supported:
+                            assert fetch(PREFIX + '/login/batches?id=synthetic-load') == saved_batch
+                        status, data = get(upload, True, request, 'synthetic-' + phase)
+                        assert status == 200
+                        receipts = json.loads(data)['items']
                     expected_conversion = 'uploaded' if phase == 'load' else 'existing'
                     assert [(row['index'], row['status']) for row in receipts] == [(0, expected_conversion), (1, expected_conversion)], receipts
                     if phase == 'load':
@@ -328,7 +366,7 @@ ThreadingHTTPServer(('127.0.0.1',18887),Mock).serve_forever()"""
             assert key.encode() not in logs.stdout + logs.stderr
             report['management_key_absent_from_host_logs'] = True
             output.write_text(json.dumps(report, indent=2) + '\n')
-            print('Isolated CPA verified registration, six embedded assets, authentication, runtime, and restart.')
+            print(f'Isolated CPA verified registration, {len(hashes)} embedded assets, authentication, runtime, and restart.')
         except BaseException:
             # Only this disposable, offline fixture can be inspected on failure.
             diagnostic = subprocess.run(['docker', 'logs', '--tail', '100', name], capture_output=True, text=True)

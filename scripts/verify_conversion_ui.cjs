@@ -71,7 +71,7 @@ async function main() {
           expireOnRead = false;
           return route.fulfill({ status: 401, json: { code: 'unauthorized' } });
         }
-        if (failRefresh && pathname === '/v0/management/plugins/model-quality/targets') { failRefresh = false; return route.abort('connectionfailed'); }
+        if (failRefresh && pathname === '/v0/management/plugins/model-quality/login/accounts') { failRefresh = false; return route.abort('connectionfailed'); }
         const response = await route.fetch({ url: new URL(pathname + requestURL.search, fixtureURL).href, maxRedirects: 0 });
         return route.fulfill({ response });
       }
@@ -197,7 +197,7 @@ async function main() {
     for (const name of ['upload', 'close', 'cancel', 'edit']) assert(await get(name).isDisabled());
     for (const i of [0, 1]) assert(await select(i).isDisabled());
     await get('upload').evaluate(n => n.click()); failRefresh = true;
-    const refreshFailure = page.waitForEvent('requestfailed', request => new URL(request.url()).pathname === '/v0/management/plugins/model-quality/targets');
+    const refreshFailure = page.waitForEvent('requestfailed', request => new URL(request.url()).pathname === '/v0/management/plugins/model-quality/login/accounts');
     await held.fulfill({ json: { items: [{ index: 1, status: 'uploaded', enabled: false }, { index: 0, status: 'uploaded', enabled: true }] } });
     await idle(); await refreshFailure; assert.equal(uploads.length, 1);
     assert.match(await row(0).innerText(), /启用/); assert.match(await row(1).innerText(), /禁用/);

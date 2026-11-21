@@ -61,6 +61,9 @@ type session struct {
 	consumed          bool
 }
 type Service struct {
+	batches             accountBatches
+	detailQueries       jobDetailQueries
+	activeConversion    *conversionLease // guarded by mu
 	accountMu           sync.Mutex
 	accounts            map[string]storedAccount
 	accountPermits      map[string]*atomic.Bool
@@ -187,6 +190,11 @@ func New(opts Options) (*Service, error) {
 		cancel()
 		return nil, err
 	}
+	if err := s.startAccountBatches(); err != nil {
+		_ = j.db.Close()
+		cancel()
+		return nil, err
+	}
 	s.wg.Add(1)
 	go s.monitor()
 	if opts.PendingWrites != nil && opts.FinishWrite != nil {
@@ -233,7 +241,15 @@ func (s *Service) Close() error {
 		}
 	}
 	s.mu.Unlock()
+	// The cancelled context rejects new detail leases. Wait for any reader
+	// which observed the old context to finish registering with wg.
+	s.detailQueries.Lock()
+	s.detailQueries.Unlock()
+	s.batches.stop()
 	s.wg.Wait()
+	s.detailQueries.Lock()
+	clear(s.detailQueries.terminal)
+	s.detailQueries.Unlock()
 	s.accountMu.Lock()
 	defer s.accountMu.Unlock()
 	clear(s.accounts)
@@ -268,6 +284,7 @@ func (s *Service) transitionLocked(j *session, status, phase, code string) error
 	}
 	j.record.View.Revision++
 	if terminal(status) {
+		s.detailQueries.remember(j)
 		j.candidate = nil
 		j.pkce = nil
 		j.state = ""
@@ -278,12 +295,7 @@ func (s *Service) transitionLocked(j *session, status, phase, code string) error
 	return s.persistLocked(j)
 }
 func (s *Service) viewLocked(j *session) Job {
-	v := j.record.View
-	if v.Status == "failed" && v.ErrorCode == "runtime_failed" && v.RuntimeCode == "service_error" && v.HTTPStatus == 0 {
-		v.HTTPStatus = serviceHTTPStatus(j.record.LogEntries, v.ErrorStage)
-	}
-	v.CanDelete = canDeleteJob(j.record)
-	v.PlanType, _ = auth.ParsePlan(v.PlanType)
+	v := jobPresentation(j.record)
 	v.Email = j.displayEmail
 	if v.Email == "" {
 		v.Email = j.credentials.Email
@@ -293,38 +305,31 @@ func (s *Service) viewLocked(j *session) Job {
 			v.Email = p.Email
 		}
 	}
-	if v.Email == "" && v.AccountID != "" {
-		v.Email = s.storedAccountEmail(v.AccountID)
-	}
-	if v.Email == "" && v.TargetAuthID != "" {
-		principal := j.record.AdoptedPrincipal
-		if principal == "" {
-			principal = j.expected.Principal
-		}
-		if a, ok := s.opts.Manager.GetByID(v.TargetAuthID); ok {
-			if p, err := auth.LoginPrincipalFromAuth(a); err == nil && principal != "" && p.Key() == principal {
-				v.Email = p.Email
-			}
-		}
-	}
+	s.completeJobEmail(&v, j.record.AdoptedPrincipal, j.expected.Principal)
 	if v.Status == "waiting_browser" && j.owner.Valid != nil && j.owner.Valid() {
 		v.AuthorizationURL = j.url
 	}
 	return v
 }
-func (s *Service) Detail(id string) (Job, error) {
+func (s *Service) liveDetail(id string) (Job, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.liveDetailLocked(id)
+}
+func (s *Service) liveDetailLocked(id string) (Job, error) {
 	j := s.jobs[id]
 	if j == nil || j.record.HistoryDeleted {
 		return Job{}, errors.New("not_found")
+	}
+	if j.record.View.ID != id || !publicJobDiagnostics(j.record.View) {
+		return Job{}, errors.New("storage_unavailable")
 	}
 	return s.viewLocked(j), nil
 }
 func (s *Service) Jobs() []Job {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	items, _ := s.jobsPageLocked("", 200)
+	items, _, _ := s.jobsPageLocked("", 200)
 	return items
 }
 
@@ -345,11 +350,10 @@ func (s *Service) JobsPage(accountID string, limit int) ([]Job, bool, error) {
 	if s.closed || s.fault {
 		return nil, false, errors.New("storage_unavailable")
 	}
-	items, more := s.jobsPageLocked(accountID, limit)
-	return items, more, nil
+	return s.jobsPageLocked(accountID, limit)
 }
 
-func (s *Service) jobsPageLocked(accountID string, limit int) ([]Job, bool) {
+func (s *Service) jobsPageLocked(accountID string, limit int) ([]Job, bool, error) {
 	matched := make([]*session, 0, len(s.jobs))
 	for _, j := range s.jobs {
 		if !j.record.HistoryDeleted && (accountID == "" || j.record.View.AccountID == accountID) {
@@ -368,11 +372,14 @@ func (s *Service) jobsPageLocked(accountID string, limit int) ([]Job, bool) {
 	}
 	out := make([]Job, 0, len(matched))
 	for _, j := range matched {
+		if s.jobs[j.record.View.ID] != j || !publicJobDiagnostics(j.record.View) {
+			return nil, false, errors.New("storage_unavailable")
+		}
 		v := s.viewLocked(j)
 		v.AuthorizationURL = ""
 		out = append(out, v)
 	}
-	return out, more
+	return out, more, nil
 }
 func (s *Service) Capabilities() any {
 	owner, err := s.opts.Owner()
@@ -406,19 +413,30 @@ func (s *Service) Capabilities() any {
 	}
 	return result
 }
+
+// Targets preserves the original in-process list API. Management requests use
+// the error-returning projection to distinguish SDK failure from an empty list.
 func (s *Service) Targets() []map[string]any {
-	out := []map[string]any{}
-	for _, a := range s.opts.Manager.List() {
-		if a.Provider != "codex" {
-			continue
-		}
-		snapshot, err := s.opts.Manager.LoginSnapshot(a.ID)
-		p, _ := auth.LoginPrincipalFromAuth(a)
-		target, _ := s.opts.Manager.QualityTarget(a.ID)
-		out = append(out, map[string]any{"auth_id": a.ID, "auth_index": a.Index, "email": p.Email, "account_id": p.AccountID, "user_id": p.UserID, "masked_email": Mask(p.Email), "identity_version": snapshot.IdentityVersion, "can_update": err == nil, "reason": SafeCode(err), "quality_paused": target.QualityPaused, "manual_disabled": target.OperatorDisabled})
+	items, err := s.targets()
+	if err != nil {
+		return []map[string]any{}
 	}
-	return out
+	return items
 }
+
+func (s *Service) targets() ([]map[string]any, error) {
+	targets, err := s.opts.Manager.LoginTargets()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]map[string]any, 0, len(targets))
+	for _, target := range targets {
+		p := target.Principal
+		out = append(out, map[string]any{"auth_id": target.ID, "auth_index": target.Index, "email": p.Email, "account_id": p.AccountID, "user_id": p.UserID, "masked_email": Mask(p.Email), "identity_version": target.Snapshot.IdentityVersion, "can_update": target.Reason == nil, "reason": SafeCode(target.Reason), "quality_paused": false, "manual_disabled": target.Disabled})
+	}
+	return out, nil
+}
+
 func (s *Service) Start(r StartRequest) (Job, error) {
 	return s.start(r, nil)
 }
@@ -505,6 +523,7 @@ func (s *Service) start(r StartRequest, account *storedAccount) (Job, error) {
 	for _, id := range removed {
 		delete(s.jobs, id)
 	}
+	s.detailQueries.forget(removed...)
 	if err = s.journal.admit(); err != nil {
 		return Job{}, err
 	}
@@ -516,6 +535,9 @@ func (s *Service) start(r StartRequest, account *storedAccount) (Job, error) {
 				key = s.journal.fingerprint(p.Email)
 			}
 		}
+	}
+	if lease := s.activeConversion; lease != nil && lease.matches(r.Credentials.Email, workspace, expected.Principal) {
+		return Job{}, errors.New("conflict")
 	}
 	active, attempts := 0, 0
 	for _, j := range s.jobs {
@@ -560,10 +582,9 @@ func (s *Service) start(r StartRequest, account *storedAccount) (Job, error) {
 			return Job{}, err
 		}
 	}
-	if account == nil {
-		err = s.persistLocked(j)
-	} else {
-		bound := *account
+	var bound storedAccount
+	if account != nil {
+		bound = *account
 		bound.View.LastJobID, bound.View.LastJobStatus = id, j.record.View.Status
 		bound.View.SecurityPending, bound.View.LastJobAction = r.securityAction != "", r.securityAction
 		bound.View.Revision++
@@ -573,20 +594,29 @@ func (s *Service) start(r StartRequest, account *storedAccount) (Job, error) {
 			bound.ConsumedEvidence = ""
 			bound.NextAttempt = time.Time{}
 		}
-		// Neither a helper nor a durable orphan job can precede account binding.
-		err = s.journal.db.Update(func(tx *bolt.Tx) error {
-			if err := s.journal.saveTx(tx, j.record); err != nil {
+	}
+	// The command-to-job link, job and optional account binding share the
+	// admission transaction. The worker cannot run ahead of this checkpoint.
+	err = s.journal.db.Update(func(tx *bolt.Tx) error {
+		if err := s.journal.saveTx(tx, j.record); err != nil {
+			return err
+		}
+		if r.commandID != "" {
+			if err := bindJobCommand(tx, r.commandID, id); err != nil {
 				return err
 			}
-			return putGob(tx, "accounts", bound.View.ID, bound)
-		})
-		if err != nil {
-			s.fault = true
-			s.cancel()
-			err = errors.New("storage_unavailable")
-		} else {
-			s.accounts[bound.View.ID] = bound
 		}
+		if account != nil {
+			return putGob(tx, "accounts", bound.View.ID, bound)
+		}
+		return nil
+	})
+	if err != nil {
+		s.fault = true
+		s.cancel()
+		err = errors.New("storage_unavailable")
+	} else if account != nil {
+		s.accounts[bound.View.ID] = bound
 	}
 	if err != nil {
 		cancel()
@@ -637,6 +667,9 @@ func (s *Service) saveAccountAuthorization(j *session) error {
 			discarded.Updated = now
 			break
 		}
+	}
+	if previous != nil {
+		s.detailQueries.remember(previous)
 	}
 	if err := s.journal.db.Update(func(tx *bolt.Tx) error {
 		b, err := tx.CreateBucketIfNotExists([]byte("account-authorizations"))
@@ -975,7 +1008,7 @@ func (s *Service) Callback(id, callback string) (Job, error) {
 			_ = s.transitionLocked(j, "awaiting_commit", "review", "")
 		}
 	}()
-	return s.Detail(id)
+	return s.liveDetail(id)
 }
 func (s *Service) prepareGrantDestination(j *session, p auth.LoginPrincipal) error {
 	if err := s.resolveSecurityCredential(j, p); err != nil {
@@ -1075,7 +1108,7 @@ func (s *Service) Commit(ctx context.Context, id, candidateID string, revision u
 	if err != nil {
 		return Job{}, err
 	}
-	return s.Detail(id)
+	return s.liveDetail(id)
 }
 
 // beginCommitLocked records submission before starting the only credential write.
@@ -1094,7 +1127,7 @@ func (s *Service) beginCommitLocked(j *session) error {
 		if other != j && j.record.View.AccountID != "" && other.record.View.AccountID == j.record.View.AccountID && !terminal(other.record.View.Status) && other.record.View.Status != "awaiting_commit" {
 			return errors.New("conflict")
 		}
-		if j.record.View.AccountID != "" && other.record.View.AccountID == j.record.View.AccountID && newerAccountJob(other.record, j.record) {
+		if j.record.View.AccountID != "" && other.record.View.AccountID == j.record.View.AccountID && newerAccountJob(&other.record, &j.record) {
 			if other.record.View.Status == "saved_not_adopted" || other.record.View.Status == "commit_unknown" {
 				return errors.New("conflict")
 			}
@@ -1266,6 +1299,7 @@ func (s *Service) maintain() {
 		for _, id := range removed {
 			delete(s.jobs, id)
 		}
+		s.detailQueries.forget(removed...)
 		s.lastPrune = now
 	}
 }
@@ -1289,13 +1323,16 @@ func (s *Service) Idempotent(key, path string, body []byte, fn func() (any, erro
 	}
 	if value.Get("method").Exists() {
 		id := value.Get("id").String()
+		if _, err := decodeJobReply(raw, id); err != nil {
+			return nil, err
+		}
 		s.mu.Lock()
 		deleted := s.jobs[id] != nil && s.jobs[id].record.HistoryDeleted
 		s.mu.Unlock()
 		if deleted {
 			return nil, errors.New("not_found")
 		}
-		if job, err := s.Detail(id); err == nil {
+		if job, err := s.liveDetail(id); err == nil {
 			_ = d.Set("email", job.Email)
 		}
 	}

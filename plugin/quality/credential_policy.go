@@ -400,7 +400,7 @@ func (en *Engine) admitManagedLocked(ctx context.Context, r *Rule, t Target, val
 	if en.localPause(RunConfig{AuthID: t.AuthID}) != "" || t.QualityPaused || t.RetainedPause {
 		return t, nil, fmt.Errorf("blocked: retained quality pause")
 	}
-	snapshot, err := h.CredentialSnapshot(ctx, t.AuthID, t.AuthIndex)
+	snapshot, err := admissionReadLocked(en, ctx, r.RunConfig, en.rules[r.ID], func() (CredentialSnapshot, error) { return h.CredentialSnapshot(ctx, t.AuthID, t.AuthIndex) })
 	if err != nil {
 		return t, nil, err
 	}

@@ -7,7 +7,7 @@ const crypto = require('node:crypto');
 const { chromium } = require('/Users/ceng/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules/playwright');
 const root = path.resolve(__dirname, '..');
 const output = path.resolve(process.env.ACCOUNT_UI_OUTPUT || path.join(root, 'artifacts/account-refined-8.8.0/account-ui'));
-const sourceHashes = () => Object.fromEntries(['index.html','app.js','login.js','client.js','view.js','style.css'].map(name=>[name,crypto.createHash('sha256').update(fs.readFileSync(path.join(root,'plugin/ui',name))).digest('hex')]));
+const sourceHashes = () => Object.fromEntries(require('../plugin/ui/public_assets.json').map(name=>[name,crypto.createHash('sha256').update(fs.readFileSync(path.join(root,'plugin/ui',name))).digest('hex')]));
 const source = sourceHashes();
 fs.mkdirSync(output, { recursive: true });
 const accounts = [], jobs = [], calls = [], errors = [], checks = [];
@@ -34,7 +34,7 @@ const server = http.createServer(async (req,res) => {
   const url = new URL(req.url,'http://localhost');
   if(!url.pathname.startsWith('/v0/management/')) {
     const name = url.pathname === '/' ? 'index.html' : url.pathname.slice(1);
-    if(!['index.html','app.js','style.css','view.js','client.js','login.js'].includes(name)) { res.writeHead(404);res.end();return; }
+    if(!require('../plugin/ui/public_assets.json').includes(name)) { res.writeHead(404);res.end();return; }
     res.writeHead(200,{'Content-Type':name.endsWith('.js')?'text/javascript':name.endsWith('.css')?'text/css':'text/html'});res.end(fs.readFileSync(path.join(root,'plugin/ui',name)));return;
   }
   let raw=''; for await (const chunk of req) raw += chunk;

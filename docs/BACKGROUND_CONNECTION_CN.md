@@ -1,6 +1,8 @@
 # Credential Ops 后台连接与恢复
 
-适用于官方 CPA 8.0.76、插件 0.31.0 和 UI 13.8.0。首次在插件中输入 CPA 管理密钥并成功保存后，容器重启只需挂回原插件数据卷。账号巡检、质量检测和后台授权各自有生命周期。
+后台授权方案自官方 CPA 8.0.76、插件 0.31.0 和 UI 13.8.0 起提供。0.32.0 增加下次探测时间、传输关闭协调和工作区独立读取。[当前服务说明](SERVICE_LIFECYCLE_0_32_CN.md)
+
+首次在插件中输入 CPA 管理密钥并成功保存后，容器重启只需挂回原插件数据卷。账号巡检、质量检测和后台授权各自有生命周期。
 
 ## 三条调用链
 
@@ -30,7 +32,7 @@
 
 | 操作 | 请求与回执 |
 | --- | --- |
-| `GET /connection` | 返回 `state`、`configured`、`can_migrate`、`revision`，以及可用时的 `source`、`code`。只读取后台状态 |
+| `GET /connection` | 返回 `state`、`configured`、`can_migrate`、`revision`，以及可用时的 `source`、`code` 和 `next_attempt_at`。只读取后台状态 |
 | `PUT /connection` | 提交 `{"revision":当前值,"mode":"configure"}`。候选密钥取自该请求的鉴权头。使用回环只读接口验证成功并完成持久化后，才切换当前配置 |
 | 旧浏览器迁移 | 使用同一个 PUT，模式为 `migrate`。仅初次无配置状态允许。明确清除后的标记跨重启保留，旧页面无权重新迁移 |
 | `DELETE /connection` | 提交 `{"revision":当前值}`。以无密钥标记替换配置，后续依赖回环的工作等待。账号巡检许可和逐规则开关独立保存 |
@@ -47,7 +49,13 @@
 | `error` | 私有存储、记录版本、权限、回环地址或部署配置需要核对。状态只提供诊断代码 |
 | `closing` | 实例正在退出，拒绝新的回环工作并取消健康检查 |
 
+0.32.1 源码中，当前密钥收到管理接口 401 后，如果失效标记暂时无法写入，`state=invalid`、`code=connection_invalidation_save_failed`。此时后台已丢弃内存密钥，`next_attempt_at` 是下次保存无密钥标记的时间。恢复磁盘空间或写权限后，同一协调器用原失效修订补写标记。管理员先行配置新密钥或清除授权会终止旧修订的补写。永久存储故障期间若进程退出，卷中可能仍是上次成功保存的记录；重启会先进行只读鉴权，只有通过后才会开放后台管理调用。
+
 就绪探针使用 `GET /v8/management/observability/requests/in-flight`，读取本地计数并核实响应。初始化期间只加载磁盘状态，网络验证异步执行。单次验证限时 4 秒，临时故障从约 1 秒起指数退避并加入抖动，基础间隔上限 64 秒；CPA 指定的等待时间优先。健康时约每 90–120 秒核实一次。普通状态读取复用验证结果。管理密钥轮换不改变 CPA 凭证条目标识。
+
+0.32.2 在同一修订上合并健康探针与业务请求同时收到的限制。403 优先显示为 `restricted`，已有 429 遇到临时 503 时保留 `rate_limited`，重试采用已知的最晚期限。业务请求收到官方临时 IP 封禁说明时，`code=management_temporarily_banned`。管理员可查看 `next_attempt_at`，协调器到时自动核验。已有退避期间迟到的成功响应不能提前放行。[并发限制与恢复用例](../plugin/quality/management_connection_test.go) · [业务封禁与期限实测](../artifacts/verification-commercial-rounds/outer-denial-race.log)
+
+若调用方取消时已收到**当前修订的 CPA 管理 HTTP 401**，后台仍停用该修订的密钥，需要管理员更新。仅在本地取消且未收到拒绝响应时，授权状态保留。管理 `api-call` 成功响应内的模型 401，以及该接口表示上游传输失败的外层 502，由样本路径处理。查询时先看请求所属接口、外层状态及后台状态代码。[取消与拒绝的回归](../plugin/quality/management_response_test.go) · [回环传输](../plugin/quality/management_client.go)
 
 ## 故障、调度与回执
 
@@ -60,7 +68,11 @@
 
 持久目录、部署 Secret 优先级和备份要求见[持久化说明](PERSISTENCE_CN.md)。详细准入与处置语义见[质量运维逻辑](QUALITY_OPERATIONS_LOGIC_CN.md)。容器重建、补检、重新授权和本机部署结果见[验收报告](BACKGROUND_CONNECTION_VERIFICATION_CN.md)。
 
+首次保存或清除若返回 `507 connection_save_failed`，先恢复私有目录的写权限或磁盘空间，再读 `/connection` 核对原修订，按当前意图明确提交。若返回 `500 connection_save_unknown`，原子更名后的持久化结果尚待核对，后台已停用内存中的配置。修复存储后通过当前修订明确保存或清除。若连 `/connection` 和 `/rules` 都返回普通路由 404，先查询 CPA 的插件登记及注册错误，再按完整卷恢复流程处理。[只读挂载与容量耗尽实测](../artifacts/verification-commercial-rounds/final/connection-storage.json) · [质量库冷备恢复](PERSISTENCE_CN.md)
+
 ## 浏览器验收与历史脚本
+
+UI 14.0.2 在账号工作区或其 iframe 隐藏后停止新增详情、候选和日志轮询。管理员已明确开始的日志导出可以继续读取剩余游标页。返回后同步原任务与选中记录。三个隐藏场景中的展示轮询、新增业务写入均为零，导出场景另读取了一页已经请求导出的数据。[隐藏、返回和导出实测](../artifacts/verification-commercial-rounds/ui-hidden/account-navigation.json)
 
 在仓库根目录执行以下命令。Chromium 脚本会在回环随机端口启动合成管理服务，测试账号来自内存夹具。页面请求数量按实际到达的接口计数，包含初始化和人为触发的刷新。
 
@@ -87,4 +99,4 @@ UI 13.8.0 通过 46 个 Node 单测和 33 个浏览器连接、页面恢复与�
 | 两个标签同时编辑，清除后另一标签持有旧 revision，换密钥后迟到旧 401 | 1 次旧版本写入被拒绝，2 次明确配置变更生效，旧响应没有清除新密钥 |
 | 页面临时 503 后恢复，再隐藏 65 秒 | 账号和草稿保留，隐藏期间 0 次展示读取，0 次业务写入 |
 
-当前账号界面的资料、代理、上传许可、工作流偏好、历史、对话框草稿与错误回执由 `verify_account_dialogs.cjs`、`verify_account_startup.cjs`、`verify_account_delete_ui.cjs` 和 `verify_security_submit.cjs` 涵盖。凭证转换和选择上传由 `verify_conversion_ui.cjs` 验证。历史脚本 `verify_account_ui.cjs`（8.8.0）和 `verify_login_ui.cjs`（8.9.0）仍断言页面存在三个 `[data-login-view]` 页签；13.8.0 通过“历史记录”和“全局设置”按钮打开对应对话框。旧脚本仍列在旧 UI 构建的输入哈希清单中，直接用于当前页面会在旧页签断言失败。[历史 UI 验证范围](UI_REWORK_9_4_0_CN.md)
+当前账号界面的资料、代理、上传许可、工作流偏好、历史、对话框草稿与错误回执由 `verify_account_dialogs.cjs`、`verify_account_startup.cjs`、`verify_account_delete_ui.cjs` 和 `verify_security_submit.cjs` 涵盖。凭证转换和选择上传由 `verify_conversion_ui.cjs` 验证。UI 14.0.1 的 `verify_login_ui.cjs` 从“历史记录”打开任务，核对页面上的完整邮箱、脱敏导出和撤回的授权链接。8.9.0 的三页签与旧导出断言归档在 `verify_login_ui_legacy.cjs`，运行时通过 `LEGACY_LOGIN_UI_DIR` 指定匹配的静态页面。8.8.0 的 `verify_account_ui.cjs` 也使用旧页签。[当前历史记录实测](../artifacts/verification-0.32.1/ui/historical-jobs/report.json) · [历史 UI 验证范围](UI_REWORK_9_4_0_CN.md)

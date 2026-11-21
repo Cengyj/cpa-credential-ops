@@ -22,7 +22,7 @@ For store installation, enable the plugin system and add `https://raw.githubuser
 3. For a fresh manual installation, extract `model-quality.so` to the configured plugin directory and enable it. For a manual upgrade, use the plugin's `path` from `GET /v8/management/plugins` to locate the current library. If it has a versioned filename, use the store update so CPA also updates the configured version. Restart CPA after a manual installation.
 4. Refresh the authenticated management panel and open **Credential Ops**.
 
-The 0.31.0 source build verifies the CPA management key once, saves it in the plugin’s private data volume and restores access on startup. Browser logout ends that browser’s access. [Connection lifecycle](docs/BACKGROUND_CONNECTION_CN.md)
+The workspace source is **0.32.2 / UI 14.0.2**. Startup checks the quality database and its command receipts before enabling workers. Concurrent management failures preserve the host’s retry deadline. Account history stops requesting additional display data when its page is hidden. The local CPA on port 8317 serves **0.32.0 / UI 14.0.0**. [Service and command lifecycle](docs/SERVICE_LIFECYCLE_0_32_CN.md) · [Verification and recovery](docs/COMMERCIAL_REVIEW_0_32_2_CN.md)
 
 The display name and repository have changed. The native plugin ID, library filename, configuration key, API paths, and data directory remain `model-quality` so existing installations retain their accounts, rules, and history. Do not install a second copy under a different library filename.
 

@@ -27,16 +27,7 @@ func (en *Engine) Handle(ctx context.Context, req pluginapi.ManagementRequest) p
 			result, err = native.Management.handleConnection(ctx, req)
 		}
 	case "GET /targets":
-		var items []Target
-		coverage := &providerInventoryStatus{Verified: true}
-		items, err = en.visibleTargets(context.WithValue(ctx, providerInventoryStatusKey{}, coverage))
-		rows := page(items, req)
-		if h, ok := en.host.(*NativeHost); ok && h.Management != nil && h.Management.ready() {
-			h.Management.addModelReasoning(ctx, rows["items"].([]Target))
-		}
-		rows["capabilities"] = en.Capabilities()
-		rows["provider_directory_verified"] = coverage.Verified
-		result = rows
+		result, err = en.targetPage(ctx, req)
 	case "GET /questions":
 		items := Questions()
 		for i := range items {
@@ -113,6 +104,8 @@ func (en *Engine) Handle(ctx context.Context, req pluginapi.ManagementRequest) p
 		if body, err = decodeRuleWrite(req.Body, true); err == nil {
 			result, err = en.previewRuleScope(ctx, body.Rule)
 		}
+	case "GET /rules/commands":
+		result, err = en.ruleCommandStatus(req.Query.Get("idempotency_key"))
 	case "GET /rules":
 		result = en.queryRules(req.Query)
 	case "POST /rules/handling/acknowledge":
@@ -135,10 +128,16 @@ func (en *Engine) Handle(ctx context.Context, req pluginapi.ManagementRequest) p
 		}
 	case "POST /rules/run":
 		var body struct {
+			Key      string `json:"idempotency_key"`
 			ID       string `json:"id"`
 			Revision uint64 `json:"revision"`
 		}
 		if err = DecodeStrict(req.Body, &body); err == nil {
+			if body.Key != "" {
+				result, err = en.acceptRuleRun(ctx, body.Key, body.ID, body.Revision)
+				status = 202
+				break
+			}
 			var receipt ruleDispatch
 			receipt, err = en.dispatchRule(ctx, body.ID, body.Revision, false)
 			result = receipt
@@ -211,9 +210,7 @@ func (en *Engine) Handle(ctx context.Context, req pluginapi.ManagementRequest) p
 			}
 		}
 	case "GET /history":
-		var entries []Audit
-		entries, err = en.History()
-		result = page(entries, req)
+		result, err = en.store.historyPage(req.Query)
 	case "GET /metrics":
 		result, err = en.metrics(req.Query.Get("view") == "summary")
 	case "GET /presets":
@@ -256,19 +253,9 @@ func (en *Engine) Handle(ctx context.Context, req pluginapi.ManagementRequest) p
 				headers.Set("Retry-After", delay)
 			}
 		}
-		code, mappedStatus := classifyError(err)
+		failure, mappedStatus := describeFailure(err, req.Method)
 		status = mappedStatus
-		msg := scrubError(err)
-		source := "business"
-		switch {
-		case strings.HasPrefix(code, "management_"), strings.HasPrefix(code, "connection_"):
-			source = "backend_management"
-		case code == "sdk_unavailable":
-			source = "sdk"
-		case code == "unavailable":
-			source = "plugin"
-		}
-		result = map[string]any{"error": map[string]any{"code": code, "message": msg, "source": source, "outcome_unknown": code == "management_uncertain" || code == "connection_save_unknown"}}
+		result = map[string]any{"error": failure}
 	} else if result == nil {
 		result = map[string]bool{"ok": true}
 	}

@@ -33,8 +33,9 @@ type Item struct {
 }
 
 type Result struct {
-	Items []Item `json:"items"`
-	Ready int    `json:"ready"`
+	SourceRef string `json:"source_ref,omitempty"`
+	Items     []Item `json:"items"`
+	Ready     int    `json:"ready"`
 }
 
 // ValidateJSON rejects duplicate keys and excessive nesting before any parsing.

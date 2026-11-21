@@ -18,6 +18,8 @@
 config.yaml
 auths/
 model-quality-data/
+plugin-data/
+**/accounts/security/
 **/management/connection.json
 **/management/.connection-*
 logs/

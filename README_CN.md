@@ -8,7 +8,7 @@ Credential Ops 是面向官方 CLIProxyAPI 的独立原生插件项目，通过 
 
 **GitHub 发布 Linux amd64（x86_64）完整包。** 包含插件账号管理、2FA 登录、智商测试、质量运维和内嵌 Go/Sobek 登录引擎，要求 glibc 2.34 或以上。[安装包与校验文件](https://github.com/Cengyj/cpa-credential-ops/releases/tag/v0.29.37)
 
-**当前工作区版本为插件 0.31.0、UI 13.8.0、Go/Sobek 2.2.1。** 后台管理授权从插件私有数据卷恢复，错过的定时检测按当前许可补一次，同一条目重新授权后续用原规则。[后台连接与恢复](docs/BACKGROUND_CONNECTION_CN.md)
+**工作区源码为插件 0.32.2、UI 14.0.2，运行时版本为 2.2.1。** 启动时核对质量库和规则命令回执，后台按 CPA 给出的期限恢复管理请求。账号历史在页面隐藏后停止追加展示读取，返回时按原任务同步。本机 8317 实际提供插件 0.32.0、UI 14.0.0。[服务与命令契约](docs/SERVICE_LIFECYCLE_0_32_CN.md) · [三轮复核与恢复实测](docs/COMMERCIAL_REVIEW_0_32_2_CN.md)
 
 从 CPA 侧栏返回时，同一标签页恢复上次打开的工作区。读取账号列表期间也可以切到智商测试或质量运维。固定供应商暂时缺席时，新运行记录会保留已核实的路由类型与索引。[管理连接与页面状态](docs/PERSISTENCE_CN.md) · [运维记录](docs/QUALITY_SCOPE_CN.md)
 
@@ -18,7 +18,7 @@ Credential Ops 是面向官方 CLIProxyAPI 的独立原生插件项目，通过 
 
 此前的质量运维、独立错误策略和恢复归属审查见 [0.30.2](docs/COMMERCIAL_AUDIT_0_30_2_CN.md)、[0.30.1](docs/COMMERCIAL_AUDIT_0_30_1_CN.md) 和 [0.30.0](docs/QUALITY_OPERATIONS_0_30_0_CN.md)。上方 GitHub 下载链接指向已发布包。
 
-本地 8317 已于 2026-11-21 18:05（北京时间）更新到完整 Linux arm64 插件 0.31.0。六份实际页面资源与构建清单逐一匹配，条件读取均返回 304。原有 195 份插件数据文件保全，账号和提交收据库逻辑内容一致，质量库仅新增经旧摘要核实的配置输入记录。[验收与复现](docs/BACKGROUND_CONNECTION_VERIFICATION_CN.md) · [实际部署报告](artifacts/backend-connection-0.31.0/deployment.json)
+本地 8317 已于 2026-11-21 19:20（北京时间）更新到完整 Linux arm64 插件 0.32.0。原有 196 个插件数据文件全部保留，质量库、账号库、登录收据库的逻辑摘要一致。10 个实际页面资源与包内源码一致，浏览器重开全部返回 304。[验收与复现](docs/SERVICE_VERIFICATION_0_32_CN.md) · [部署报告](artifacts/verification-0.32.0/deployment.json)
 
 在「质量运维 → 编辑规则 → 上游错误处理」中，可分别设置遇到 401、402、账户配额耗尽的 429、指定模型不支持的 400/404 时如何处理凭证。从 UI 13.6.59 起，在支持凭证处置的 CPA 上新建规则时，四项均预选「暂停凭证」，可逐项修改。编辑已有规则会显示原配置。确认处置后，同批其他凭证和后续任务继续执行。答错与上游错误策略独立，自定义、视觉和人工评审题可在支持的探测通道上处理明确上游错误。管理员在 CPA 启用后，正常刷新、测试提交及规则派发自动结束旧普通阻断，无额外确认阶段。
 

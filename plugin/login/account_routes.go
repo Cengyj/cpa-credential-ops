@@ -10,6 +10,10 @@ import (
 
 // Account writes share the login service's authenticated idempotency journal.
 func credentialAccountWrite(s *Service, method, path string, raw []byte) (any, error) {
+	return s.writeAccountCommand(method, path, raw, "")
+}
+
+func (s *Service) writeAccountCommand(method, path string, raw []byte, commandID string) (any, error) {
 	invalid := errors.New("invalid_request")
 	if path == "/accounts/import" && method == http.MethodPost {
 		r, err := Object(raw, "entries", "proxy_url")
@@ -115,12 +119,9 @@ func credentialAccountWrite(s *Service, method, path string, raw []byte) (any, e
 		if err != nil {
 			return nil, err
 		}
-		return s.startManualSecurity(r.Get("id").String(), revision, r.Get("action").String(), r.Get("logout_all_devices").Bool(), reauthorize, upload)
+		return s.startManualSecurity(r.Get("id").String(), revision, r.Get("action").String(), r.Get("logout_all_devices").Bool(), reauthorize, upload, commandID)
 	}
-	allowed := []string{"id"}
-	if path != "/accounts/inspect" {
-		allowed = append(allowed, "revision")
-	}
+	allowed := []string{"id", "revision"}
 	if path == "/accounts/start" {
 		allowed = append(allowed, "target_auth_id", "upload_to_cpa")
 	}
@@ -138,10 +139,6 @@ func credentialAccountWrite(s *Service, method, path string, raw []byte) (any, e
 		}
 	}
 	id := r.Get("id").String()
-	if path == "/accounts/inspect" && method == http.MethodPost {
-		accounts, err := s.InspectAccounts(id)
-		return map[string]any{"items": accounts}, err
-	}
 	if id == "" {
 		return nil, invalid
 	}
@@ -155,7 +152,7 @@ func credentialAccountWrite(s *Service, method, path string, raw []byte) (any, e
 		if err != nil {
 			return nil, err
 		}
-		return s.startManualAccount(id, revision, r.Get("target_auth_id").String(), upload)
+		return s.startManualAccountCommand(id, revision, r.Get("target_auth_id").String(), upload, commandID)
 	case path == "/accounts/entry" && method == http.MethodDelete:
 		return map[string]bool{"deleted": true}, s.DeleteAccount(id, revision)
 	case path == "/accounts/entry" && method == http.MethodPut:

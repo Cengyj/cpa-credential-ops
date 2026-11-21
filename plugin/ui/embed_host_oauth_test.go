@@ -27,14 +27,14 @@ func TestHostOAuthAssets(t *testing.T) {
 	}
 }
 
-// The optional browser check exercises the same six resources the native host serves.
+// The optional browser check exercises the same resources the native host serves.
 func TestHostOAuthBrowser(t *testing.T) {
 	node := os.Getenv("HOST_OAUTH_UI_TEST_NODE")
 	if node == "" {
 		t.Skip("set HOST_OAUTH_UI_TEST_NODE to a Node executable with Playwright to run the browser check")
 	}
 	dir := t.TempDir()
-	for _, name := range []string{"index.html", "app.js", "client.js", "view.js", "login.js", "style.css"} {
+	for _, name := range []string{"index.html", "app.js", "client.js", "view.js", "login.js", "style.css", "workspace.js", "commands.js", "markup.js", "conversion.js"} {
 		data, err := Files.ReadFile(name)
 		if err != nil {
 			t.Fatal(err)

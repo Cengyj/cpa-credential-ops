@@ -60,7 +60,7 @@ async function finish(id) {
   assert.equal(unauthorized.status, 401);
   checks.push('actual v8 management rejects unauthenticated targets');
   const resourceHashes = {};
-  for (const name of ['index.html', 'app.js', 'client.js', 'view.js', 'login.js', 'style.css']) {
+  for (const name of require('../plugin/ui/public_assets.json')) {
     const response = await fetch(new URL(name, demo.page_url));
     assert.equal(response.status, 200);
     const returned = Buffer.from(await response.arrayBuffer());
@@ -70,7 +70,7 @@ async function finish(id) {
     assert.deepEqual(returned, packaged, `Native host resource ${name} must match static build bytes`);
     resourceHashes[name] = require('node:crypto').createHash('sha256').update(returned).digest('hex');
   }
-  checks.push('all six native-host resources are byte-identical to UI source and static build');
+  checks.push('all native-host resources are byte-identical to UI source and static build');
   const targetReply = await api('/targets');
   const target = targetReply.items.find((entry) => entry.models.includes('mq-reasoner'));
   assert(target, `mock target missing: ${JSON.stringify(targetReply)}`);
@@ -383,7 +383,7 @@ async function finish(id) {
   const report = {
     result: 'passed',
     verified_at: new Date().toISOString(),
-    source_sha256: Object.fromEntries(['index.html', 'app.js', 'client.js', 'view.js', 'login.js', 'style.css'].map((name) => [name, require('node:crypto').createHash('sha256').update(fs.readFileSync(path.join(root, 'plugin/ui', name))).digest('hex')])),
+    source_sha256: Object.fromEntries(require('../plugin/ui/public_assets.json').map((name) => [name, require('node:crypto').createHash('sha256').update(fs.readFileSync(path.join(root, 'plugin/ui', name))).digest('hex')])),
     binary_sha256: Object.fromEntries(['cli-proxy-api-quality', process.platform === 'darwin' ? 'model-quality.dylib' : 'model-quality.so'].map((name) => [name, require('node:crypto').createHash('sha256').update(fs.readFileSync(path.join(root, 'artifacts', name))).digest('hex')])),
     platform: `${process.platform}/${process.arch}`,
     browser: await browser.version(),

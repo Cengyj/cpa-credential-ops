@@ -14,7 +14,7 @@ const controlKey = 'offline-control';
 const portIndex = process.argv.indexOf('--port');
 const requestedPort = portIndex < 0 ? 0 : Number(process.argv[portIndex + 1]);
 if (!Number.isInteger(requestedPort) || requestedPort < 0 || requestedPort > 65535) throw new Error('Invalid --port');
-const staticFiles = new Set(['index.html', 'app.js', 'client.js', 'login.js', 'view.js', 'style.css']);
+const staticFiles = new Set(require('../plugin/ui/public_assets.json'));
 let accounts, jobs, credentials, logs, recoveries, settings, sequence, injections, calls, receipts, connection;
 let qualityTargets, questions, qualityRuns, qualityRules, qualityActions, qualityAudits, qualitySettings;
 const timers = new Set();

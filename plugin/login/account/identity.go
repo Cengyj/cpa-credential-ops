@@ -109,6 +109,7 @@ type LoginCommitRequest struct {
 
 // LoginCommitResult reports durable adoption, independently of credential availability.
 type LoginCommitResult struct {
+	CommandRef        string `json:"command_ref,omitempty"`
 	CommitID          string `json:"commit_id"`
 	AuthID            string `json:"auth_id"`
 	AuthIndex         string `json:"auth_index,omitempty"`

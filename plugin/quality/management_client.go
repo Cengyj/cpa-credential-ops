@@ -155,8 +155,14 @@ func (m *ManagementClient) conditionalResponse(ctx context.Context, method, path
 	resp, err := m.send(ctx, key, method, path, body, ifMatch)
 	// CPA reports upstream transport failures as an outer 502 on api-call.
 	upstreamTransport := resp != nil && path == "/v8/management/requests/api-call" && resp.StatusCode == http.StatusBadGateway
-	if ctx.Err() == nil && !upstreamTransport && (err != nil || resp.StatusCode >= 400) {
+	// An HTTP response belongs to this credential revision even when the
+	// caller is cancelled as the headers arrive. A local cancellation alone
+	// carries no evidence about the host.
+	if resp != nil && resp.StatusCode >= 400 && !upstreamTransport || err != nil && ctx.Err() == nil {
 		m.observeFailure(status.Revision, resp)
+	}
+	if resp != nil && resp.StatusCode == http.StatusForbidden && ctx.Err() == nil {
+		m.observeBan(status.Revision, resp)
 	}
 	if err != nil && method != http.MethodGet {
 		return nil, fmt.Errorf("management_uncertain: CPA did not confirm the operation")
@@ -173,8 +179,13 @@ func (m *ManagementClient) send(ctx context.Context, key, method, path string, b
 			return nil, err
 		}
 	}
-	req, err := http.NewRequestWithContext(ctx, method, m.base+path, bytes.NewReader(raw))
+	requestCtx, release, err := m.transportContext(ctx)
 	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(requestCtx, method, m.base+path, bytes.NewReader(raw))
+	if err != nil {
+		release()
 		return nil, fmt.Errorf("invalid management request")
 	}
 	req.Header.Set("Authorization", "Bearer "+key)
@@ -184,9 +195,42 @@ func (m *ManagementClient) send(ctx context.Context, key, method, path string, b
 	}
 	resp, err := m.client.Do(req)
 	if err != nil {
+		release()
 		return nil, fmt.Errorf("management_network: CPA management endpoint did not respond")
 	}
+	resp.Body = &managementResponseBody{ReadCloser: resp.Body, release: release}
 	return resp, nil
+}
+
+// Hold a transport lease through the response body. Shutdown cancels active
+// reads and waits for their callers to release the body before closing idle connections.
+func (m *ManagementClient) transportContext(ctx context.Context) (context.Context, func(), error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.status.State == "closing" {
+		return nil, nil, fmt.Errorf("unavailable: management transport is closing")
+	}
+	m.wg.Add(1)
+	if m.ctx == nil {
+		return ctx, sync.OnceFunc(m.wg.Done), nil
+	}
+	requestCtx, cancel := context.WithCancel(ctx)
+	stop := context.AfterFunc(m.ctx, cancel)
+	return requestCtx, sync.OnceFunc(func() {
+		stop()
+		cancel()
+		m.wg.Done()
+	}), nil
+}
+
+type managementResponseBody struct {
+	io.ReadCloser
+	release func()
+}
+
+func (b *managementResponseBody) Close() error {
+	defer b.release()
+	return b.ReadCloser.Close()
 }
 
 func (m *ManagementClient) request(ctx context.Context, method, path string, body any, out any, limit int64) error {
@@ -196,14 +240,14 @@ func (m *ManagementClient) request(ctx context.Context, method, path string, bod
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("management_http_%d: CPA management request failed", resp.StatusCode)
+		return &managementHTTPError{status: resp.StatusCode}
 	}
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
-	if err != nil || int64(len(raw)) > limit {
+	if err != nil || int64(len(raw)) > limit || out != nil && json.Unmarshal(raw, out) != nil {
+		if method == http.MethodGet {
+			return fmt.Errorf("management_invalid_response: invalid or oversized CPA response")
+		}
 		return fmt.Errorf("management_uncertain: invalid or oversized CPA response")
-	}
-	if out != nil && json.Unmarshal(raw, out) != nil {
-		return fmt.Errorf("management_uncertain: invalid CPA response")
 	}
 	return nil
 }

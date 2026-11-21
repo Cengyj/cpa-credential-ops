@@ -2,8 +2,18 @@ package quality
 
 import (
 	"fmt"
+	"maps"
 	"sort"
+
+	bolt "go.etcd.io/bbolt"
 )
+
+// Reads share scalar totals only while the committed store revision is unchanged.
+// All run updates publish under the engine mutex after their transaction commits.
+type metricsProjection struct {
+	revision int
+	values   map[string]any
+}
 
 func (en *Engine) Metrics() (map[string]any, error) {
 	return en.metrics(false)
@@ -11,6 +21,23 @@ func (en *Engine) Metrics() (map[string]any, error) {
 
 func (en *Engine) metrics(summary bool) (map[string]any, error) {
 	en.mu.Lock()
+	var revision int
+	if summary {
+		err := en.store.db.View(func(tx *bolt.Tx) error {
+			revision = tx.ID()
+			return nil
+		})
+		if err != nil {
+			en.mu.Unlock()
+			return nil, fmt.Errorf("unavailable: read metrics revision: %w", err)
+		}
+		if en.summary.revision == revision && en.summary.values != nil {
+			result := maps.Clone(en.summary.values)
+			en.mu.Unlock()
+			result["dropped_usage_events"] = en.dropped.Load()
+			return result, nil
+		}
+	}
 	correct, incorrect, unknown := 0, 0, 0
 	covered, planned, unlocatedPruned := 0, 0, 0
 	errors := map[string]int{}
@@ -85,15 +112,17 @@ func (en *Engine) metrics(summary bool) (map[string]any, error) {
 		coverage = float64(covered) / float64(planned)
 	}
 	budget := en.budget
-	en.mu.Unlock()
 	result := map[string]any{
 		"correct": correct, "incorrect": incorrect, "unknown": unknown, "planned": planned, "covered": covered,
 		"quality_pass_rate": rate, "coverage": coverage, "known_tokens": knownTokens + judgeTokens + controlTokens,
 		"unknown_usage": unknownUsage, "dropped_usage_events": en.dropped.Load(), "unlocated_pruned_samples": unlocatedPruned,
 	}
 	if summary {
+		en.summary = metricsProjection{revision: revision, values: maps.Clone(result)}
+		en.mu.Unlock()
 		return result, nil
 	}
+	en.mu.Unlock()
 	sources := map[string]map[string]int64{}
 	err := en.store.All("usage", func(raw []byte) error {
 		var event UsageEvent

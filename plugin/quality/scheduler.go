@@ -221,14 +221,36 @@ type scheduledRule struct {
 	remainder  bool
 }
 
-// A mixed observation can continue testing eligible OAuth files while its other
-// objects wait for the management directory. This receipt survives history cleanup.
+// The receipt and each child's admission share a transaction. Both survive
+// restart independently of result history and never authorize external writes.
 type pendingRuleSchedule struct {
-	Due      time.Time `json:"due"`
-	Accepted []string  `json:"accepted_auth_ids,omitempty"`
+	Due              time.Time         `json:"due"`
+	Accepted         []string          `json:"accepted_auth_ids,omitempty"`
+	WaitingLogins    map[string]string `json:"waiting_logins,omitempty"` // subject -> blocking credential
+	DirectoryPending bool              `json:"directory_pending,omitempty"`
 }
 
-func allowsPartialSchedule(r *Rule) bool {
+func (p *pendingRuleSchedule) waitsForDirectory() bool {
+	// Older receipts contained only Due and Accepted and waited for inventory.
+	return p.DirectoryPending || len(p.WaitingLogins) == 0
+}
+
+func (en *Engine) remainderReadyLocked(p *pendingRuleSchedule, capability HostCapabilities) bool {
+	if p == nil {
+		return false
+	}
+	if p.waitsForDirectory() && (!capability.CredentialManagement || capability.ManagementSession) {
+		return true
+	}
+	for _, credential := range p.WaitingLogins {
+		if hold := en.loginHolds[credential]; hold != nil && hold.State == "completed" {
+			return true
+		}
+	}
+	return false
+}
+
+func canRunWithoutManagement(r *Rule) bool {
 	return dynamicScope(r.TargetScope) && !managedRule(r) && contains(ruleTypes(r), objectOAuth)
 }
 
@@ -290,7 +312,7 @@ func (en *Engine) takeDueRulesLocked(now time.Time) ([]scheduledRule, error) {
 			continue
 		}
 		normalDue := !r.NextRun.After(now)
-		remainderReady := r.PendingSchedule != nil && (!capability.CredentialManagement || capability.ManagementSession)
+		remainderReady := en.remainderReadyLocked(r.PendingSchedule, capability)
 		if !normalDue && !remainderReady {
 			continue
 		}
@@ -319,7 +341,7 @@ func (en *Engine) takeDueRulesLocked(now time.Time) ([]scheduledRule, error) {
 		retry := en.scheduleRetry[r.ID]
 		retrying := retry.revision == r.Revision && retry.due.Equal(occurrence.due)
 		occurrence.catchup = occurrence.catchup || retrying
-		if capability.CredentialManagement && !capability.ManagementSession && !allowsPartialSchedule(r) && (managedRule(r) || scopeNeedsProviderDirectory(r, nil) || retrying && retry.waitManagement) {
+		if capability.CredentialManagement && !capability.ManagementSession && !canRunWithoutManagement(r) && (managedRule(r) || scopeNeedsProviderDirectory(r, nil) || retrying && retry.waitManagement) {
 			if !retrying || !retry.waitManagement {
 				en.deferOccurrenceLocked(r, &occurrence, sessionSkip().Reason, true)
 			}

@@ -1,279 +1,191 @@
-// Verify retained login tasks against offline management fixtures only.
+// Current account history dialog. The historical three-tab UI and its original
+// explicit workflow assertions remain available in verify_login_ui_legacy.cjs.
 const assert = require('node:assert/strict');
-const fs = require('node:fs');
+const fs = require('node:fs/promises');
 const path = require('node:path');
-const http = require('node:http');
-const crypto = require('node:crypto');
+const { spawn } = require('node:child_process');
+const { once } = require('node:events');
+const { createInterface } = require('node:readline');
+const { createHash } = require('node:crypto');
 const { chromium } = require(process.env.PLAYWRIGHT_MODULE || '/Users/ceng/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules/playwright');
-const root = path.resolve(__dirname, '..');
-const ui = path.join(root, 'plugin/ui');
-const sourceHashes = () => Object.fromEntries(['index.html', 'app.js', 'login.js', 'client.js', 'view.js', 'style.css'].map(name => [name, crypto.createHash('sha256').update(fs.readFileSync(path.join(ui, name))).digest('hex')]));
-const source = sourceHashes();
-const output = process.env.LOGIN_UI_OUTPUT || path.join(root, 'artifacts/account-focused-8.9.0/login-ui');
-fs.mkdirSync(output, { recursive: true });
-const calls = [], jobs = [], checks = [], screenshots = [], heldReads = new Set();
-let unauthorizedNext = false, rejectNextAction = false, capabilitiesGate = null, qualityGate = null, nextJobsFailure = null, nextDetailRead = null;
-const target = { auth_id: 'offline-codex', auth_index: 'offline', email: 'fixture@example.test', account_id: 'acct_fixture_complete', user_id: 'user_fixture_complete', masked_email: 'f***@example.test', identity_version: 'identity-fixture', can_update: true, quality_paused: true, manual_disabled: true };
-const seed = (id, status, method = 'password_totp') => {
-  const job = { id, revision: 1, method, intent: 'reauthorize', email: target.email, masked_email: target.masked_email, status, phase: status === 'waiting_browser' ? 'authorization' : 'review', candidate_id: `${id}:candidate`, created_at: '2026-11-16T00:00:00Z', ...(method === 'browser' ? { authorization_url: 'https://auth.openai.com/oauth/authorize?state=offline-state&code_challenge=offline-challenge' } : {}) };
-  jobs.push(job); return job;
-};
-const candidate = seed('candidate-existing', 'awaiting_commit');
-const json = (res, value, status = 200) => { res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }); res.end(JSON.stringify(value)); };
-const server = http.createServer(async (req, res) => {
-  const url = new URL(req.url, 'http://localhost');
-  if (!url.pathname.startsWith('/v0/management/')) {
-    const name = url.pathname === '/' ? 'index.html' : url.pathname.slice(1);
-    if (!['index.html', 'app.js', 'client.js', 'view.js', 'login.js', 'style.css'].includes(name)) { res.writeHead(404); res.end(); return; }
-    res.writeHead(200, { 'Content-Type': name.endsWith('.js') ? 'text/javascript' : name.endsWith('.css') ? 'text/css' : 'text/html' });
-    res.end(fs.readFileSync(path.join(ui, name))); return;
-  }
-  let raw = ''; for await (const chunk of req) raw += chunk;
-  const body = raw ? JSON.parse(raw) : null;
-  calls.push({ path: url.pathname, query: url.search, method: req.method, body, key: req.headers['idempotency-key'] });
-  if (req.headers.authorization !== 'Bearer offline-management-key' || unauthorizedNext) { unauthorizedNext = false; json(res, { code: 'unauthorized' }, 401); return; }
-  if (url.pathname.startsWith('/v0/management/plugins/model-quality') && !url.pathname.startsWith('/v0/management/plugins/model-quality/login/')) {
-    if (qualityGate) await qualityGate;
-    const suffix = url.pathname.split('model-quality')[1];
-    if (suffix === '/questions') json(res, { items: [{ id: 'custom', kind: 'custom', title: '自定义题目', prompt: '' }] });
-    else if (suffix === '/targets') json(res, { items: [{ ...target, provider: 'codex', type: 'oauth', models: ['offline-model'], reasons: ['quality_paused'], effective_available: false }] });
-    else json(res, { items: [], total: 0 });
-    return;
-  }
-  const suffix = url.pathname.replace('/v0/management/plugins/model-quality/login', '');
-  const job = jobs.find(item => item.id === (body?.job_id || url.searchParams.get('id')?.replace(':candidate', '')));
-  if (req.method !== 'GET') assert(req.headers['idempotency-key'], 'Every login write carries an idempotency key');
-  if (rejectNextAction && req.method !== 'GET') { rejectNextAction = false; json(res, { code: 'revision_conflict', message: 'DO_NOT_RENDER_SERVER_SECRET' }, 409); return; }
-  if (suffix === '/capabilities') {
-    if (capabilitiesGate) await capabilitiesGate;
-    json(res, { available: true, automatic_commit: true, commit_mode: 'account_auto_commit', runtime: { engine: 'go_sobek_protocol', runtime_version: '2.1.0', schema_version: '2' }, methods: { browser: { available: true }, password_totp: { available: true } }, vault: { available: true, initialized: true, storage_mode: 'plaintext' } });
-  } else if (suffix === '/targets') json(res, { items: [target] });
-  else if (suffix === '/accounts') json(res, { items: [] });
-  else if (suffix === '/accounts/settings') json(res, { revision: 1, interval_minutes: 15, inspection_enabled: false, auto_relogin_enabled: false, login_proxy_url: '' });
-  else if (suffix === '/vault/status') json(res, { available: true, initialized: true, storage_mode: 'plaintext' });
-  else if (suffix === '/jobs') {
-    const failure = nextJobsFailure; nextJobsFailure = null;
-    if (failure) { failure.received(); await failure.gate; json(res, { code: 'storage_unavailable' }, 503); }
-    else json(res, { items: [...jobs].reverse() });
-  } else if (suffix === '/detail') {
-    const response = JSON.parse(JSON.stringify(job || {}));
-    const held = nextDetailRead; nextDetailRead = null;
-    if (held) { held.received(); await held.gate; }
-    json(res, response);
-  } else if (suffix === '/candidate') {
-    assert(url.searchParams.get('id').endsWith(':candidate'));
-    json(res, { id: `${job.id}:candidate`, revision: job.revision, job_id: job.id, email: job.email, account_id: 'acct_fixture_complete', user_id: 'user_fixture_complete', intent: job.intent, target_auth_id: target.auth_id, restrictions: ['quality_paused', 'manual_disabled', 'rules_stopped'] });
-  } else if (suffix === '/commit') {
-    assert.equal(body.candidate_id, `${job.id}:candidate`); assert.equal(body.revision, job.revision); job.status = 'committed'; job.revision++; json(res, job);
-  } else if (suffix === '/callback') {
-    assert(body.callback_url.startsWith('http://localhost:1455/auth/callback')); job.status = 'awaiting_commit'; job.revision++; json(res, job);
-  } else if (suffix === '/cancel' || suffix === '/discard') {
-    job.status = suffix === '/cancel' ? 'cancelled' : 'discarded'; job.revision++; json(res, job);
-  } else json(res, { code: 'not_found' }, 404);
-});
-(async () => {
-  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
-  const browser = await chromium.launch({ headless: true, executablePath: process.env.CHROME_PATH || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' });
-  const page = await browser.newPage({ viewport: { width: 1280, height: 800 }, reducedMotion: 'reduce' });
-  const errors = [];
-  page.on('pageerror', error => errors.push(error.message));
-  await page.route('**/*', route => new URL(route.request().url()).hostname === '127.0.0.1' ? route.continue() : route.abort());
-  const tasks = async () => page.locator('[data-login-view=tasks]').click();
-  const ready = async () => page.locator('#account-import-open:enabled').waitFor({ state: 'attached' });
-  const settle = async () => page.evaluate(async () => { await document.fonts.ready; await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))); });
-  const refresh = async () => { await page.locator('#login-refresh').evaluate(button => button.click()); await settle(); };
-  const waitStatus = async text => { await tasks(); await page.locator('#login-job-detail h3').filter({ hasText: text }).waitFor(); };
-  const select = async job => { await refresh(); await tasks(); await page.locator(`[data-login-job="${job.id}"]`).click(); };
-  const capture = async name => { await settle(); assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false); await page.screenshot({ path: path.join(output, `${name}.png`), fullPage: true }); screenshots.push(`${name}.png`); };
-  const connect = async () => { await page.locator('#login-connect').click(); await page.locator('#management-key').fill('offline-management-key'); await page.locator('#connection-form button[type=submit]').click(); await page.locator('body.connected').waitFor(); await ready(); };
-  const writes = () => calls.filter(call => call.method !== 'GET');
-  const cancelCalls = () => calls.filter(call => call.path.endsWith('/cancel')).length;
+
+function gate() {
+  let release;
+  const promise = new Promise(resolve => { release = resolve; });
+  return {promise,release};
+}
+
+async function main() {
+  const ui = path.resolve(__dirname,'../plugin/ui');
+  const names = require('../plugin/ui/public_assets.json');
+  const sourceHashes = async () => Object.fromEntries(await Promise.all(names.map(async name =>
+    [name,createHash('sha256').update(await fs.readFile(path.join(ui,name))).digest('hex')])));
+  const source = await sourceHashes();
+  const fixture = spawn(process.execPath,[path.join(__dirname,'login_ui_fixture.cjs')],{stdio:['ignore','pipe','inherit']});
+  const exit = once(fixture,'exit');
+  let browser;
   try {
-    const serverURL = `http://127.0.0.1:${server.address().port}/`;
-    await page.goto(`${serverURL}#login`);
-    assert.equal(await page.locator('[data-page]').count(), 3);
-    assert.deepEqual(await page.locator('[data-login-view]').evaluateAll(nodes => nodes.map(node => node.dataset.loginView)), ['accounts', 'tasks', 'settings']);
-    assert.equal(await page.locator('#login-view-temporary, #login-form, #login-start, #login-method, #login-credential-rows').count(), 0, 'Temporary login is removed rather than hidden');
-    assert.equal(await page.locator('#connection-open').isVisible(), true);
-    await connect();
-    assert.equal(await page.locator('#login-engine, .runtime-info').count(), 0);
-    assert.equal(await page.locator('[data-page=login]').getAttribute('aria-current'), 'page');
-    assert.equal(await page.locator('#login-view-accounts').isVisible(), true);
-    assert.deepEqual(writes(), []);
-    checks.push('The independent login page has three retained views, a disconnected reconnect state and no temporary-login DOM; connection only reads existing state');
-    await tasks(); await waitStatus('等待确认导入');
-    const detail = await page.locator('#login-job-detail').innerText();
-    for (const value of [target.email, 'acct_fixture_complete', 'user_fixture_complete', '质量暂停', '人工禁用', '检测规则']) assert(detail.includes(value), value);
-    assert(!detail.includes('f***'));
-    assert.equal(calls.filter(call => call.path.endsWith('/commit')).length, 0);
-    await capture('candidate-1280');
-    await page.locator('[data-login-action=commit]').click(); await waitStatus('已保存');
-    assert.equal(candidate.status, 'committed');
-    assert.match(await page.locator('#login-job-detail').innerText(), /相关检测规则保持停止/);
-    assert.equal(calls.filter(call=>call.path.endsWith('/commit')).length,1,'Historical candidate uses a single explicit action');
-    checks.push('Historical candidates retain complete identity and restrictions and submit with one explicit action without an extra confirmation, model calls or quality release');
-    const enabledJob=seed('automatic-account-completed','committed');
-    Object.assign(enabledJob,{account_id:'offline-account',auto_commit:true,enable_credential:true,credential_enabled:true});
-    await select(enabledJob);await waitStatus('已保存并启用');
-    assert.match(await page.locator('#login-job-detail').innerText(),/无需再次确认/);assert.equal(await page.locator('[data-login-action=commit]').count(),0);
-    Object.assign(enabledJob,{status:'saved_not_adopted',credential_enabled:false,error_code:'credential_enable_conflict',revision:enabledJob.revision+1});
-    await refresh();await page.locator('#login-job-detail').filter({hasText:'CPA 尚未确认启用'}).waitFor();
-    assert.equal(await page.locator('[data-login-action=commit]').count(),0);assert.equal(calls.filter(call=>call.path.endsWith('/commit')).length,1);
-    checks.push('Automatic account completion confirms saving and enablement without another action; an enablement conflict exposes the incomplete result without retrying a write');
-    const discard = seed('discard-existing', 'awaiting_commit'); await select(discard); await waitStatus('等待确认导入');
-    await page.locator('[data-login-action=discard]').click(); await waitStatus('已丢弃候选'); assert.equal(discard.status, 'discarded');
-    checks.push('A pending candidate can be explicitly discarded without creating or committing a replacement task');
-    const browserJob = seed('browser-existing', 'waiting_browser', 'browser'); await select(browserJob); await waitStatus('等待浏览器授权');
-    assert.match(await page.locator('.login-auth-link').getAttribute('href'), /^https:\/\/auth\.openai\.com\/oauth\/authorize/);
-    await page.locator('#login-callback').fill('http://localhost:1455/auth/callback?code=offline-code&state=offline-state');
-    await refresh(); assert.match(await page.locator('#login-callback').inputValue(), /offline-code/);
-    await page.locator('[data-login-action=callback]').click(); await waitStatus('等待确认导入');
-    assert.equal(await page.locator('#login-callback').count(), 0);
-    assert.equal(browserJob.status, 'awaiting_commit');
-    await page.locator('[data-login-action=discard]').click(); await waitStatus('已丢弃候选');
-    checks.push('A historical browser task still accepts its callback, preserves an unsent callback across polling and clears it after submission');
-    const unsafe = seed('unsafe-existing', 'waiting_browser', 'browser'); unsafe.authorization_url = 'https://auth.openai.com@evil.example/oauth/authorize';
-    await select(unsafe); await page.locator('#login-job-detail').filter({ hasText: '授权链接暂不可用' }).waitFor();
-    assert.equal(await page.locator('.login-auth-link').count(), 0);
-    rejectNextAction = true; await page.locator('[data-login-action=cancel]').click();
-    await page.locator('#login-history-feedback').filter({ hasText: '任务版本已变化' }).waitFor();
-    assert(!(await page.locator('body').innerText()).includes('DO_NOT_RENDER_SERVER_SECRET'));
-    assert.equal(unsafe.status, 'waiting_browser');
-    await page.locator('[data-login-action=cancel]').click(); await waitStatus('已取消');
-    checks.push('Unsafe historical authorization URLs are rejected; fixed action-error copy omits server secrets and cancellation remains explicit');
-    Object.assign(unsafe, { status: 'failed', error_code: 'runtime_failed', error_stage: 'authorization', error_reason: 'proxy_connection_failed' });
-    await refresh(); await page.locator('#login-job-detail').filter({ hasText: '打开授权页：代理连接失败' }).waitFor();
-    assert.match(await page.locator('#login-job-detail').innerText(), /代理地址、端口和认证资料/);
-    Object.assign(unsafe, { status: 'interaction_required', error_code: 'interaction_required', error_stage: 'authorization', error_reason: 'unsupported_request' });
-    await refresh(); await page.locator('#login-job-detail').filter({ hasText: '尚未适配' }).waitFor();
-    assert(!(await page.locator('#login-job-detail').innerText()).includes('临时登录'));
-    assert(!(await page.locator('#login-job-detail').innerText()).includes('请使用浏览器授权'));
-    Object.assign(unsafe, { error_stage: '', error_reason: '' });
-    await refresh(); await page.locator('#login-job-detail').filter({ hasText: '此历史记录不能判断' }).waitFor();
-    checks.push('Diagnostics distinguish proxy failure and runtime incompatibility, keep missing historical evidence uncertain and never point to the removed login page');
-    Object.assign(unsafe, { method: 'password_totp', status: 'running', phase: 'session', error_code: '', error_stage: '', error_reason: '' });
-    await refresh(); await page.locator('#login-job-detail .field-note').filter({ hasText: '建立网页登录会话' }).waitFor();
-    const progressWrites = writes().length;
-    unsafe.phase = 'password'; unsafe.revision++;
-    await page.locator('#login-job-detail .field-note').filter({ hasText: '验证账号密码' }).waitFor({ timeout: 8000 });
-    for (const [phase, label] of [['runtime_start', '启动 Go 登录引擎'], ['browser_start', '启动登录环境'], ['email', '填写账号邮箱'], ['totp', '验证 2FA'], ['browser_verification', '处理网站验证'], ['oauth', '获取 Codex 授权'], ['consent', '确认授权'], ['workspace', '核对账号工作区'], ['callback', '接收授权回调']]) {
-      unsafe.phase = phase; unsafe.revision++;
-      await refresh(); await page.locator('#login-job-detail .field-note').filter({ hasText: label }).waitFor();
-      assert.equal(await page.locator('[data-login-action=commit]').count(), 0);
-    }
-    assert.equal(writes().length, progressWrites);
-    await capture('reference-progress-1280');
-    checks.push('Live polling advances session, password, 2FA, website verification and OAuth phase copy without recreating tasks or exposing premature commit');
-    for (const [stage, reason, label, advice] of [
-      ['session', 'session_unconfirmed', '建立网页登录会话：未确认网页登录会话', '未继续获取 Codex 授权'],
-      ['password', 'authentication_not_advanced', '验证密码：验证响应未确认流程前进', '未判定验证成功'],
-      ['totp', 'totp_factor_missing', '验证 2FA：未找到可用的 TOTP 验证方式', '本次未提交 2FA 验证码'],
-      ['oauth', 'sentinel_unavailable', '获取 Codex 授权：官方登录安全组件未就绪', '官方认证资源'],
-      ['browser_verification', 'human_verification', '处理网站验证：需要完成人机验证', '此步骤需要人工处理'],
-      ['browser_verification', 'browser_verification_timeout', '处理网站验证：网站自动检查超时', '尚未确认需要人工验证'],
-      ['browser_verification', 'browser_verification_required', '处理网站验证：网站验证尚未完成', '官方接口返回了网站验证页面'],
-    ]) {
-      Object.assign(unsafe, { status: reason === 'browser_verification_timeout' ? 'failed' : 'interaction_required', phase: '', error_code: reason === 'browser_verification_timeout' ? 'runtime_timeout' : 'interaction_required', error_stage: stage, error_reason: reason, revision: unsafe.revision + 1 });
-      await refresh(); await page.locator('#login-job-detail').filter({ hasText: label }).waitFor();
-      assert((await page.locator('#login-job-detail').innerText()).includes(advice));
-      assert.equal(await page.locator('[data-login-action=commit]').count(), 0);
-    }
-    checks.push('Reference-flow diagnostics distinguish unconfirmed session, unchanged authentication state, absent TOTP factor, unavailable Sentinel and manual website verification');
-    const security = seed('security-existing','running');
-    Object.assign(security,{action:'reset_totp',security_status:'running',reauthorize:true,phase:'security_login'});
-    const securityWrites=writes().length;await select(security);
-    for(const [phase,label] of [['security_login','登录账号安全会话'],['security_check','核对账号与 2FA 状态'],['totp_disable','移除旧 2FA'],['totp_enroll','登记新 2FA'],['totp_activate','激活新 2FA'],['totp_saved','新 2FA 已保存'],['logout_all','退出所有设备'],['reauthorization','重新授权 CPA']]){
-      security.phase=phase;security.revision++;await refresh();await page.locator('#login-job-detail .field-note').filter({hasText:label}).waitFor();
-    }
-    Object.assign(security,{status:'security_uncertain',phase:'',error_code:'security_uncertain',error_stage:'totp_activate'});await refresh();await waitStatus('安全操作待核对');
-    assert.match(await page.locator('#login-job-detail').innerText(),/未确认的修改不会自动重试/);assert.equal(await page.locator('[data-login-action=commit]').count(),0);
-    Object.assign(security,{status:'failed',security_status:'complete',totp_reset:true,devices_logged_out:true,error_code:'exchange_failed',error_stage:'oauth'});await refresh();await waitStatus('后续步骤未完成');
-    assert.match(await page.locator('#login-job-detail').innerText(),/新 2FA 已保存/);assert.match(await page.locator('#login-job-detail').innerText(),/旧密钥不会恢复/);
-    Object.assign(security,{action:'logout_all',status:'succeeded',security_status:'complete',totp_reset:false,reauthorize:false,error_code:'',error_stage:''});await refresh();await waitStatus('安全操作已完成');
-    assert.match(await page.locator('#login-job-detail').innerText(),/本次未选择重新授权 CPA/);assert.equal(writes().length,securityWrites);
-    checks.push('Security task phases and independent outcomes distinguish saved TOTP, device logout, unresolved mutations and later OAuth failure without replaying any write');
-    const downloadEvent = page.waitForEvent('download'); await page.locator('#login-export').click();
-    const reportText = fs.readFileSync(await (await downloadEvent).path(), 'utf8');
-    assert(reportText.includes(target.email));
-    for (const secret of ['offline-code', 'offline-state', 'offline-management-key', 'authorization_url', 'credentials']) assert(!reportText.includes(secret));
-    checks.push('Task export retains complete identity and safe diagnostic metadata while omitting OAuth and management secrets');
-    for (const theme of ['light', 'white', 'dark']) for (const viewport of [{ width: 1280, height: 800 }, { width: 390, height: 844 }]) {
-      await page.locator('#theme-toggle').selectOption(theme); await page.setViewportSize(viewport); await capture(`tasks-${theme}-${viewport.width}`);
-    }
-    checks.push('Retained task details fit all three themes on desktop and phone without document overflow');
-    await page.setViewportSize({ width: 1280, height: 800 }); await page.locator('#theme-toggle').selectOption('light');
-    const active = seed('background-existing', 'waiting_browser', 'browser'); await select(active); await waitStatus('等待浏览器授权');
-    await page.locator('#login-callback').fill('http://localhost:1455/auth/callback?code=unsent&state=offline-state');
-    const cancelsBefore = cancelCalls(); const writesBefore = writes().length;
-    await page.locator('[data-page=manual]').click();
-    assert.equal(cancelCalls(), cancelsBefore); assert.equal(writes().length, writesBefore);
-    let releaseCapabilities;
-    capabilitiesGate = new Promise(resolve => { releaseCapabilities = resolve; });
-    heldReads.add(releaseCapabilities);
-    await page.locator('[data-page=login]').click(); await page.locator('#login-workbench').waitFor();
-    for (const selector of ['#account-import-open', '#account-inspect']) assert(await page.locator(selector).isDisabled());
-    capabilitiesGate = null; releaseCapabilities(); heldReads.delete(releaseCapabilities); await ready(); await tasks();
-    await page.locator(`[data-login-job="${active.id}"]`).waitFor(); await page.locator('#login-callback').waitFor();
-    assert.equal(await page.locator('#login-callback').inputValue(), ''); assert.equal(active.status, 'waiting_browser');
-    const sameTabReads = calls.filter(call => call.path.endsWith('/capabilities')).length;
-    await page.locator('#login-callback').fill('http://localhost:1455/auth/callback?code=draft&state=offline-state');
-    await page.locator('[data-page=login]').click();
-    assert.equal(calls.filter(call => call.path.endsWith('/capabilities')).length, sameTabReads);
-    assert.match(await page.locator('#login-callback').inputValue(), /draft/);
-    checks.push('Navigation clears callback input without cancelling host jobs; reentry disables account controls until ready and clicking the current page preserves its draft');
-    let releaseFailure, failureReceived;
-    const receivedFailure = new Promise(resolve => { failureReceived = resolve; });
-    nextJobsFailure = { gate: new Promise(resolve => { releaseFailure = resolve; }), received: failureReceived }; heldReads.add(releaseFailure);
-    const failedResponse = page.waitForResponse(response => new URL(response.url()).pathname.endsWith('/model-quality/login/jobs') && response.status() === 503);
-    await refresh(); await receivedFailure;
-    await page.locator('[data-page=manual]').click(); await page.locator('[data-page=login]').click(); await ready();
-    releaseFailure(); heldReads.delete(releaseFailure); await (await failedResponse).finished(); await settle();
-    assert.equal(await page.locator('#login-notice').count(), 0);
-    checks.push('A delayed read failure from an older visit cannot overwrite the current account workspace');
-    let releaseDetail, detailReceived;
-    const receivedDetail = new Promise(resolve => { detailReceived = resolve; });
-    nextDetailRead = { gate: new Promise(resolve => { releaseDetail = resolve; }), received: detailReceived }; heldReads.add(releaseDetail);
-    await tasks(); await page.locator(`[data-login-job="${candidate.id}"]`).click(); await receivedDetail;
-    assert.equal(await page.locator('#login-job-detail [data-login-action]').count(), 0);
-    await page.locator(`[data-login-job="${active.id}"]`).click(); await waitStatus('等待浏览器授权');
-    releaseDetail(); heldReads.delete(releaseDetail); await settle();
-    assert.match(await page.locator('#login-job-detail h3').innerText(), /等待浏览器授权/);
-    checks.push('Task selection removes stale actions immediately and a late detail response cannot replace a newer selected task');
-    await page.locator('#login-callback').fill('http://localhost:1455/auth/callback?code=clear-on-401&state=offline-state');
-    unauthorizedNext = true; await refresh(); await page.locator('body:not(.connected)').waitFor();
-    assert.equal(await page.locator('[data-page=login]').getAttribute('aria-current'), 'page');
-    assert(await page.locator('#connection-open').isVisible());
-    assert(await page.locator('#login-view-accounts').isVisible());
-    assert(await page.locator('#account-import-open').isDisabled());
-    assert.equal(await page.evaluate(() => localStorage.length + sessionStorage.length), 0);
-    assert.equal(await page.locator('[data-login-secret], #login-callback').evaluateAll(nodes => nodes.some(node => node.value)), false);
-    await connect(); assert.equal(await page.locator('[data-page=login]').getAttribute('aria-current'), 'page');
-    checks.push('401 clears account and callback data plus the persisted management key, keeps the page selected and offers a working reconnect');
-    await page.locator('#connection-top').click(); await page.locator('#disconnect').click(); await page.locator('[data-page=manual]').click();
-    await page.locator('#connection-open').click(); await page.locator('#management-key').fill('offline-management-key');
-    let releaseQuality; qualityGate = new Promise(resolve => { releaseQuality = resolve; }); heldReads.add(releaseQuality);
-    await page.locator('#connection-form button[type=submit]').click(); await page.evaluate(() => { location.hash = '#login'; });
-    await page.locator('[data-page=login][aria-current=page]').waitFor();
-    assert(await page.locator('#login-view-accounts').isVisible());
-    assert.equal(await page.locator('#connection-open').innerText(), '未连接');
-    qualityGate = null; releaseQuality(); heldReads.delete(releaseQuality); await page.locator('body.connected').waitFor(); await ready();
-    checks.push('Navigating to login during an unfinished management connection opens the correct account workspace when it completes');
-    const clientResult = await page.evaluate(async () => {
-      const { ManagementClient } = await import('./client.js'); const client = new ManagementClient('/unused', () => {}); client.open('offline-management-key');
-      const paths = ['https://evil.example/commit', '//evil.example/commit', '/bad/../commit', '/commit#x', '/commit?password=secret', '/unknown'];
-      const rejected = await Promise.all(paths.map(async value => { try { await client.requestHostLogin(value, 'POST', {}, 'key'); return false; } catch { return true; } }));
-      const obsoleteRoutes = [['/start', 'POST'], ['/vault/entry', 'PUT'], ['/vault/entry', 'DELETE']];
-      const obsoleteRejected = await Promise.all(obsoleteRoutes.map(async ([route, method]) => { try { await client.requestHostLogin(route, method, {}, 'key'); return false; } catch { return true; } }));
-      let missingKeyRejected = false; try { await client.requestHostLogin('/commit', 'POST', {}); } catch { missingKeyRejected = true; }
-      client.clear(); return { rejected, obsoleteRejected, missingKeyRejected };
+    const [line] = await once(createInterface({input:fixture.stdout}),'line');
+    const info = JSON.parse(line), {origin,hostname,port} = new URL(info.url);
+    assert.equal(hostname,'127.0.0.1'); assert.notEqual(port,'8317');
+    browser = await chromium.launch({executablePath:process.env.CHROME_PATH || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'});
+    const page = await browser.newPage({viewport:{width:1280,height:800},reducedMotion:'reduce'});
+    page.setDefaultTimeout(6000);
+    const prefix = '/v0/management/plugins/model-quality', email = 'visible-identity@example.test';
+    const validURL = 'https://auth.openai.com/oauth/authorize?state=offline-state&code_challenge=offline-challenge';
+    const callback = 'http://localhost:1455/auth/callback?code=CANARY_CALLBACK&state=offline-state';
+    const base = {account_id:'isolated-private-account',target_auth_id:'isolated-private-target',method:'password_totp',intent:'reauthorize',
+      email,masked_email:'v***@example.test',created_at:'2026-11-16T01:00:00Z',expires_at:'2099-11-16T01:15:00Z',revision:1,plan_type:'pro'};
+    const done = {...base,id:'isolated-terminal-job',method:'password_totp',action:'reset_totp',status:'failed',phase:'',reauthorize:true,
+      totp_reset:true,devices_logged_out:true,security_status:'complete',error_code:'exchange_failed',error_stage:'oauth',
+      runtime_code:'service_error',http_status:503,can_delete:true,raw:{access_token:'CANARY_TOKEN'},password:'CANARY_PASSWORD',totp_secret:'CANARY_TOTP'};
+    const active = {...base,id:'isolated-browser-job',method:'browser',status:'waiting_browser',phase:'authorization',authorization_url:validURL};
+    const candidate = {...base,id:'isolated-candidate-job',status:'awaiting_commit',candidate_id:'isolated-candidate'};
+    const unknown = {...base,id:'isolated-unknown-job',status:'saved_not_adopted',error_code:'credential_enable_conflict',auto_commit:true,enable_credential:true};
+    const jobs = [done,active,candidate,unknown], writes = [], errors = [], results = {};
+    let held, optionalCandidate, detailFailure = false, forced401 = false;
+    page.on('pageerror',e => errors.push(e.message));
+    await page.route('**/*',async route => {
+      const req = route.request(), url = new URL(req.url());
+      assert.equal(url.origin,origin);
+      if (!url.pathname.startsWith(prefix + '/')) return route.continue();
+      if (req.method() !== 'GET') { writes.push(req.method() + ' ' + url.pathname); return route.fulfill({status:405,json:{code:'test_read_only'}}); }
+      assert.equal(req.headers().authorization,'Bearer ' + info.management_key);
+      if (forced401) { forced401 = false; return route.fulfill({status:401,json:{code:'unauthorized'}}); }
+      const resource = url.pathname.slice(prefix.length);
+      if (resource === '/login/jobs') return route.fulfill({json:{items:jobs.map(({authorization_url, ...job}) => job),has_more:false}});
+      const id = url.searchParams.get('id'), job = jobs.find(j => j.id === id);
+      if (resource === '/login/detail' && job) {
+        const value = {...job}, pause = held?.id === id ? held : null;
+        if (pause) { held = null; pause.entered.release(); await pause.wait.promise; }
+        if (detailFailure && id === active.id) return route.fulfill({status:503,json:{code:'storage_unavailable'}});
+        return route.fulfill({json:value});
+      }
+      if (resource === '/login/candidate') {
+        const owner = jobs.find(job => job.candidate_id === id); assert(owner);
+        if (owner === active && optionalCandidate) { optionalCandidate.entered.release(); await optionalCandidate.wait.promise; }
+        return route.fulfill({json:{id,job_id:owner.id,revision:owner.revision,email,account_id:'isolated-oauth-account',user_id:'isolated-oauth-user',
+          restrictions:['quality_paused','manual_disabled','rules_stopped'],intent:'reauthorize',target_auth_id:base.target_auth_id}});
+      }
+      if (resource === '/login/logs' && job) {
+        const entry = {id:1,time:base.created_at,status:job.status,phase:job.phase,error_stage:job.error_stage,error_code:job.error_code,
+          runtime_code:job.runtime_code,http_status:job.http_status,raw:{access_token:'CANARY_TOKEN'},authorization_url:validURL,callback_url:callback};
+        return route.fulfill({json:{job_id:id,revision:job.revision,first_id:1,last_id:1,retained_count:1,next_cursor:1,has_more:false,entries:[entry]}});
+      }
+      return route.continue();
     });
-    assert(clientResult.rejected.every(Boolean)); assert(clientResult.obsoleteRejected.every(Boolean)); assert(clientResult.missingKeyRejected);
-    assert(!calls.some(call => /\/(start|vault\/entry|vault\/initialize)$/.test(call.path)));
-    assert(!calls.some(call => /\/(runs|release)$/.test(call.path) && call.method !== 'GET'));
-    assert.deepEqual(await page.evaluate(() => ({ local: Object.fromEntries(Object.entries(localStorage)), session: Object.fromEntries(Object.entries(sessionStorage)) })), { local: { 'model-quality:management-key:/v0/management/plugins/model-quality': 'offline-management-key' }, session: {} });
-    checks.push('Strict endpoint and idempotency validation rejects removed task-creation and storage-edit routes; task review never invokes models or quality release');
-    assert.deepEqual(errors, []); assert.deepEqual(sourceHashes(), source);
-    fs.writeFileSync(path.join(output, 'report.json'), JSON.stringify({ status: 'passed', fixture_scope: 'Loopback-only synthetic retained tasks; no real credentials or remote model calls', checks, screenshots, source_sha256: source }, null, 2) + '\n');
-    process.stdout.write(`Login task UI: ${checks.length} checks passed with offline fixtures.\n`);
-  } finally { for (const release of heldReads) release(); await browser.close(); await new Promise(resolve => server.close(resolve)); }
-})().catch(error => { process.stderr.write(`${error.stack}\n`); process.exitCode = 1; });
+    const openHistory = async () => {
+      if (!await page.locator('#login-history-dialog').evaluate(el => el.open)) await page.click('#account-history-open');
+    };
+    const detail = page.locator('#login-job-detail'), link = page.locator('.login-auth-link');
+    const select = async job => {
+      await openHistory();
+      await page.locator('[data-login-job="' + job.id + '"]').click();
+      await detail.locator('.login-detail-identity').filter({hasText:email}).waitFor();
+    };
+    const refresh = async (id, code = 200) => {
+      const response = page.waitForResponse(r => new URL(r.url()).pathname === prefix + '/login/detail' && new URL(r.url()).searchParams.get('id') === id && r.status() === code);
+      await page.click('#login-refresh'); await (await response).finished();
+      await page.evaluate(() => new Promise(done => requestAnimationFrame(() => requestAnimationFrame(done))));
+    };
+    await page.goto(origin + '/management.html#/auth-files');
+    await page.evaluate(([p,k]) => localStorage.setItem('model-quality:management-key:' + p,k),[prefix,info.management_key]);
+    await page.goto(origin + '/#login');
+    assert.equal(await page.locator('#login-view-temporary,#login-form,#login-start').count(),0);
+    await page.locator('#account-import-open:enabled').waitFor(); await select(done);
+    await detail.locator('.tag').filter({hasText:'后续步骤未完成'}).waitFor();
+    assert.match(await detail.innerText(),/新 2FA 已保存/); assert.match(await detail.innerText(),/已退出所有设备/);
+    assert.equal(await detail.locator('.login-auth-link,[data-login-action=commit],[data-login-action=cancel]').count(),0);
+    assert(await page.locator('#login-history-delete-open').isEnabled());
+    await page.locator('#login-task-search').fill(email); assert.equal(await page.locator('[data-login-job]').count(),jobs.length); await page.locator('#login-task-search').fill('');
+    const download = page.waitForEvent('download');
+    await page.click('#login-export');
+    const reportText = await fs.readFile(await (await download).path(),'utf8'), report = JSON.parse(reportText);
+    assert.equal(report.read_incomplete,false);
+    assert.equal(report.jobs[0].id,done.id); assert.equal(report.jobs[0].http_status,503); assert.equal(report.jobs[0].totp_reset,true);
+    assert.equal(report.jobs[0].events.length,1); assert.equal(report.jobs[0].events[0].http_status,503);
+    for (const secret of [email,base.masked_email,base.target_auth_id,base.account_id,'CANARY_TOKEN','CANARY_PASSWORD','CANARY_TOTP',
+      'CANARY_CALLBACK',info.management_key,'auth.openai.com','offline-state','offline-challenge','authorization_url','access_token']) {
+      assert(!reportText.includes(secret), 'Export contains a private field or value');
+    }
+    assert.equal(await detail.locator('.login-detail-identity').innerText(),email);
+    results.terminal = {fullEmailOnScreen:true,filteredByEmail:true,canDelete:true,confirmedSecurityEffects:2};
+    results.export = {jobID:done.id,httpStatus:503,eventCount:1,excludedEmailTokensAndURLs:true};
+    await select(candidate); await detail.getByRole('button',{name:'确认上传 CPA'}).waitFor();
+    for (const marker of [email,'isolated-oauth-account','isolated-oauth-user','质量暂停','人工禁用']) assert((await detail.innerText()).includes(marker),marker);
+    await select(unknown); await detail.locator('.notice').filter({hasText:'保存结果尚未确认'}).waitFor();
+    assert.equal(await detail.locator('[data-login-action=commit]').count(),0);
+    assert(await page.locator('#login-history-delete-open').isDisabled());
+    results.protectedStates = {awaitingCandidate:true,uncertainProtected:true};
+    await select(active); await link.waitFor(); assert.equal(await link.getAttribute('href'),validURL);
+    const input = page.locator('#login-callback'); await input.fill(callback);
+    await refresh(active.id); assert.equal(await input.inputValue(),callback);
+    const pause = held = {id:active.id,entered:gate(),wait:gate()};
+    const pending = refresh(active.id,503);
+    await pause.entered.promise;
+    assert.equal(await link.getAttribute('href'),validURL);
+    detailFailure = true; pause.wait.release(); await pending;
+    await page.locator('#login-history-read-note').filter({hasText:'任务详情'}).waitFor();
+    assert.equal(await link.getAttribute('href'),validURL); assert.equal(await input.inputValue(),callback);
+    const staleExport = page.waitForEvent('download');
+    await page.click('#login-export');
+    const staleReport = JSON.parse(await fs.readFile(await (await staleExport).path(),'utf8'));
+    assert.equal(staleReport.jobs[0].id,active.id);
+    assert(staleReport.jobs[0].events.length > 0);
+    assert.equal(staleReport.read_incomplete,true,'Readable events cannot certify a job summary whose refresh failed');
+    results.export.staleSummaryMarkedIncomplete = true;
+    detailFailure = false;
+    await refresh(active.id);
+    const recoveredExport = page.waitForEvent('download');
+    await page.click('#login-export');
+    assert.equal(JSON.parse(await fs.readFile(await (await recoveredExport).path(),'utf8')).read_incomplete,false);
+    results.export.currentSummaryRecovered = true;
+    for (const replacement of [null,'https://auth.openai.com@evil.example/oauth/authorize']) {
+      if (replacement === null) delete active.authorization_url;
+      else active.authorization_url = replacement;
+      active.revision++;
+      await refresh(active.id);
+      assert.equal(await link.count(),0,'A successful detail read withdrawing or rejecting a URL removes the previously shown link');
+      assert.equal(await input.inputValue(),callback,'The same active job retains its draft after navigation availability changes');
+      assert(!(await detail.innerHTML()).includes('offline-challenge'));
+      active.authorization_url = validURL; active.revision++;
+      await refresh(active.id); await link.waitFor();
+      assert.equal(await link.getAttribute('href'),validURL); assert.equal(await input.inputValue(),callback);
+    }
+    results.browserNavigation = {validLink:true,pendingKeptPrevious:true,failedReadKeptPrevious:true,successfulWithdrawalRemoved:true,invalidURLRemoved:true,sameJobDraftPreserved:true};
+    active.status = 'awaiting_commit'; active.candidate_id = 'isolated-browser-candidate'; delete active.authorization_url; active.revision++;
+    optionalCandidate = {entered:gate(),wait:gate()};
+    await refresh(active.id); await optionalCandidate.entered.promise;
+    assert.equal(await link.count(),0); assert.equal(await input.count(),0);
+    assert.equal(await detail.locator('[data-login-action=commit]').count(),0);
+    optionalCandidate.wait.release(); await detail.locator('[data-login-action=commit]').waitFor();
+    results.browserNavigation.transitionWithPendingCandidateRevoked = true;
+    active.status = 'waiting_browser'; active.authorization_url = validURL; delete active.candidate_id; active.revision++;
+    await refresh(active.id); await link.waitFor(); assert.equal(await input.inputValue(),'');
+    await input.fill(callback);
+    await page.keyboard.press('Escape'); await page.click('[data-page=manual]'); await page.click('[data-page=login]');
+    await select(active); await link.waitFor(); assert.equal(await input.inputValue(),'');
+    const late = held = {id:done.id,entered:gate(),wait:gate()};
+    await page.locator('[data-login-job="' + done.id + '"]').click(); await late.entered.promise;
+    await select(active); await link.waitFor();
+    const delivered = page.waitForResponse(r => r.url().endsWith('/login/detail?id=' + done.id));
+    late.wait.release(); await (await delivered).finished();
+    assert.equal(await link.getAttribute('href'),validURL);
+    results.navigation = {discardedDraftOnLeaving:true,oldDetailDidNotReplaceActiveJob:true};
+    await input.fill(callback); forced401 = true;
+    await page.click('#login-refresh'); await page.waitForSelector('body:not(.connected)');
+    assert.equal(await page.evaluate(() => localStorage.getItem('model-quality:management-key:/v0/management/plugins/model-quality')),null);
+    assert(!await page.locator('[data-login-secret], #login-callback').evaluateAll(nodes => nodes.some(node => node.value)));
+    assert.equal(await link.count(),0);
+    assert.deepEqual(writes,[]); assert.deepEqual(errors,[]);
+    results.access = {expiredIdentityCleared:true,secretDraftCleared:true,businessPOSTs:0,backendConfigurationWrites:0};
+    assert.deepEqual(await sourceHashes(),source);
+    if (process.env.LOGIN_UI_OUTPUT) {
+      await fs.mkdir(process.env.LOGIN_UI_OUTPUT,{recursive:true});
+      const report = {status:'passed',fixture_scope:'Authenticated loopback-only seeded tasks, read-only browser',checks:Object.keys(results),source_sha256:source,...results};
+      await fs.writeFile(path.join(process.env.LOGIN_UI_OUTPUT,'report.json'),JSON.stringify(report,null,2)+'\n');
+    }
+    console.log(JSON.stringify(results));
+  } finally { await browser?.close(); fixture.kill(); await exit; }
+}
+main().catch(e => {console.error(e);process.exitCode = 1;});

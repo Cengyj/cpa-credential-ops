@@ -1,12 +1,6 @@
 package login
 
-import (
-	"bytes"
-	"encoding/gob"
-	"errors"
-
-	bolt "go.etcd.io/bbolt"
-)
+import "errors"
 
 const maxJobLogEntries = 200
 
@@ -81,7 +75,7 @@ func safeLogEntry(view Job) LogEntry {
 	if view.HTTPStatus >= 100 && view.HTTPStatus <= 599 {
 		entry.HTTPStatus = view.HTTPStatus
 	}
-	if runtimeErrorCode(view.RuntimeCode) != "" {
+	if view.RuntimeCode != "" && runtimeErrorCode(view.RuntimeCode) != "" {
 		entry.RuntimeCode = view.RuntimeCode
 	}
 	if runtimeDiagnostic(view.SecurityStatus, []string{"pending", "running", "complete", "uncertain", "totp_saved", "failed"}) {
@@ -111,42 +105,57 @@ func serviceHTTPStatus(entries []LogEntry, stage string) int {
 }
 
 func (j *journal) logs(id string) (JobLogs, error) {
-	logs := JobLogs{JobID: id, Entries: []LogEntry{}}
-	err := j.db.View(func(tx *bolt.Tx) error {
-		raw := tx.Bucket([]byte("jobs")).Get([]byte(id))
-		if raw == nil {
-			return errors.New("not_found")
-		}
-		var record storedJob
-		if err := gob.NewDecoder(bytes.NewReader(raw)).Decode(&record); err != nil {
-			return errors.New("storage_unavailable")
-		}
-		logs.Entries = append(logs.Entries, record.LogEntries...)
-		logs.RetainedCount = len(logs.Entries)
-		if logs.RetainedCount > 0 {
-			logs.FirstID = logs.Entries[0].ID
-			logs.LastID = logs.Entries[logs.RetainedCount-1].ID
-			logs.NextCursor = logs.LastID
-			logs.Truncated = logs.FirstID > 1
-		}
-		// An old record remains marked incomplete even after new real events arrive.
-		logs.Legacy = record.LogVersion == 0
-		return nil
-	})
+	record, err := j.visibleJob(id)
 	if err != nil {
-		if err.Error() == "not_found" {
-			return JobLogs{}, err
-		}
+		return JobLogs{}, err
+	}
+	if record.LogVersion > 1 {
 		return JobLogs{}, errors.New("storage_unavailable")
 	}
+	logs := JobLogs{JobID: id, Entries: record.LogEntries, RetainedCount: len(record.LogEntries), Legacy: record.LogVersion == 0}
+	if logs.RetainedCount == 0 {
+		logs.Entries = []LogEntry{}
+		return logs, nil
+	}
+	logs.FirstID = logs.Entries[0].ID
+	logs.LastID = logs.Entries[logs.RetainedCount-1].ID
+	logs.NextCursor = logs.LastID
+	logs.Truncated = logs.FirstID > 1
 	return logs, nil
 }
 
 func (s *Service) Logs(id string) (JobLogs, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.jobs[id] == nil || s.jobs[id].record.HistoryDeleted {
-		return JobLogs{}, errors.New("not_found")
+	logs, err := s.journal.logs(id)
+	if err != nil {
+		return JobLogs{}, err
 	}
-	return s.journal.logs(id)
+	if len(logs.Entries) > maxJobLogEntries {
+		return JobLogs{}, errors.New("storage_unavailable")
+	}
+	for i, entry := range logs.Entries {
+		if entry.ID == 0 || entry.ID != logs.FirstID+uint64(i) || !publicLogFields(entry) {
+			return JobLogs{}, errors.New("storage_unavailable")
+		}
+	}
+	return logs, nil
+}
+
+// Validate durable labels at the management/export boundary. Valid historical
+// levels and optional fields stay as recorded. Invalid text never enters the
+// response or its error, and reads do not rewrite the original evidence.
+func publicLogFields(e LogEntry) bool {
+	if !runtimeDiagnostic(e.Event, []string{"", "state", "request", "request_log_limit"}) ||
+		!runtimeDiagnostic(e.Level, []string{"", "info", "warn", "error"}) ||
+		!runtimeDiagnostic(e.Method, []string{"", "GET", "HEAD", "POST"}) ||
+		e.RequestKind != "" && !runtimeRequestKind(e.RequestKind) {
+		return false
+	}
+	if !publicDiagnosticTime(e.Time) {
+		return false
+	}
+	state := safeLogEntry(Job{Status: e.Status, Phase: e.Phase, ErrorStage: e.ErrorStage, ErrorCode: e.ErrorCode,
+		ErrorReason: e.ErrorReason, RuntimeCode: e.RuntimeCode, SecurityStatus: e.SecurityStatus, HTTPStatus: e.HTTPStatus})
+	return (e.Status == "" || e.Status == state.Status) && e.Phase == state.Phase && e.ErrorStage == state.ErrorStage &&
+		e.ErrorCode == state.ErrorCode && e.ErrorReason == state.ErrorReason && e.RuntimeCode == state.RuntimeCode &&
+		e.SecurityStatus == state.SecurityStatus && e.HTTPStatus == state.HTTPStatus && e.DurationMS >= 0 && e.DurationMS <= 900000
 }

@@ -379,6 +379,131 @@ func TestConnectionCorruptionAndWriteFailure(t *testing.T) {
 	}
 }
 
+func TestConcurrentHealthAndBusinessRetryWindows(t *testing.T) {
+	for _, tt := range []struct {
+		name, businessRetry, healthRetry, state, code string
+		businessStatus, healthStatus                  int
+		window                                        time.Duration
+	}{
+		{"health rate limit after business outage", "", "300", "rate_limited", "management_rate_limited", 503, 429, 5 * time.Minute},
+		{"health outage extends existing limit", "60", "300", "rate_limited", "management_rate_limited", 429, 503, 5 * time.Minute},
+		{"health restriction after business limit", "180", "", "restricted", "management_temporarily_banned", 429, 403, 11 * time.Minute},
+		{"late success preserves business limit", "180", "", "rate_limited", "management_rate_limited", 429, 200, 3 * time.Minute},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			synctest.Test(t, func(t *testing.T) {
+				m, _ := NewManagementClient("")
+				resume := make(chan struct{})
+				var probes atomic.Int32
+				m.client.Transport = connectionTransport(func(r *http.Request) (*http.Response, error) {
+					status, retry := tt.businessStatus, tt.businessRetry
+					body := `{"in_flight":0}`
+					if r.URL.Path == readinessPath {
+						status, retry = 200, ""
+						if probes.Add(1) == 2 {
+							select {
+							case <-resume:
+							case <-r.Context().Done():
+								return nil, r.Context().Err()
+							}
+							status, retry = tt.healthStatus, tt.healthRetry
+							if status == 403 {
+								body = `{"error":"IP banned due to too many failed attempts. Try again in 11m0s"}`
+							}
+						}
+					}
+					return &http.Response{StatusCode: status, Header: http.Header{"Retry-After": {retry}}, Body: io.NopCloser(strings.NewReader(body))}, nil
+				})
+				m.Start(dir, "offline-test")
+				defer m.Close()
+				synctest.Wait()
+				m.mu.RLock()
+				due := m.next
+				m.mu.RUnlock()
+				time.Sleep(time.Until(due))
+				synctest.Wait()
+				if probes.Load() != 2 || m.request(t.Context(), "GET", "/business", nil, nil, 1024) == nil {
+					t.Fatal("expected an overlapping health check and failed business request")
+				}
+				close(resume)
+				synctest.Wait()
+				st := m.snapshot()
+				if st.State != tt.state || st.Code != tt.code || st.NextAttemptAt == nil || time.Until(*st.NextAttemptAt) < tt.window {
+					t.Fatalf("overlapping responses lost restriction: %s/%s, next %v", st.State, st.Code, st.NextAttemptAt)
+				}
+				time.Sleep(time.Until(*st.NextAttemptAt) - time.Millisecond)
+				synctest.Wait()
+				if probes.Load() != 2 {
+					t.Fatal("contacted CPA before its retry window elapsed")
+				}
+				time.Sleep(time.Millisecond)
+				synctest.Wait()
+				if probes.Load() != 3 || !m.ready() {
+					t.Fatal("single coordinator did not recover at the agreed deadline")
+				}
+			})
+		})
+	}
+}
+
+func TestConnectionInvalidationDiskRepair(t *testing.T) {
+	for _, rotate := range []bool{false, true} {
+		t.Run(fmt.Sprintf("rotate=%v", rotate), func(t *testing.T) {
+			dir := t.TempDir()
+			synctest.Test(t, func(t *testing.T) {
+				m, _ := NewManagementClient("")
+				var probes atomic.Int32
+				m.client.Transport = connectionTransport(func(r *http.Request) (*http.Response, error) {
+					probes.Add(1)
+					return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"in_flight":0}`))}, nil
+				})
+				m.Start(dir, "")
+				defer m.Close()
+				st, err := editConnection(t, m, "PUT", "offline-old", "configure", m.snapshot().Revision)
+				if err != nil {
+					t.Fatal(err)
+				}
+				private := filepath.Join(dir, "management")
+				if err := os.Chmod(private, 0755); err != nil {
+					t.Fatal(err)
+				}
+				m.observeFailure(st.Revision, &http.Response{StatusCode: 401})
+				denied := m.snapshot()
+				if denied.Code != "connection_invalidation_save_failed" || denied.NextAttemptAt == nil || m.ready() {
+					t.Fatalf("denial must suspend use and schedule local marker repair: %+v", denied)
+				}
+				time.Sleep(2 * time.Second)
+				synctest.Wait()
+				if st := m.snapshot(); st.Code != denied.Code || st.NextAttemptAt == nil || !st.NextAttemptAt.After(*denied.NextAttemptAt) {
+					t.Fatalf("disk still unavailable, expected a later local retry: %+v", st)
+				}
+				if err := os.Chmod(private, 0700); err != nil {
+					t.Fatal(err)
+				}
+				expectedState, expectedRevision, expectedProbes := "invalid", denied.Revision, int32(1)
+				if rotate {
+					next, err := editConnection(t, m, "PUT", "offline-new", "configure", denied.Revision)
+					if err != nil {
+						t.Fatal(err)
+					}
+					expectedState, expectedRevision, expectedProbes = "saved", next.Revision, 2
+				}
+				time.Sleep(10 * time.Second)
+				synctest.Wait()
+				record, err := m.files.readInstalled()
+				if err != nil || record == nil || record.State != expectedState || record.Revision != expectedRevision ||
+					record.State == "invalid" && record.Key != "" || probes.Load() != expectedProbes {
+					t.Fatal("local marker repair lost the revision, retained denied material, or made an external call")
+				}
+				if st := m.snapshot(); st.NextAttemptAt != nil || !rotate && st.Code != "management_key_invalid" {
+					t.Fatal(st)
+				}
+			})
+		})
+	}
+}
+
 func TestBadEndpointIsolatedFromSDKAndReportsSafeError(t *testing.T) {
 	m := RuntimeManagementClient("http://user:private-canary@outside.example/")
 	m.Start(t.TempDir(), "unused-secret")
@@ -448,5 +573,79 @@ func TestConfigurationBanReturnsSafeRetryAfterAndNoSavedCandidate(t *testing.T) 
 	}
 	if _, err := os.Stat(filepath.Join(dir, "management")); !os.IsNotExist(err) {
 		t.Fatal("rejected candidate persisted")
+	}
+}
+
+func TestConnectionBackoffReportsCurrentCauseAndInvalidResponse(t *testing.T) {
+	dir := t.TempDir()
+	synctest.Test(t, func(t *testing.T) {
+		m, _ := NewManagementClient("")
+		var calls atomic.Int32
+		m.client.Transport = connectionTransport(func(r *http.Request) (*http.Response, error) {
+			body := `{"in_flight":0}`
+			if calls.Add(1) == 1 {
+				body = `{"unexpected":0}`
+			}
+			return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(body))}, nil
+		})
+		m.Start(dir, "offline")
+		defer m.Close()
+		synctest.Wait()
+		rev := m.snapshot().Revision
+		check := func(code string, after time.Duration) {
+			t.Helper()
+			st := m.snapshot()
+			raw, _ := json.Marshal(st)
+			var state struct {
+				Next *time.Time `json:"next_attempt_at"`
+			}
+			_ = json.Unmarshal(raw, &state)
+			if st.Code != code || state.Next == nil || time.Until(*state.Next) < after {
+				t.Errorf("expected %s and next attempt after %s, got %s", code, after, raw)
+			}
+		}
+		check("management_invalid_response", time.Second)
+		headers := http.Header{"Retry-After": {"90"}}
+		m.observeFailure(rev, &http.Response{StatusCode: 429, Header: headers})
+		check("management_rate_limited", 90*time.Second)
+		// A previously in-flight 503 must not shorten the host's limit.
+		m.observeFailure(rev, &http.Response{StatusCode: 503})
+		check("management_rate_limited", 90*time.Second)
+		time.Sleep(91 * time.Second)
+		synctest.Wait()
+		if calls.Load() != 2 || !m.ready() {
+			t.Fatal(m.snapshot(), calls.Load())
+		}
+	})
+}
+
+func TestConnectionCloseCancelsActiveBusinessTransport(t *testing.T) {
+	m, _ := NewManagementClient("")
+	waiting := make(chan struct{})
+	m.client.Transport = connectionTransport(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == readinessPath {
+			return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"in_flight":0}`))}, nil
+		}
+		close(waiting)
+		<-r.Context().Done()
+		return nil, r.Context().Err()
+	})
+	m.Start(t.TempDir(), "")
+	if _, err := editConnection(t, m, "PUT", "fake", "configure", m.snapshot().Revision); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- m.request(ctx, "GET", "/slow", nil, nil, 128) }()
+	<-waiting
+	m.Close()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("cancelled read succeeded")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Close left background HTTP request running")
 	}
 }

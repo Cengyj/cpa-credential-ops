@@ -43,8 +43,9 @@ func providerDirectoryFailureReason(err error) string {
 	if strings.HasPrefix(message, "management_session_required:") {
 		return "本轮尚未建立 CPA 管理会话，未能读取提供商配置目录。请查看后台连接状态。"
 	}
-	var status int
-	if _, scanErr := fmt.Sscanf(message, "management_http_%d:", &status); scanErr == nil && status >= 100 && status <= 599 {
+	var response *managementHTTPError
+	if errors.As(err, &response) {
+		status := response.status
 		if status == http.StatusUnauthorized || status == http.StatusForbidden {
 			return fmt.Sprintf("本轮 CPA 管理接口鉴权未通过（HTTP %d），未能核实提供商配置目录。", status)
 		}
@@ -306,7 +307,7 @@ func (m *ManagementClient) readProviderValue(ctx context.Context, path string, o
 		return "", false, nil
 	}
 	if resp.StatusCode != http.StatusOK {
-		return "", false, fmt.Errorf("management_http_%d: CPA configuration unavailable", resp.StatusCode)
+		return "", false, &managementHTTPError{status: resp.StatusCode}
 	}
 	const maxConfig = 8 << 20
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxConfig+1))

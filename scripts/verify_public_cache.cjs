@@ -79,7 +79,7 @@ async function main() {
       assert.deepEqual(first.records[name], { networkStatus: 200, validator: null }, name);
       assert.deepEqual(reopened.records[name], { networkStatus: 304, validator: tag }, name);
       const previous = prior.ui_source_sha256[name], changed = previous !== digest;
-      const response = await get(new URL(name, indexURL), { 'If-None-Match': `W/"${previous}"` });
+      const response = await get(new URL(name, indexURL), previous ? { 'If-None-Match': `W/"${previous}"` } : {});
       assert.equal(response.status, changed ? 200 : 304, name);
       assert.equal(response.headers.etag, tag);
       if (changed) assert.equal(createHash('sha256').update(response.body).digest('hex'), digest, name);
@@ -102,7 +102,7 @@ async function main() {
       authenticatedRequests: first.authenticatedRequests + reopened.authenticatedRequests };
     await fs.mkdir(path.dirname(reportFile), { recursive: true });
     await fs.writeFile(reportFile, JSON.stringify(report, null, 2) + '\n');
-    console.log('Verified 6 cold browser responses, 6 conditional reopens, changed assets, and gzip negotiation.');
+    console.log(`Verified ${Object.keys(assets).length} cold responses and conditional reopens, changed assets, and gzip negotiation.`);
   } finally {
     await browser.close();
   }

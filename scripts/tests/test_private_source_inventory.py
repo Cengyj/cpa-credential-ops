@@ -25,6 +25,10 @@ class PrivateSourceInventoryTests(unittest.TestCase):
             'login-runtime-go/runtime-volume/management/connection.json',
             'login-runtime-go/runtime-volume/management/.connection-123',
             'plugin/nested/model-quality-data/accounts/job.json',
+            'plugin/arbitrary-volume/accounts/security/fake-job.json',
+            'plugin/nested/auths/fake-token.json',
+            'login-runtime-go/plugin-data/fake-job.json',
+            'plugin/local-config/config.yaml',
         }
         self.public = {
             'plugin/management/routes.go',

@@ -79,6 +79,10 @@ var staticResources = []struct{ name, contentType string }{
 	{"client.js", "application/javascript; charset=utf-8"},
 	{"view.js", "application/javascript; charset=utf-8"},
 	{"login.js", "application/javascript; charset=utf-8"},
+	{"workspace.js", "application/javascript; charset=utf-8"},
+	{"commands.js", "application/javascript; charset=utf-8"},
+	{"conversion.js", "application/javascript; charset=utf-8"},
+	{"markup.js", "application/javascript; charset=utf-8"},
 	{"style.css", "text/css; charset=utf-8"},
 }
 

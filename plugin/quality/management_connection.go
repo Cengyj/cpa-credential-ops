@@ -1,13 +1,14 @@
 package quality
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"math/rand/v2"
 	"net/http"
-	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -21,37 +22,25 @@ import (
 // This endpoint is implemented by CPA 8.0.76 and reads local counters only.
 const readinessPath = "/v8/management/observability/requests/in-flight"
 
-// JSON escaping can expand each byte of an accepted management key sixfold.
-const maxConnectionRecordBytes = 64 << 10
-
 type ConnectionStatus struct {
-	State      string `json:"state"`
-	Code       string `json:"code,omitempty"`
-	Source     string `json:"source,omitempty"`
-	Configured bool   `json:"configured"`
-	CanMigrate bool   `json:"can_migrate"`
-	Revision   uint64 `json:"revision"`
+	NextAttemptAt *time.Time `json:"next_attempt_at,omitempty"`
+	State         string     `json:"state"`
+	Code          string     `json:"code,omitempty"`
+	Source        string     `json:"source,omitempty"`
+	Configured    bool       `json:"configured"`
+	CanMigrate    bool       `json:"can_migrate"`
+	Revision      uint64     `json:"revision"`
 }
 
 type connectionState struct {
-	status    ConnectionStatus
-	directory string
-	ctx       context.Context
-	cancel    context.CancelFunc
-	wake      chan struct{}
-	wg        sync.WaitGroup
-	next      time.Time
-	failures  uint
-}
-
-// The file contains a plaintext secret or a durable clear/invalidation marker.
-// Revisions are opaque JSON-safe integers used for browser compare-and-swap.
-type connectionRecord struct {
-	Version  int    `json:"version"`
-	Revision uint64 `json:"revision"`
-	Base     string `json:"base"`
-	State    string `json:"state"`
-	Key      string `json:"key,omitempty"`
+	status   ConnectionStatus
+	files    connectionFiles
+	ctx      context.Context
+	cancel   context.CancelFunc
+	wake     chan struct{}
+	wg       sync.WaitGroup
+	next     time.Time
+	failures uint
 }
 
 func nextConnectionRevision(previous uint64) uint64 {
@@ -66,7 +55,16 @@ func nextConnectionRevision(previous uint64) uint64 {
 func (m *ManagementClient) snapshot() ConnectionStatus {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return m.status
+	out := m.status
+	if !m.next.IsZero() && (out.State == "waiting" || out.State == "rate_limited" || out.State == "restricted" || out.invalidationPending()) {
+		next := m.next.UTC()
+		out.NextAttemptAt = &next
+	}
+	return out
+}
+
+func (st ConnectionStatus) invalidationPending() bool {
+	return st.State == "invalid" && st.Code == "connection_invalidation_save_failed"
 }
 
 // RuntimeManagementClient leaves SDK-backed operations available when the
@@ -88,13 +86,13 @@ func (m *ManagementClient) Start(directory, deploymentKey string) {
 		return
 	}
 	m.status.Revision = nextConnectionRevision(0)
-	m.directory = filepath.Join(directory, "management")
+	m.files = connectionFiles(filepath.Join(directory, "management"))
 	m.ctx, m.cancel = context.WithCancel(context.Background())
 	if m.base == "" {
 		return
 	}
 	m.wake = make(chan struct{}, 1)
-	record, err := m.readRecord()
+	record, err := m.files.readRecord()
 	switch {
 	case err != nil:
 		m.status = ConnectionStatus{State: "error", Code: "connection_store_invalid", Revision: nextConnectionRevision(0)}
@@ -135,102 +133,6 @@ func (m *ManagementClient) Close() {
 	if m.client != nil {
 		m.client.CloseIdleConnections()
 	}
-}
-
-func (m *ManagementClient) readRecord() (*connectionRecord, error) {
-	info, err := os.Lstat(m.directory)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil, nil
-	}
-	if err != nil || !info.IsDir() || info.Mode().Perm()&0077 != 0 {
-		return nil, errors.New("unsafe connection directory")
-	}
-	// A stopped process may leave a staged key before the rename. The
-	// exclusive quality store lock prevents a second instance from staging here.
-	if err := m.removeStagedRecords(); err != nil {
-		return nil, err
-	}
-	name := filepath.Join(m.directory, "connection.json")
-	info, err = os.Lstat(name)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil, nil
-	}
-	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0077 != 0 || info.Size() > maxConnectionRecordBytes {
-		return nil, errors.New("unsafe connection file")
-	}
-	raw, err := os.ReadFile(name)
-	var r connectionRecord
-	if err != nil || DecodeStrict(raw, &r) != nil || r.Version != 1 || r.Revision == 0 || r.Revision > 1<<52 || r.Base == "" ||
-		!(r.State == "saved" && validManagementKey(r.Key) || (r.State == "invalid" || r.State == "cleared") && r.Key == "") {
-		return nil, errors.New("invalid connection record")
-	}
-	return &r, nil
-}
-
-func (m *ManagementClient) removeStagedRecords() error {
-	entries, err := os.ReadDir(m.directory)
-	if err != nil {
-		return err
-	}
-	for _, entry := range entries {
-		suffix, match := strings.CutPrefix(entry.Name(), ".connection-")
-		if !match || !entry.Type().IsRegular() {
-			continue
-		}
-		if _, err := strconv.ParseUint(suffix, 10, 64); err != nil {
-			continue
-		}
-		if err := os.Remove(filepath.Join(m.directory, entry.Name())); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func syncDirectory(path string) error {
-	dir, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	return errors.Join(dir.Sync(), dir.Close())
-}
-
-var errConnectionDurability = errors.New("connection_save_unknown: could not confirm durable configuration replacement")
-
-func (m *ManagementClient) saveRecord(record connectionRecord) error {
-	if err := os.Mkdir(m.directory, 0700); err != nil && !errors.Is(err, os.ErrExist) {
-		return err
-	}
-	info, err := os.Lstat(m.directory)
-	if err != nil || !info.IsDir() || info.Mode().Perm()&0077 != 0 {
-		return errors.New("unsafe connection directory")
-	}
-	if err := syncDirectory(filepath.Dir(m.directory)); err != nil {
-		return err
-	}
-	data, err := json.Marshal(record)
-	if err != nil {
-		return err
-	}
-	if len(data) > maxConnectionRecordBytes {
-		return errors.New("connection record exceeds storage limit")
-	}
-	file, err := os.CreateTemp(m.directory, ".connection-*")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(file.Name())
-	_, writeErr := file.Write(data)
-	if err := errors.Join(writeErr, file.Sync(), file.Close()); err != nil {
-		return err
-	}
-	if err := os.Rename(file.Name(), filepath.Join(m.directory, "connection.json")); err != nil {
-		return err
-	}
-	if err := syncDirectory(m.directory); err != nil {
-		return errConnectionDurability
-	}
-	return nil
 }
 
 func (m *ManagementClient) signalLocked() {
@@ -291,7 +193,7 @@ func (m *ManagementClient) handleConnection(ctx context.Context, req pluginapi.M
 		record.Key, record.State = key, "saved"
 		next.State, next.Source, next.Configured = "ready", "saved", true
 	}
-	if err := m.saveRecord(record); err != nil {
+	if err := m.files.saveRecord(record); err != nil {
 		if errors.Is(err, errConnectionDurability) {
 			m.key = ""
 			m.status = ConnectionStatus{State: "error", Code: "connection_save_unknown", Revision: record.Revision}
@@ -315,7 +217,7 @@ func (e *connectionVerificationError) retryAfterHeader() string {
 	if e.retryAfter <= 0 {
 		return ""
 	}
-	return strconv.FormatInt(int64((e.retryAfter+time.Second-1)/time.Second), 10)
+	return strconv.FormatInt(int64((e.retryAfter-1)/time.Second)+1, 10)
 }
 
 type connectionObservation struct {
@@ -351,6 +253,36 @@ func managementFailure(resp *http.Response) connectionObservation {
 	return result
 }
 
+// CPA reports a temporary IP restriction in a small JSON body. Peek at it
+// without consuming the reply or taking the coordinator lock during I/O.
+func managementBan(resp *http.Response) time.Duration {
+	const limit = 2048
+	if resp.Body == nil || resp.ContentLength > limit {
+		return 0
+	}
+	reader := bufio.NewReaderSize(resp.Body, limit+1)
+	resp.Body = struct {
+		io.Reader
+		io.Closer
+	}{reader, resp.Body}
+	raw, err := reader.Peek(limit + 1)
+	if err != io.EOF {
+		return 0
+	}
+	var denied struct {
+		Error string `json:"error"`
+	}
+	if uniqueJSON(raw) != nil || json.Unmarshal(raw, &denied) != nil {
+		return 0
+	}
+	text, found := strings.CutPrefix(denied.Error, "IP banned due to too many failed attempts. Try again in ")
+	remaining, err := time.ParseDuration(text)
+	if !found || err != nil || remaining <= 0 {
+		return 0
+	}
+	return min(remaining, time.Duration(math.MaxInt64)-time.Second) + time.Second
+}
+
 func connectionError(st ConnectionStatus) error {
 	code := st.Code
 	if code == "" {
@@ -370,18 +302,9 @@ func (m *ManagementClient) probe(ctx context.Context, key string) connectionObse
 	if resp.StatusCode != http.StatusOK {
 		seen := managementFailure(resp)
 		if resp.StatusCode == http.StatusForbidden {
-			// This host reports its IP-ban expiry in JSON rather than Retry-After.
-			var denied struct {
-				Error string `json:"error"`
-			}
-			raw, readErr := io.ReadAll(io.LimitReader(resp.Body, 2049))
-			if readErr == nil && len(raw) <= 2048 && json.Unmarshal(raw, &denied) == nil {
-				if text, found := strings.CutPrefix(denied.Error, "IP banned due to too many failed attempts. Try again in "); found {
-					if remaining, parseErr := time.ParseDuration(text); parseErr == nil && remaining > 0 {
-						seen.delay = max(seen.delay, remaining+time.Second)
-						seen.code = "management_temporarily_banned"
-					}
-				}
+			if delay := managementBan(resp); delay > 0 {
+				seen.delay = max(seen.delay, delay)
+				seen.code = "management_temporarily_banned"
 			}
 		}
 		return seen
@@ -390,10 +313,22 @@ func (m *ManagementClient) probe(ctx context.Context, key string) connectionObse
 		InFlight *int64 `json:"in_flight"`
 	}
 	data, err := io.ReadAll(io.LimitReader(resp.Body, 65537))
-	if err != nil || len(data) > 65536 || json.Unmarshal(data, &counts) != nil || counts.InFlight == nil || *counts.InFlight < 0 {
-		return connectionObservation{state: "waiting", code: "management_unavailable"}
+	if err != nil || len(data) > 65536 || uniqueJSON(data) != nil || json.Unmarshal(data, &counts) != nil || counts.InFlight == nil || *counts.InFlight < 0 {
+		return connectionObservation{state: "waiting", code: "management_invalid_response"}
 	}
 	return connectionObservation{state: "ready"}
+}
+
+func (m *ManagementClient) observeBan(revision uint64, resp *http.Response) {
+	delay := managementBan(resp)
+	if delay <= 0 {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.status.Revision == revision && m.status.State == "restricted" {
+		m.mergeBackoffLocked(connectionObservation{state: "restricted", code: "management_temporarily_banned", delay: delay})
+	}
 }
 
 func (m *ManagementClient) observeFailure(revision uint64, resp *http.Response) {
@@ -407,14 +342,30 @@ func (m *ManagementClient) observeFailure(revision uint64, resp *http.Response) 
 	}
 	o := managementFailure(resp)
 	if m.status.State != "ready" && o.state != "invalid" {
-		if proposed := time.Now().Add(o.delay); o.delay > 0 && proposed.After(m.next) {
-			m.next = proposed
-			m.signalLocked()
-		}
+		m.mergeBackoffLocked(o)
 		return
 	}
 	m.applyLocked(o)
 	m.signalLocked()
+}
+
+// Overlapping observations for one revision retain the most specific
+// restriction and the latest server deadline, regardless of arrival order.
+func (m *ManagementClient) mergeBackoffLocked(o connectionObservation) {
+	switch o.state {
+	case "restricted":
+		if m.status.Code != "management_temporarily_banned" {
+			m.status.State, m.status.Code = o.state, o.code
+		}
+	case "rate_limited":
+		if m.status.State != "restricted" {
+			m.status.State, m.status.Code = o.state, o.code
+		}
+	}
+	if proposed := time.Now().Add(o.delay); o.delay > 0 && proposed.After(m.next) {
+		m.next = proposed
+		m.signalLocked()
+	}
 }
 
 func (m *ManagementClient) applyLocked(o connectionObservation) {
@@ -428,17 +379,32 @@ func (m *ManagementClient) applyLocked(o connectionObservation) {
 		// An earlier candidate probe cannot reinstate a credential after
 		// the current configuration has received an authoritative denial.
 		m.status.Revision = nextConnectionRevision(m.status.Revision)
-		if m.directory != "" {
-			record := connectionRecord{Version: 1, Revision: m.status.Revision, State: "invalid", Base: m.base}
-			if err := m.saveRecord(record); err != nil {
-				m.status.Code = "connection_invalidation_save_failed"
-			}
+		m.failures = 0
+		if m.files != "" {
+			m.persistInvalidationLocked()
 		}
 	default:
-		delay := time.Second << min(m.failures, 6)
-		m.failures++
-		m.next = time.Now().Add(max(delay+rand.N(delay/2), o.delay))
+		m.retryLocked(o.delay)
 	}
+}
+
+func (m *ManagementClient) retryLocked(minimum time.Duration) {
+	delay := time.Second << min(m.failures, 6)
+	m.failures++
+	m.next = time.Now().Add(max(delay+rand.N(delay/2), minimum))
+}
+
+// Saving the same keyless marker is idempotent, even if a previous rename
+// succeeded but its directory sync failed. Only the denied revision may write it.
+func (m *ManagementClient) persistInvalidationLocked() {
+	record := connectionRecord{Version: 1, Revision: m.status.Revision, State: "invalid", Base: m.base}
+	if err := m.files.saveRecord(record); err != nil {
+		m.status.Code = "connection_invalidation_save_failed"
+		m.retryLocked(0)
+		return
+	}
+	m.status.Code = "management_key_invalid"
+	m.next = time.Time{}
 }
 
 func (m *ManagementClient) monitor() {
@@ -450,7 +416,8 @@ func (m *ManagementClient) monitor() {
 		if m.ctx.Err() != nil {
 			return
 		}
-		if key == "" {
+		repair := st.invalidationPending()
+		if key == "" && !repair {
 			select {
 			case <-m.ctx.Done():
 				return
@@ -471,12 +438,22 @@ func (m *ManagementClient) monitor() {
 				continue
 			}
 		}
+		if repair {
+			m.mu.Lock()
+			if m.status.invalidationPending() && m.status.Revision == st.Revision && m.next.Equal(next) {
+				m.persistInvalidationLocked()
+			}
+			m.mu.Unlock()
+			continue
+		}
 		o := m.probe(m.ctx, key)
 		m.mu.Lock()
-		// A new delay supersedes a health result, except for a definitive
-		// denial of the same credential generation.
-		if m.key == key && m.status.Revision == st.Revision && m.status.State != "closing" && (m.next.Equal(next) || o.state == "invalid") {
-			m.applyLocked(o)
+		if m.key == key && m.status.Revision == st.Revision && m.status.State != "closing" {
+			if m.next.Equal(next) || o.state == "invalid" {
+				m.applyLocked(o)
+			} else if o.state != "ready" {
+				m.mergeBackoffLocked(o)
+			}
 		}
 		m.mu.Unlock()
 	}

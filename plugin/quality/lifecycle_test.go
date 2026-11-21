@@ -109,6 +109,15 @@ func TestManualReceiptReadAndRetention(t *testing.T) {
 			t.Fatalf("status %d, want %d: %s", res.StatusCode, want, res.Body)
 		}
 		if want != http.StatusOK {
+			var reply struct {
+				Error queryFailure `json:"error"`
+			}
+			if err := json.Unmarshal(res.Body, &reply); err != nil {
+				t.Fatal(err)
+			}
+			if want == http.StatusNotFound && reply.Error.Code != "command_not_accepted" || want == http.StatusGone && reply.Error.Code != "gone" {
+				t.Fatalf("ambiguous command lookup %d: %s", want, res.Body)
+			}
 			return nil
 		}
 		var run Run

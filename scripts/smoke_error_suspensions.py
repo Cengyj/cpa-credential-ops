@@ -46,10 +46,15 @@ def verify_manual_readmission(prefix, request, restart, root, target, recorded_c
 
     baseline = completed(manual('readmission-before-policy'))
     assert len(recorded_calls()) == 1 and not mutation_log()
-    rule = request(prefix + '/rules', {'name': 'Synthetic error-policy exclusion', 'target_scope': 'all_enabled',
-                                       'models': [missing], 'samples': 1, 'question_id': 'logic-boxes',
-                                       'action': 'disable_credential', 'upstream_error_actions': {'model_unsupported': 'disable_credential'},
-                                       'enabled': True, 'activation': 'keep'})
+    create = {'name': 'Synthetic error-policy exclusion', 'target_scope': 'all_enabled',
+              'models': [missing], 'samples': 1, 'question_id': 'logic-boxes',
+              'action': 'disable_credential', 'upstream_error_actions': {'model_unsupported': 'disable_credential'},
+              'enabled': True, 'activation': 'keep', 'idempotency_key': 'readmission-create-rule'}
+    rule = request(prefix + '/rules', create)
+    assert request(prefix + '/rules', create)['id'] == rule['id']
+    def command(key, allowed=(200,)):
+        return request(prefix + '/rules/commands?idempotency_key=' + key, allowed=allowed)
+    assert command(create['idempotency_key'])['rule_id'] == rule['id']
 
     def run_rule():
         return request(prefix + '/rules/run', {'id': rule['id'], 'revision': rule['revision']})
@@ -77,7 +82,14 @@ def verify_manual_readmission(prefix, request, restart, root, target, recorded_c
     assert saved['enabled'] and not saved.get('handling'), saved
     assert mutation_log() == [('PATCH', '/v8/management/credentials/status')] * 2
     # A fresh round may act again, while the original catalog evidence never replays itself.
-    readmitted = run_rule()
+    run_key = 'readmission-rule-command-after-enable'
+    run_input = {'id': rule['id'], 'revision': rule['revision'], 'idempotency_key': run_key}
+    assert command(run_key, allowed=(404,))['error']['code'] == 'command_not_accepted'
+    accepted = request(prefix + '/rules/run', run_input, allowed=(202,))
+    assert accepted['state'] == 'accepted' and accepted['rule_id'] == rule['id']
+    assert request(prefix + '/rules/run', run_input, allowed=(202,))['idempotency_key'] == run_key
+    resolved = await_value(lambda: command(run_key), lambda r: r['state'] == 'completed')
+    readmitted = resolved['result']
     assert readmitted['count'] == 1 and readmitted['skipped'] == 0 and readmitted['scope_batch_id'] != batch, readmitted
     new_rows = await_value(lambda: request(prefix + '/runs?scope_batch_id=' + readmitted['scope_batch_id'])['items'],
                           lambda items: len(items) == 1 and items[0]['action_status'] == 'credential_suspended')
@@ -101,6 +113,9 @@ def verify_manual_readmission(prefix, request, restart, root, target, recorded_c
                 raise
             time.sleep(.2)
     assert not listing['items']
+    assert command(create['idempotency_key'])['rule_id'] == rule['id']
+    assert command(run_key)['result']['scope_batch_id'] == readmitted['scope_batch_id']
+    assert request(prefix + '/rules/run', run_input, allowed=(202,))['result']['scope_batch_id'] == readmitted['scope_batch_id']
     retained = request(prefix + '/runs?rule_id=' + saved['id'])
     assert retained['total'] == 1 and retained['items'][0]['id'] == new_rows[0]['id'], retained
     assert request(prefix + '/runs/detail?id=' + rows[0]['id'], allowed=(404,))
@@ -119,6 +134,7 @@ def verify_manual_readmission(prefix, request, restart, root, target, recorded_c
     assert not enabled_after_delete['manual_disabled'] and not enabled_after_delete.get('error_policy_block')
     assert mutation_log() == [('PATCH', '/v8/management/credentials/status')] * 4 and len(recorded_calls()) == 2
     return {'model': model, 'missing_rule_model': missing, 'manual_before_suspension': baseline,
+            'create_and_run_receipts_survived_rule_delete_and_restart': True,
             'blocked_while_disabled': blocked, 'manual_after_cpa_enablement': after,
             'original_error_run': rows[0]['id'], 'rule_after_enablement': readmitted,
             'fresh_error_run': new_rows[0]['id'], 'retained_disposition': handling['state'], 'original_rule_enabled': saved['enabled'],
@@ -218,6 +234,8 @@ def verify_error_suspensions(prefix, request, restart, root, targets, recorded_c
         if counts != expected or any(call['disabled'] for call in seen):
             raise AssertionError({
                 'phase': label, 'actual_calls': dict(counts), 'expected_calls': dict(expected),
+                'admission': {name: [row['status'], (row.get('preflight_detail') or {}).get('code'), row['action_status']]
+                              for name, row in by_name.items()},
                 'calls_while_disabled': sum(call['disabled'] for call in seen),
                 'confirmed_reenables': [row['name'] for row in writes() if row['method'] == 'PATCH' and not row['disabled'] and row['cpa_status'] == 200],
             })
@@ -289,7 +307,7 @@ def verify_error_suspensions(prefix, request, restart, root, targets, recorded_c
     batch = schedule_after(batch)
     check('cron before restart', rule, batch, start, scheduled=True)
     before_calls = len(recorded_calls())
-    restart()
+    restart_states = restart(await_management=True)
     deadline = time.monotonic() + 30
     while True:
         try:
@@ -316,7 +334,7 @@ def verify_error_suspensions(prefix, request, restart, root, targets, recorded_c
         later = [row for row in history if row['config']['auth_id'] == name + '.json' and row['id'] != originals[name]['run_id']]
         assert all(row['action_status'] not in ('credential_suspended', 'credential_restored') and
                    len(row['samples']) == 4 and all(sample['quality_verdict'] == 'correct' for sample in row['samples']) for row in later)
-    return {'scope': 'all_credentials', 'fixed_receipts': fixed_receipts,
+    return {'scope': 'all_credentials', 'fixed_receipts': fixed_receipts, 'restart_authorization_states': restart_states,
             'retained_original_rows': diagnostic_history, 'operator_enabled': sorted(externally_enabled),
             'later_upstream_probes_while_suspended': dict.fromkeys(sorted(SUSPENDED - externally_enabled), 0),
             'state_reads_are_allowed': True,

@@ -161,7 +161,7 @@ func TestTOTPValidationWorkerParity(t *testing.T) {
 	if !ok {
 		t.Fatal("test source path unavailable")
 	}
-	worker := filepath.Join(filepath.Dir(source), "..", "..", "..", "..", "login-runtime", "totp.mjs")
+	worker := filepath.Join(filepath.Dir(source), "..", "..", "login-runtime", "totp.mjs")
 	cases := totpValidationCases()
 	values := make([]string, len(cases))
 	for i, tc := range cases {

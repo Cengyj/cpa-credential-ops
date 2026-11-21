@@ -33,6 +33,7 @@ type RuntimeRequest struct {
 	WorkspaceID         string      `json:"workspace_id,omitempty"`
 }
 type StartRequest struct {
+	commandID               string
 	knownPlans              []string
 	securityBinding         auth.LoginSnapshot
 	workspaceID             string
@@ -251,7 +252,7 @@ func SafeCode(err error) string {
 		return s
 	}
 	switch s {
-	case "cpa_credential_missing", "cpa_credential_unavailable", "quality_reconciliation_pending",
+	case "command_not_accepted", "command_result_expired", "cpa_credential_missing", "cpa_credential_unavailable", "quality_reconciliation_pending",
 		"retained_quality_pause", "credential_handling_pending", "quality_credential_restricted":
 		return s
 	case "credential_login_pending":

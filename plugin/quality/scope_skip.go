@@ -8,15 +8,16 @@ import (
 )
 
 type ScopeSkipDetail struct {
-	NotExecuted bool   `json:"not_executed,omitempty"`
-	RunID       string `json:"run_id,omitempty"`
-	AuthID      string `json:"auth_id"`
-	ObjectType  string `json:"object_type,omitempty"`
-	AuthIndex   string `json:"auth_index,omitempty"`
-	Email       string `json:"email,omitempty"`
-	Code        string `json:"code"`
-	Model       string `json:"model,omitempty"`
-	Reason      string `json:"reason"`
+	waitingCredential string
+	NotExecuted       bool   `json:"not_executed,omitempty"`
+	RunID             string `json:"run_id,omitempty"`
+	AuthID            string `json:"auth_id"`
+	ObjectType        string `json:"object_type,omitempty"`
+	AuthIndex         string `json:"auth_index,omitempty"`
+	Email             string `json:"email,omitempty"`
+	Code              string `json:"code"`
+	Model             string `json:"model,omitempty"`
+	Reason            string `json:"reason"`
 }
 
 func newScopedRun(rule *Rule, t Target, config RunConfig, question Question, batch string, scheduled bool, now time.Time, snapshot *CredentialSnapshot) *Run {

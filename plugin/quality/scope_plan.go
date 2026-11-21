@@ -105,7 +105,7 @@ func (en *Engine) collectScopeLocked(ctx context.Context, draft *Rule, inventory
 	if err == nil {
 		err = en.observeMissingEntriesLocked(ctx, targets, coverage.Verified)
 		if err == nil {
-			reconciliation = en.reconcileCurrentTargetsLocked(ctx, targets, nil)
+			reconciliation = en.reconcileDirectoryLocked(ctx, targets, nil)
 		}
 	}
 	owned := maps.Clone(en.managed)
@@ -207,7 +207,7 @@ func (en *Engine) collectScopeLocked(ctx context.Context, draft *Rule, inventory
 		for _, id := range dependencies(m.config) {
 			if hold := en.loginHolds[id]; hold != nil && (hold.State != "completed" || hold.generation > loginGeneration) {
 				code, reason := hold.reason()
-				detail = &ScopeSkipDetail{Code: code, Reason: reason, NotExecuted: true}
+				detail = &ScopeSkipDetail{Code: code, Reason: reason, NotExecuted: true, waitingCredential: id}
 				break
 			}
 		}

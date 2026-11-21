@@ -21,10 +21,11 @@ import (
 )
 
 type journal struct {
-	db     *bolt.DB
-	key    []byte
-	idemMu sync.Mutex
-	now    func() time.Time
+	db       *bolt.DB
+	key      []byte
+	idemMu   sync.Mutex
+	idemKeys map[string]*commandLock
+	now      func() time.Time
 }
 
 const journalMaxBytes int64 = 256 << 20
@@ -48,12 +49,15 @@ type storedJob struct {
 	LogEntries                        []LogEntry
 }
 type idempotency struct {
-	Fingerprint string
-	Pending     bool
-	Response    []byte
-	Code        string
-	Created     time.Time
-	JobID       string
+	JobPath      string
+	BatchVersion uint8
+	Retired      bool
+	Fingerprint  string
+	Pending      bool
+	Response     []byte
+	Code         string
+	Created      time.Time
+	JobID        string
 }
 
 func openJournal(dir string) (*journal, error) {
@@ -152,6 +156,7 @@ func (j *journal) prune(now time.Time) ([]string, error) {
 				}
 			}
 		}
+		var retired map[string]idempotency
 		cursor = tx.Bucket([]byte("idempotency")).Cursor()
 		for key, raw := cursor.First(); key != nil; key, raw = cursor.Next() {
 			var record idempotency
@@ -162,10 +167,18 @@ func (j *journal) prune(now time.Time) ([]string, error) {
 			if jobID == "" {
 				jobID = ojson.ParseBytes(record.Response).Get("id").String()
 			}
-			if record.Pending || protected[jobID] || record.Created.IsZero() || record.Created.Add(terminalRetention).After(now) {
+			if record.BatchVersion != 0 || record.Retired || record.Pending || protected[jobID] || record.Created.IsZero() || record.Created.Add(terminalRetention).After(now) {
 				continue
 			}
-			if err := cursor.Delete(); err != nil {
+			// Retain a compact reservation for commands whose result has aged out.
+			// A cleanup or restart must never turn a consumed key into new authority.
+			if retired == nil {
+				retired = make(map[string]idempotency)
+			}
+			retired[string(key)] = idempotency{Fingerprint: record.Fingerprint, JobPath: record.JobPath, Retired: true}
+		}
+		for id, record := range retired {
+			if err := putGob(tx, "idempotency", id, record); err != nil {
 				return err
 			}
 		}
@@ -299,42 +312,96 @@ func (j *journal) load() ([]storedJob, error) {
 	return out, err
 }
 
+type commandLock struct {
+	mu    sync.Mutex
+	users int
+}
+
+func (j *journal) lockCommand(id string) func() {
+	j.idemMu.Lock()
+	if j.idemKeys == nil {
+		j.idemKeys = make(map[string]*commandLock)
+	}
+	lock := j.idemKeys[id]
+	if lock == nil {
+		lock = &commandLock{}
+		j.idemKeys[id] = lock
+	}
+	lock.users++
+	j.idemMu.Unlock()
+	lock.mu.Lock()
+	return func() {
+		lock.mu.Unlock()
+		j.idemMu.Lock()
+		lock.users--
+		if lock.users == 0 {
+			delete(j.idemKeys, id)
+		}
+		j.idemMu.Unlock()
+	}
+}
+
+func validCommandKey(key string) bool {
+	return len(key) >= 8 && len(key) <= 128 && !strings.ContainsAny(key, "\r\n\x00")
+}
+
+func (j *journal) commandRecord(id string) (*idempotency, error) {
+	var record *idempotency
+	err := j.db.View(func(tx *bolt.Tx) error {
+		raw := tx.Bucket([]byte("idempotency")).Get([]byte(id))
+		if raw == nil {
+			return nil
+		}
+		record = new(idempotency)
+		return gob.NewDecoder(bytes.NewReader(raw)).Decode(record)
+	})
+	if err != nil {
+		return nil, errors.New("storage_unavailable")
+	}
+	return record, nil
+}
+
+func (record *idempotency) check(fingerprint string) error {
+	switch {
+	case record.Fingerprint != fingerprint:
+		return errors.New("idempotency_conflict")
+	case record.Retired:
+		return errors.New("command_result_expired")
+	case record.Pending:
+		return errors.New("idempotency_unknown")
+	case record.Code != "":
+		if !publicStoredCode(record.Code) {
+			return errors.New("storage_unavailable")
+		}
+		return errors.New(record.Code)
+	}
+	return nil
+}
+
 // Idempotent records intent before executing the operation. An interrupted response
 // remains unknown instead of silently repeating an authorization or mutation.
 func (j *journal) idempotent(key, path string, raw []byte, fn func() (any, error)) ([]byte, error) {
-	if len(key) < 8 || len(key) > 128 || strings.ContainsAny(key, "\r\n\x00") {
+	if !validCommandKey(key) {
 		return nil, errors.New("invalid_request")
 	}
-	j.idemMu.Lock()
-	defer j.idemMu.Unlock()
 	canonical, err := canonicalRequest(raw)
 	if err != nil {
 		return nil, err
 	}
 	id := j.fingerprint(key)
 	fingerprint := j.fingerprint(path, canonical)
-	var old idempotency
-	exists := false
-	err = j.db.View(func(tx *bolt.Tx) error {
-		v := tx.Bucket([]byte("idempotency")).Get([]byte(id))
-		if v == nil {
-			return nil
-		}
-		exists = true
-		return gob.NewDecoder(bytes.NewReader(v)).Decode(&old)
-	})
+	release := j.lockCommand(id)
+	defer release()
+	old, err := j.commandRecord(id)
 	if err != nil {
-		return nil, errors.New("storage_unavailable")
+		return nil, err
 	}
-	if exists {
-		if old.Fingerprint != fingerprint {
-			return nil, errors.New("idempotency_conflict")
+	if old != nil {
+		if err := old.check(fingerprint); err != nil {
+			return nil, err
 		}
-		if old.Pending {
-			return nil, errors.New("idempotency_unknown")
-		}
-		if old.Code != "" {
-			return nil, errors.New(old.Code)
+		if jobReplyPath(path) {
+			return cachedJobReply(old.Response, old.JobID)
 		}
 		return old.Response, nil
 	}
@@ -342,14 +409,23 @@ func (j *journal) idempotent(key, path string, raw []byte, fn func() (any, error
 	if err = j.capacity(maintenance); err != nil {
 		return nil, err
 	}
-	record := idempotency{Fingerprint: fingerprint, Pending: true, Created: j.now()}
+	record := idempotency{Fingerprint: fingerprint, Pending: true, Created: j.now(), JobPath: jobCommandPath(path)}
 	if err = j.db.Update(func(tx *bolt.Tx) error { return putGob(tx, "idempotency", id, record) }); err != nil {
 		return nil, errors.New("storage_unavailable")
 	}
 	value, opErr := fn()
+	// Once the operation has run, a lost result cannot establish non-execution.
+	// Leave the durable pending reservation in place for a same-key lookup.
 	response, e := Encode(value)
 	if e != nil {
-		return nil, errors.New("storage_unavailable")
+		return nil, errors.New("idempotency_unknown")
+	}
+	if record.JobPath != "" && opErr != nil {
+		if inserted, readErr := j.commandRecord(id); readErr != nil || inserted != nil && inserted.JobID != "" {
+			// The operation may have failed after atomically admitting a job.
+			// Keep its identity attached for a read-only outcome lookup.
+			return nil, errors.New("idempotency_unknown")
+		}
 	}
 	record.Pending = false
 	record.Code = SafeCode(opErr)
@@ -358,7 +434,7 @@ func (j *journal) idempotent(key, path string, raw []byte, fn func() (any, error
 	record.Response = d
 	record.JobID = ojson.ParseBytes(d).Get("id").String()
 	if err = j.db.Update(func(tx *bolt.Tx) error { return putGob(tx, "idempotency", id, record) }); err != nil {
-		return nil, errors.New("storage_unavailable")
+		return nil, errors.New("idempotency_unknown")
 	}
 	if opErr != nil {
 		return nil, errors.New(record.Code)

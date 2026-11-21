@@ -59,9 +59,18 @@ async function main() {
           assert.equal(u.origin, origin);
           if (request.method() !== 'GET') writes.push(request.method() + ' ' + u.pathname);
           const resource = u.searchParams.get('source') || u.pathname.split('/').pop();
+          if (resource === 'metrics' && control.holdMetrics) {
+            control.metricsEntered?.release();
+            await control.holdMetrics.promise;
+          }
+          if (control.split && u.pathname === '/v0/management/plugins/model-quality/targets') {
+            const offset = Number(u.searchParams.get('offset'));
+            control.offsets.push(offset);
+            if (!offset) { control.firstEntered.release(); await control.split.promise; }
+            return route.fulfill({json:{total:2,snapshot:'two',items:[{auth_id:'partition-' + offset}]}});
+          }
           if (resource === control.failure) return route.fulfill({ status: control.code || 503, json: { error: '离线读取故障' } });
           if (resource === control.invalid) return route.fulfill({ status: 200, contentType: 'application/json', body: 'null' });
-          if (resource === 'metrics' && control.holdMetrics) await control.holdMetrics.promise;
           if (resource === 'metrics') return route.fulfill({ json: {
             quality_pass_rate: control.recovered ? 0.5 : 0.75, correct: control.recovered ? 4 : 6, judged: 8, planned: 10,
             unknown: 2, incorrect: control.recovered ? 4 : 2, coverage: 0.8, known_tokens: 120, unknown_usage: 0, dropped_events: 0,
@@ -114,6 +123,7 @@ async function main() {
     await scenario('metrics_failure', async ({ page, outer, control, connect, choose, refresh }) => {
       await connect(); await choose();
       await page.click('[data-page=operations]');
+      await refresh();
       control.failure = 'metrics';
       await refresh();
       const failed = await status(page);
@@ -150,12 +160,13 @@ async function main() {
       control.failure = '';
       await refresh();
       const recovered = await status(page);
-      control.failure = 'metrics'; control.code = 401;
+      control.failure = 'manual_test'; control.code = 401;
       await refresh();
       return { connected, failed, recovered, unauthorized: await status(page) };
     }, { width: 320, height: 720, theme: 'white', embedded: true });
     await scenario('catalog_with_slow_metrics', async ({ page, outer, control, connect, choose, settle }) => {
       await connect(); await choose();
+      await page.click('[data-page=operations]');
       control.holdMetrics = gate(); control.failure = 'targets';
       const failure = outer.waitForResponse(response => new URL(response.url()).pathname.endsWith('/targets') && response.status() === 503);
       let failed;
@@ -170,6 +181,7 @@ async function main() {
     });
     await scenario('rules_and_questions', async ({ page, control, connect, choose, refresh }) => {
       await connect(); await choose();
+      await page.click('[data-page=operations]'); await refresh();
       const initial = await status(page);
       control.failure = 'rules'; await refresh();
       const staleRules = await status(page);
@@ -178,11 +190,34 @@ async function main() {
       control.failure = ''; await refresh();
       return { initial, staleRules, staleQuestions, recovered: await status(page) };
     });
+    await scenario('late_metrics_on_manual', async ({ page, outer, control, connect, choose, settle }) => {
+      await connect(); await choose(); await settle();
+      control.metricsEntered = gate(); control.holdMetrics = gate();
+      await page.click('[data-page=operations]'); await control.metricsEntered.promise;
+      await page.click('[data-page=manual]');
+      control.failure = 'metrics';
+      const failed = outer.waitForResponse(r => r.url().includes('/metrics?') && r.status() === 503);
+      control.holdMetrics.release(); await (await failed).finished(); await settle();
+      const manual = await status(page);
+      assert(!manual.warning && manual.canSubmit);
+      return {manual,oldMetricsAffectedCurrentWorkspace:false};
+    });
+    await scenario('paged_directory_leaving', async ({ page, outer, control, connect, choose, settle }) => {
+      await connect(); await choose(); await settle();
+      control.split = gate(); control.firstEntered = gate(); control.offsets = [];
+      await page.click('#refresh'); await control.firstEntered.promise;
+      await page.click('[data-page=login]');
+      const response = outer.waitForResponse(r => new URL(r.url()).pathname === '/v0/management/plugins/model-quality/targets');
+      control.split.release(); await (await response).finished(); await settle();
+      assert.deepEqual(control.offsets,[0]);
+      return {requestedOffsets:[...control.offsets],displayReadAfterLeaving:0};
+    });
     if (out) await fs.writeFile(path.join(out, 'reads.json'), JSON.stringify(results, null, 2) + '\n');
     if (process.argv.includes('--observe')) return;
     const initial = results.initial_history_failure;
     assert(initial.failed.connected && initial.failed.saved && initial.failed.canSubmit);
-    assert(initial.failed.warning && initial.failed.qualityRows > 0);
+    assert(initial.failed.warning);
+    assert.equal(initial.failed.qualityRows, 0, 'Opening manual history must not fetch operations data');
     assert.match(initial.failed.historyText, /读取失败/);
     assert.equal(initial.failed.historyTotal, '');
     assert(!initial.failed.canClearHistory && initial.recovered.canClearHistory);
@@ -203,11 +238,11 @@ async function main() {
     assert.notEqual(history.failed.firstHistory, history.recovered.firstHistory);
     const catalog = results.catalog_failure;
     assert(catalog.connected.firstHistory && catalog.connected.canClearHistory, 'A direct manual workspace connection enables history cleanup immediately');
-    assert(catalog.failed.connected && !catalog.failed.canSubmit);
+    assert(catalog.failed.connected && catalog.failed.canSubmit, 'The previous complete selection can request a fresh admission read');
     assert.match(catalog.failed.credentialNote, /未确认|读取失败/);
     assert(!catalog.recovered.warning && catalog.recovered.canSubmit);
     assert(!catalog.unauthorized.connected && !catalog.unauthorized.saved);
-    assert(!results.catalog_with_slow_metrics.failed.canSubmit);
+    assert(results.catalog_with_slow_metrics.failed.canSubmit, 'The saved selection can recheck the directory while unrelated metrics are pending');
     const rules = results.rules_and_questions;
     assert(rules.initial.canRunRule && !rules.staleRules.canRunRule && rules.staleRules.canSubmit && rules.staleRules.rulesNote);
     assert(rules.staleQuestions.canRunRule && !rules.staleQuestions.canSubmit && rules.staleQuestions.questionNote);

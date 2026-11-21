@@ -14,28 +14,6 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
 
-func (en *Engine) History() ([]Audit, error) {
-	out := []Audit{}
-	err := en.store.All("audit", func(b []byte) error {
-		var a Audit
-		if e := decode(b, &a); e != nil {
-			return e
-		}
-		out = append(out, a)
-		return nil
-	})
-	if err != nil {
-		return nil, fmt.Errorf("unavailable: read audit history: %w", err)
-	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].Time.Equal(out[j].Time) {
-			return out[i].ID < out[j].ID
-		}
-		return out[i].Time.After(out[j].Time)
-	})
-	return out, nil
-}
-
 // QueryRuns sorts lightweight references and clones only the requested page.
 func (en *Engine) QueryRuns(query url.Values) (map[string]any, error) {
 	source := query.Get("source")

@@ -12,7 +12,8 @@ import (
 )
 
 type Store struct {
-	db *bolt.DB
+	db      *bolt.DB
+	history auditIndex
 }
 
 var buckets = []string{"meta", "runs", "rules", "audit", "usage", "idempotency", "presets"}
@@ -21,34 +22,87 @@ func OpenStore(dir string, _ int64) (*Store, error) {
 	if e := os.MkdirAll(dir, 0700); e != nil {
 		return nil, e
 	}
-	db, e := bolt.Open(filepath.Join(dir, "quality.db"), 0600, &bolt.Options{Timeout: time.Nanosecond})
+	db, e := bolt.Open(filepath.Join(dir, "quality.db"), 0600, &bolt.Options{Timeout: time.Nanosecond, OpenFile: openQualityFile})
 	if e != nil {
 		return nil, fmt.Errorf("open plugin store (single instance required): %w", e)
 	}
 	s := &Store{db: db}
-	e = db.Update(func(tx *bolt.Tx) error {
-		for _, b := range buckets {
-			if _, e := tx.CreateBucketIfNotExists([]byte(b)); e != nil {
-				return e
-			}
-		}
-		b := tx.Bucket([]byte("meta"))
-		v := b.Get([]byte("schema"))
-		if v != nil && string(v) != "1" && string(v) != "2" {
-			return fmt.Errorf("unsupported plugin store schema")
-		}
-		if string(v) == "1" {
-			if err := migrateManualOnly(tx); err != nil {
-				return err
-			}
-		}
-		return b.Put([]byte("schema"), []byte("2"))
-	})
+	e = db.Update(prepareQualityStore)
 	if e != nil {
 		return nil, errors.Join(e, db.Close())
 	}
 	return s, nil
 }
+
+// bbolt initializes any zero-length file before a transaction can inspect it.
+// Only the process that created the file may take that initialization path.
+func openQualityFile(path string, flags int, mode os.FileMode) (*os.File, error) {
+	if flags&os.O_CREATE == 0 || flags&os.O_TRUNC != 0 {
+		// bbolt also calls this hook for snapshot reads and copies.
+		return os.OpenFile(path, flags, mode)
+	}
+	file, err := os.OpenFile(path, flags|os.O_EXCL, mode)
+	if !errors.Is(err, os.ErrExist) {
+		return file, err
+	}
+	file, err = os.OpenFile(path, flags&^os.O_CREATE, mode)
+	if err != nil {
+		return nil, err
+	}
+	info, err := file.Stat()
+	if err == nil && info.Size() > 0 {
+		return file, nil
+	}
+	if err == nil {
+		err = errors.New("incomplete quality store: existing file is empty")
+	}
+	return nil, errors.Join(err, file.Close())
+}
+
+func prepareQualityStore(tx *bolt.Tx) error {
+	first, _ := tx.Cursor().First()
+	newStore := first == nil
+	// bbolt initializes its two metadata pages at IDs 0 and 1. A later
+	// empty root has a committed history, so its former data is unknown.
+	if newStore && tx.ID() != 2 {
+		return fmt.Errorf("incomplete quality store: empty database after prior transactions")
+	}
+	if !newStore {
+		meta := tx.Bucket([]byte("meta"))
+		if meta == nil || meta.Get([]byte("schema")) == nil {
+			return fmt.Errorf("incomplete quality store: missing schema in a populated database")
+		}
+		version := string(meta.Get([]byte("schema")))
+		if version == "2" {
+			// Recreating an empty bucket here would silently discard evidence
+			// of a partial restore, including command and ownership history.
+			for _, name := range buckets {
+				if tx.Bucket([]byte(name)) == nil {
+					return fmt.Errorf("incomplete quality store: missing required bucket %s", name)
+				}
+			}
+			return prepareRuleCommandBuckets(tx)
+		}
+		if version != "1" {
+			return fmt.Errorf("unsupported plugin store schema")
+		}
+	}
+	for _, name := range buckets {
+		if _, err := tx.CreateBucketIfNotExists([]byte(name)); err != nil {
+			return err
+		}
+	}
+	if !newStore {
+		if err := migrateManualOnly(tx); err != nil {
+			return err
+		}
+	}
+	if err := tx.Bucket([]byte("meta")).Put([]byte("schema"), []byte("2")); err != nil {
+		return err
+	}
+	return prepareRuleCommandBuckets(tx)
+}
+
 func (s *Store) Close() error { return s.db.Close() }
 func (s *Store) Put(bucket, key string, v any) error {
 	return s.Write(func(tx *bolt.Tx) error { return put(tx, bucket, key, v) })

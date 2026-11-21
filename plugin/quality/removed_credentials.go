@@ -211,6 +211,7 @@ func (en *Engine) checkFinishedRounds(ctx context.Context) error {
 		for id := range removed {
 			delete(en.managed, id)
 		}
+		en.directory.revision.Add(1)
 	}
 	return err
 }

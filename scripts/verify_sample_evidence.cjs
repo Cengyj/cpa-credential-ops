@@ -75,7 +75,7 @@ async function main() {
       const pathname = location.pathname;
       if (req.method() !== 'GET') mutations.push(pathname);
       const name = pathname.split('/').pop() || 'index.html';
-      if (baseline && ['app.js', 'view.js', 'index.html', 'client.js', 'login.js', 'style.css'].includes(name)) {
+      if (baseline && require('../plugin/ui/public_assets.json').includes(name)) {
         return route.fulfill({ path: path.join(baseline, name) });
       }
       if (pathname.endsWith('/runs/review') && req.method() === 'POST') {

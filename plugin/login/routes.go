@@ -17,10 +17,10 @@ const RoutePrefix = "/v0/management/plugins/model-quality/login"
 // authentication. Public plugin resources contain only static UI assets.
 func ManagementRoutes() []map[string]string {
 	routes := []map[string]string{}
-	for _, p := range []string{"/capabilities", "/targets", "/jobs", "/logs", "/detail", "/candidate", "/vault/status", "/accounts", "/accounts/detail", "/accounts/settings"} {
+	for _, p := range []string{"/commands", "/batches", "/capabilities", "/targets", "/jobs", "/logs", "/detail", "/candidate", "/vault/status", "/accounts", "/accounts/detail", "/accounts/settings"} {
 		routes = append(routes, map[string]string{"method": "GET", "path": RoutePrefix + p})
 	}
-	for _, p := range []string{"/start", "/callback", "/cancel", "/discard", "/commit", "/accounts/import", "/accounts/start", "/accounts/inspect", "/accounts/security", "/accounts/security/complete", "/conversion/preview", "/conversion/upload"} {
+	for _, p := range []string{"/batches/cancel", "/start", "/callback", "/cancel", "/discard", "/commit", "/accounts/import", "/accounts/start", "/accounts/inspect", "/accounts/security", "/accounts/security/complete", "/conversion/preview", "/conversion/upload"} {
 		routes = append(routes, map[string]string{"method": "POST", "path": RoutePrefix + p})
 	}
 	for _, p := range []string{"/vault/entry", "/accounts/entry"} {
@@ -44,8 +44,12 @@ func errorReply(err error) pluginapi.ManagementResponse {
 	code := SafeCode(err)
 	status := 409
 	switch code {
-	case "not_found":
+	case "not_found", "command_not_accepted":
 		status = 404
+	case "command_result_expired":
+		status = 410
+	case "storage_capacity":
+		status = 507
 	case "invalid_request", "invalid_credentials", "invalid_proxy", "invalid_callback":
 		status = 400
 	case "runtime_unavailable", "storage_unavailable", "plugin_unavailable", "cpa_credential_unavailable", "quality_authority_unavailable":
@@ -57,12 +61,13 @@ func errorReply(err error) pluginapi.ManagementResponse {
 	switch code {
 	case "runtime_unavailable", "runtime_failed", "runtime_timeout", "runtime_protocol_error", "runtime_invalid":
 		source = "login_runtime"
-	case "plugin_unavailable", "storage_unavailable":
+	case "plugin_unavailable", "storage_unavailable", "storage_capacity", "idempotency_unknown":
 		source = "plugin"
 	case "cpa_credential_unavailable", "quality_authority_unavailable":
 		source = "sdk"
 	}
-	return reply(status, map[string]any{"error": code, "code": code, "source": source, "outcome_unknown": code == "idempotency_unknown" || code == "commit_unknown" || code == "security_uncertain" || code == "saved_not_adopted"})
+	retryable := status == 429 || status == 503
+	return reply(status, map[string]any{"retryable": retryable, "error": code, "code": code, "source": source, "outcome_unknown": code == "idempotency_unknown" || code == "commit_unknown" || code == "security_uncertain" || code == "saved_not_adopted"})
 }
 func (s *Service) Handle(ctx context.Context, req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
 	if s == nil {
@@ -113,10 +118,21 @@ func (s *Service) Handle(ctx context.Context, req pluginapi.ManagementRequest) p
 			}
 		}
 		switch path {
+		case "/commands", "/batches":
+			if len(req.Query) != 1 || req.Query.Get("id") == "" {
+				return errorReply(errors.New("invalid_request"))
+			}
+			if path == "/batches" {
+				value, err = s.lookupAccountBatch(req.Query.Get("id"))
+			} else {
+				value, err = s.lookupJobCommand(req.Query.Get("id"))
+			}
 		case "/capabilities":
 			value = s.Capabilities()
 		case "/targets":
-			value = map[string]any{"items": s.Targets()}
+			var items []map[string]any
+			items, err = s.targets()
+			value = map[string]any{"items": items}
 		case "/jobs":
 			var items []Job
 			var more bool
@@ -182,6 +198,9 @@ func (s *Service) Handle(ctx context.Context, req pluginapi.ManagementRequest) p
 	if len(req.Query) != 0 || len(req.Body) > limit {
 		return errorReply(errors.New("invalid_request"))
 	}
+	if path == "/accounts/inspect" || path == "/conversion/upload" {
+		return s.handleAccountBatch(ctx, req, path)
+	}
 	// A preview is a pure transformation; never cache its token-bearing response.
 	if path == "/conversion/preview" {
 		value, err := s.conversionPreview(req.Body)
@@ -190,7 +209,12 @@ func (s *Service) Handle(ctx context.Context, req pluginapi.ManagementRequest) p
 		}
 		return reply(200, value)
 	}
-	body, err := s.Idempotent(req.Headers.Get("Idempotency-Key"), req.Method+path, req.Body, func() (any, error) { return s.write(ctx, req.Method, path, req.Body) })
+	key := req.Headers.Get("Idempotency-Key")
+	commandID := ""
+	if jobCommandPath(req.Method+path) != "" {
+		commandID = s.journal.fingerprint(key)
+	}
+	body, err := s.Idempotent(key, req.Method+path, req.Body, func() (any, error) { return s.write(ctx, req.Method, path, req.Body, commandID) })
 	if err != nil {
 		return errorReply(err)
 	}
@@ -198,18 +222,27 @@ func (s *Service) Handle(ctx context.Context, req pluginapi.ManagementRequest) p
 	r.Body = body
 	return r
 }
-func (s *Service) write(ctx context.Context, method, path string, raw []byte) (any, error) {
-	if path == "/conversion/upload" && method == http.MethodPost {
-		return s.uploadConversion(ctx, raw)
+func (s *Service) write(ctx context.Context, method, path string, raw []byte, commandID string) (any, error) {
+	if path == "/batches/cancel" && method == http.MethodPost {
+		value, err := Object(raw, "id")
+		if err != nil {
+			return nil, err
+		}
+		id, err := stringField(value, "id")
+		if err != nil {
+			return nil, err
+		}
+		return s.cancelAccountBatch(id)
 	}
 	if strings.HasPrefix(path, "/accounts/") {
-		return credentialAccountWrite(s, method, path, raw)
+		return s.writeAccountCommand(method, path, raw, commandID)
 	}
 	if path == "/start" {
 		r, e := DecodeStart(raw)
 		if e != nil {
 			return nil, e
 		}
+		r.commandID = commandID
 		return s.Start(r)
 	}
 	if path == "/vault/entry" {

@@ -44,7 +44,7 @@ func (en *Engine) runByReceipt(key string) (*Run, error) {
 		return nil, err
 	}
 	if r == nil {
-		return nil, fmt.Errorf("not_found: submission receipt")
+		return nil, fmt.Errorf("command_not_accepted: manual test has not been accepted")
 	}
 	return runForDisplay(r), nil
 }
@@ -151,10 +151,10 @@ func (en *Engine) Submit(ctx context.Context, c RunConfig) (*Run, error) {
 func (en *Engine) submit(ctx context.Context, c RunConfig, ruleID string, scheduledRevision uint64) (*Run, error) {
 	en.mu.Lock()
 	defer en.mu.Unlock()
-	return en.submitLocked(ctx, c, ruleID, scheduledRevision, en.host.Targets, nil)
+	return en.submitLocked(ctx, c, ruleID, scheduledRevision, en.host.Targets, nil, nil)
 }
 
-func (en *Engine) submitLocked(ctx context.Context, c RunConfig, ruleID string, scheduledRevision uint64, inventory func(context.Context) ([]Target, error), occurrence *scheduledRule) (*Run, error) {
+func (en *Engine) submitLocked(ctx context.Context, c RunConfig, ruleID string, scheduledRevision uint64, inventory func(context.Context) ([]Target, error), occurrence *scheduledRule, command *ruleCommandRecord) (*Run, error) {
 	if en.closed || en.fault != nil {
 		return nil, fmt.Errorf("unavailable: plugin is stopping or persistence failed")
 	}
@@ -215,19 +215,18 @@ func (en *Engine) submitLocked(ctx context.Context, c RunConfig, ruleID string, 
 	if queueFull && (rule == nil || en.Capabilities().QualityPause) {
 		return nil, fmt.Errorf("queue_full: retry later")
 	}
-	targets, e := inventory(en.inventoryContextLocked(ctx))
+	fence := en.admissionFenceLocked(rule)
+	ctx = en.inventoryContextLocked(ctx)
+	targets, e := en.readAdmissionTargetsLocked(ctx, inventory, c, rule)
 	if e != nil {
-		return nil, fmt.Errorf("host targets unavailable: %w", e)
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
+		return nil, e
 	}
 	if rule == nil {
 		if err := c.verifyManualSubject(targets, c.ExpectedObjectType, c.ExpectedAuthIndex); err != nil {
 			return nil, err
 		}
 	}
-	if err := currentTargetError(en.reconcileCurrentTargetsLocked(ctx, targets, dependencies(c)), dependencies(c)); err != nil {
+	if err := currentTargetError(en.reconcileDirectoryLocked(ctx, targets, dependencies(c)), dependencies(c)); err != nil {
 		return nil, err
 	}
 	if err := en.runDispositionLocked(c, rule == nil); err != nil {
@@ -235,7 +234,7 @@ func (en *Engine) submitLocked(ctx context.Context, c RunConfig, ruleID string, 
 	}
 	var manualAccount string
 	if d := en.managed[c.AuthID]; rule == nil && d != nil && d.State == "externally_enabled" {
-		manualAccount, err = en.currentManualAccountLocked(ctx, c, targets)
+		manualAccount, err = admissionReadLocked(en, ctx, c, rule, func() (string, error) { return en.currentManualAccount(ctx, c, targets) })
 		if err != nil {
 			return nil, err
 		}
@@ -374,6 +373,27 @@ func (en *Engine) submitLocked(ctx context.Context, c RunConfig, ruleID string, 
 			}
 		}
 	}
+	if err := en.checkAdmissionFenceLocked(ctx, fence, dependencies(c)); err != nil {
+		return nil, err
+	}
+	// A concurrent submission may have committed the same key, filled a
+	// queue slot or admitted this rule while inventory was being read.
+	if c.IdempotencyKey != "" {
+		prior, err := en.submittedRunLocked(c.IdempotencyKey, requestHash)
+		if err != nil || prior != nil {
+			return cloneRun(prior), err
+		}
+	}
+	if rule != nil && en.hasCurrentRoundLocked(rule) {
+		return nil, fmt.Errorf("conflict: rule already running")
+	}
+	if len(en.queue) >= cap(en.queue) {
+		en.compactQueueLocked()
+	}
+	queueFull = len(en.queue) >= cap(en.queue)
+	if err := en.storageAdmission(); err != nil {
+		return nil, err
+	}
 	if queueFull {
 		return reject(fmt.Errorf("queue_full: retry later"), queueSkip())
 	}
@@ -436,8 +456,9 @@ func (en *Engine) submitLocked(ctx context.Context, c RunConfig, ruleID string, 
 		}
 		return en.recordFixedAdmissionLocked(rule, r)
 	}
-	if occurrence != nil {
+	if occurrence != nil || command != nil {
 		c := changes()
+		c.ruleCommand = completedDispatch(command, ruleDispatch{RunID: r.ID, Count: 1})
 		c.runs[r.ID] = r
 		en.consumeOccurrence(c, cloneRule(rule), occurrence)
 		if err := en.commitLocked(c); err != nil {

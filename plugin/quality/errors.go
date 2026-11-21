@@ -2,18 +2,59 @@ package quality
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 )
 
+// managementHTTPError describes the outer CPA response only. Model statuses
+// inside a successful api-call remain upstream evidence in the sample.
+type managementHTTPError struct{ status int }
+
+func (e *managementHTTPError) Error() string {
+	return fmt.Sprintf("management_http_%d: CPA management request failed", e.status)
+}
+
+type queryFailure struct {
+	Code           string `json:"code"`
+	Message        string `json:"message"`
+	Source         string `json:"source"`
+	Retryable      bool   `json:"retryable"`
+	OutcomeUnknown bool   `json:"outcome_unknown"`
+}
+
+func describeFailure(err error, method string) (queryFailure, int) {
+	code, status := classifyError(err)
+	f := queryFailure{Code: code, Message: scrubError(err), Source: "business"}
+	switch {
+	case strings.HasPrefix(code, "management_"), strings.HasPrefix(code, "connection_"), code == "deployment_key_invalid":
+		f.Source = "backend_management"
+	case code == "sdk_unavailable":
+		f.Source = "sdk"
+	case code == "unavailable":
+		f.Source = "plugin"
+	}
+	f.OutcomeUnknown = method != http.MethodGet && (code == "management_uncertain" || code == "connection_save_unknown")
+	if method == http.MethodGet {
+		switch code {
+		case "management_rate_limited", "management_network", "management_unavailable", "management_temporarily_banned", "management_invalid_response", "sdk_unavailable", "unavailable":
+			f.Retryable = true
+		}
+	}
+	return f, status
+}
+
 // classifyError accepts an explicit service code, never incidental text in a message.
 func classifyError(err error) (string, int) {
 	statuses := map[string]int{
+		"command_not_accepted":                http.StatusNotFound,
+		"snapshot_expired":                    http.StatusConflict,
 		"sdk_unavailable":                     http.StatusServiceUnavailable,
 		"management_key_invalid":              http.StatusUnprocessableEntity,
 		"management_temporarily_banned":       http.StatusServiceUnavailable,
 		"management_restricted":               http.StatusServiceUnavailable,
 		"management_rate_limited":             http.StatusTooManyRequests,
+		"management_invalid_response":         http.StatusBadGateway,
 		"management_network":                  http.StatusServiceUnavailable,
 		"management_unavailable":              http.StatusServiceUnavailable,
 		"management_session_required":         http.StatusServiceUnavailable,

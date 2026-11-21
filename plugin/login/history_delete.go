@@ -69,32 +69,6 @@ func (s *Service) DeleteJob(id string, revision uint64) error {
 		return errors.New("storage_unavailable")
 	}
 	s.jobs[id] = &session{record: deleted}
+	s.detailQueries.forget(id)
 	return nil
-}
-
-// Select the visible record without replaying older login outcomes on the account.
-func (s *Service) visibleAccountJob(accountID, lastID string) Job {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	last := s.jobs[lastID]
-	if last == nil {
-		return Job{}
-	}
-	if !last.record.HistoryDeleted {
-		return last.record.View
-	}
-	var latest *session
-	for _, job := range s.jobs {
-		r := job.record
-		if r.HistoryDeleted || r.View.AccountID != accountID {
-			continue
-		}
-		if latest == nil || newerAccountJob(r, latest.record) {
-			latest = job
-		}
-	}
-	if latest != nil {
-		return latest.record.View
-	}
-	return Job{}
 }

@@ -29,7 +29,7 @@ async function main() {
     const screenshot = (page, name) => out && page.screenshot({ path: path.join(out, name + '.png'), animations: 'disabled' });
     async function scenario(name, interact) {
       const context = await browser.newContext({ viewport: { width: 1440, height: 900 }, reducedMotion: 'reduce' });
-      const page = await context.newPage();
+      let page = await context.newPage();
       page.setDefaultTimeout(6000);
       const tasks = new Map(), reads = [], posts = [], cancels = [], errors = [];
       const control = {};
@@ -85,12 +85,13 @@ async function main() {
             return route.fulfill({ json: { ...run, status: 'running' } });
           }
           if (key) {
+            if (control.generic404) return route.fulfill({status:404, json:{code:'not_found',error:'missing route'}});
             if (control.failReceiptReads) {
               control.failReceiptReads--;
               return route.fulfill({ status: 503, json: { error: { code: 'unavailable', message: 'Synthetic read failure' } } });
             }
             const found = tasks.get(key);
-            return route.fulfill(found ? { json: found } : { status: 404, json: { error: { code: 'not_found', message: 'No synthetic run' } } });
+            return route.fulfill(found ? { json: found } : { status: 404, json: { error: { code: 'command_not_accepted', message: 'No synthetic run' } } });
           }
           const manual = [...tasks.values()].find(run => run.id === id);
           if (manual) return route.fulfill({ json: manual });
@@ -118,7 +119,15 @@ async function main() {
           await page.selectOption('#question', 'logic-candy');
         }
         await configure();
-        results[name] = await interact({ page, tasks, reads, posts, cancels, control, configure });
+        async function reopen() {
+          await page.close();
+          page = await context.newPage(); page.setDefaultTimeout(6000);
+          page.on('pageerror', e => errors.push(e.message));
+          await page.goto(origin + '/#manual');
+          await page.waitForSelector('body.connected');
+          return page;
+        }
+        results[name] = await interact({ page, tasks, reads, posts, cancels, control, configure, reopen });
         assert.deepEqual(errors, []);
       } finally { await context.close(); }
     }
@@ -269,8 +278,12 @@ async function main() {
         await page.waitForSelector('#run-submit:not([aria-busy="true"])');
         assert.equal(posts.length, 0);
         if (order === 'latest_failure') {
-          assert(await submit(page).isDisabled());
+          assert(await submit(page).isEnabled(), 'A prior exact selection can retry the current directory');
           assert.match(await page.locator('#target-summary').innerText(), /读取失败/);
+          control.targetState = {};
+          await submit(page).click();
+          await page.waitForFunction(() => document.querySelector('#run-frozen-data').textContent.includes('manual-1'));
+          assert.equal(posts.length, 1, 'Only an explicit retry with a successful fresh directory may submit');
         } else assert.match(await page.locator('#target-summary').innerText(), /停用/);
         return { posts: posts.length, newestReadControlsAdmission: true, responseOrder: order };
       });
@@ -324,11 +337,13 @@ async function main() {
       await page.click('[data-run=fixture-run-visual]');
       await control.hold.entered.promise;
       const pollDuringHistoryRead = page.waitForRequest(r => r.url().endsWith('/runs/detail?id=manual-1'), { timeout: 3500 }).then(() => true, () => false);
+      const trackedDuringHistory = await pollDuringHistoryRead;
       await page.click('[data-page=operations]');
+      const manualPollsOnLeave = reads.filter(id => id === 'manual-1').length;
       await page.click('#operations-history [data-run=fixture-run-observation]');
       await page.waitForSelector('#quality-detail-export:visible');
       const initialDownload = await download(page, '#quality-detail-export');
-      const trackedDuringHistory = await pollDuringHistoryRead;
+      assert.equal(reads.filter(id => id === 'manual-1').length, manualPollsOnLeave, 'A hidden manual workspace issues no new display polls');
       await page.keyboard.press('Escape');
       await page.click('#operations-history [data-run=fixture-run-observation-error]');
       await page.waitForSelector('#quality-detail-export:visible');
@@ -360,11 +375,27 @@ async function main() {
       const afterReconnect = await selected(page);
       return { posts: posts.length, distinctKeys: new Set(posts).size, admitted: tasks.size, recovered, afterReconnect, reads };
     });
-    await scenario('missing_receipt', async ({ page, reads, posts, tasks, control }) => {
+    await scenario('closed_last_tab', async ({ page, posts, tasks, control, reopen }) => {
+      control.loseAck = true;
+      control.generic404 = true;
+      const lost = page.waitForEvent('requestfailed', r => r.method() === 'POST' && r.url().endsWith('/runs'));
+      await submit(page).click(); await lost;
+      page = await reopen();
+      await page.locator('#manual-config-summary').filter({hasText:'正在核对上次提交'}).waitFor();
+      assert(await submit(page).isDisabled(), 'A generic proxy 404 cannot authorize another submission');
+      await page.locator('#run-form').evaluate(form => form.requestSubmit());
+      assert.equal(posts.length,1);
+      control.generic404 = false;
+      await page.waitForFunction(() => document.querySelector('#run-frozen-data').textContent.includes('manual-1'));
+      assert.equal(posts.length,1); assert.equal(tasks.size,1);
+      return {lastTabClosed:true, recovered:await selected(page), posts:posts.length, admitted:tasks.size, generic404Resubmissions:0};
+    });
+    await scenario('missing_receipt', async ({ page, reads, posts, tasks, control, reopen, configure }) => {
       control.dropBeforeAdmission = true;
       const lost = page.waitForEvent('requestfailed', { predicate: request => request.method() === 'POST' && request.url().endsWith('/runs') });
       await submit(page).click();
       await lost;
+      page = await reopen(); await configure();
       await page.waitForSelector('#run-submit:enabled');
       const beforeRetry = [...reads];
       await submit(page).click();

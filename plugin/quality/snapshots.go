@@ -68,6 +68,7 @@ func cloneRule(rule *Rule) *Rule {
 	if rule.PendingSchedule != nil {
 		pending := *rule.PendingSchedule
 		pending.Accepted = slices.Clone(pending.Accepted)
+		pending.WaitingLogins = maps.Clone(pending.WaitingLogins)
 		out.PendingSchedule = &pending
 	}
 	return &out

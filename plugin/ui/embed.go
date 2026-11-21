@@ -7,5 +7,5 @@ import "embed"
 
 // Files contains static assets only; it does not contain credentials or state.
 //
-//go:embed index.html app.js client.js view.js login.js style.css
+//go:embed index.html app.js client.js view.js login.js style.css workspace.js commands.js conversion.js markup.js
 var Files embed.FS

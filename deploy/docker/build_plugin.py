@@ -42,5 +42,5 @@ checksums = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in (librar
     'go_version': subprocess.check_output(['go', 'version'], text=True).strip(),
     'checksums': checksums,
     'ui_version': json.loads((ROOT / 'plugin/ui/index.html').read_text().split('<script type="application/json" id="build-info">', 1)[1].split('</script>', 1)[0])['ui_version'],
-    'ui_source_sha256': {name: hashlib.sha256((ROOT / 'plugin/ui' / name).read_bytes()).hexdigest() for name in ('index.html', 'style.css', 'app.js', 'client.js', 'view.js', 'login.js')},
+    'ui_source_sha256': {name: hashlib.sha256((ROOT / 'plugin/ui' / name).read_bytes()).hexdigest() for name in json.loads((ROOT / 'plugin/ui/public_assets.json').read_text())},
 }, indent=2) + '\n')

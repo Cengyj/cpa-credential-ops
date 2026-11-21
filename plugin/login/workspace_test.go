@@ -124,7 +124,7 @@ func TestReauthorizationRefusesUnreadableOrReplacedWorkspaceBeforeRuntime(t *tes
 			_, err = s.Start(r)
 			code := "identity_changed"
 			if mode == "unreadable" {
-				code = "storage_unavailable"
+				code = "cpa_credential_unavailable"
 			}
 			if err == nil || err.Error() != code || runtimeCalls.Load() != 1 || h.saves != 1 {
 				t.Fatalf("changed workspace started an unpinned login: %v", err)

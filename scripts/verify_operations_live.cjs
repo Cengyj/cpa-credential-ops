@@ -82,7 +82,10 @@ async function main() {
     rows[0].status = 'running';
     target = {...target, manual_disabled:false, runtime_status:'registered', effective_available:true};
     tokens = 42; rule.next_run_local = '2026-11-21T08:15:00+08:00';
+    const idleReads = query().length;
     await tick(5100);
+    assert.equal(query().length, idleReads, 'idle workspace used the active-task polling interval');
+    await tick(10100);
     await el('[data-run=admitted-after-timer]').waitFor();
     await displays('#metrics', '42'); await displays('#rules-list', '08:15:00');
     assert(await el('[data-run=row-0]').evaluate(node => node === document.activeElement));
@@ -105,9 +108,9 @@ async function main() {
     let entered, release;
     const pending = new Promise(resolve => { entered = resolve; });
     hold = {enter:entered,wait:new Promise(resolve => { release=resolve; })};
-    await tick(5100); await pending;
-    const blocked = reads.length;
-    await tick(10200); assert.equal(reads.length, blocked);
+    await tick(15100); await pending;
+    const blocked = query().length;
+    await tick(16100); assert.equal(query().length, blocked);
     await el('#ops-all-rules').click(); await displays('#ops-batch-summary', '1–20 / 23');
     release(); await page.waitForTimeout(100);
     assert.equal(await el('#ops-scope-label').textContent(), '全部规则');
@@ -119,14 +122,14 @@ async function main() {
     await tick(5100);
     assert(await el('#quality-detail[open]').isVisible());
     await el('[data-close=quality-detail]').click();
-    failActivity = true; await tick(5100);
+    failActivity = true; await tick(15100);
     await el('#activity-read-note:not([hidden])').waitFor();
     assert(await el('[data-run=admitted-after-timer]').isVisible());
     await tick(12500); await el('#activity-read-note').waitFor({state:'hidden'});
 
     const invisible = async (hide, resume) => {
       await hide(); await page.waitForTimeout(120);
-      const at = query().length; await tick(12500);
+      const at = query().length; await tick(16100);
       assert.equal(query().length, at);
       await resume();
       await page.waitForFunction(() => document.querySelector('iframe')?.contentDocument?.querySelector('#ops-record-count'));
@@ -154,8 +157,8 @@ async function main() {
     await page.getByRole('link',{name:'Credential Ops'}).click(); await el('body.connected').waitFor();
     await el('[data-page=operations]').click(); await el('[data-run=host-return]').waitFor();
     const resumed = query().length;
-    await tick(5100); assert.equal(query().length, resumed + 1);
-    failTargets = true; await tick(5100);
+    await tick(15100); assert.equal(query().length, resumed + 1);
+    failTargets = true; await tick(15100);
     assert(await el('#run-submit').isDisabled());
     assert.match(await el('#target-summary').textContent(), /读取失败/);
     assert.doesNotMatch(await el('#target-summary').textContent(), /停用|错误策略/);

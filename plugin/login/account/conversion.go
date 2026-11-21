@@ -22,9 +22,14 @@ var errConversionIdentity = errors.New("duplicate_identity")
 // ImportConverted only creates new files. Receipts consume an identity before
 // the host write, so a lost response or restart cannot silently repeat a save.
 func (m *Manager) ImportConverted(ctx context.Context, item conversion.Item, guard func() error, prepare func(context.Context, string, string) error) (LoginCommitResult, error) {
+	return m.ImportConvertedForCommand(ctx, item, "", guard, prepare)
+}
+
+// CommandRef links this exact batch to the durable SDK receipt across databases.
+func (m *Manager) ImportConvertedForCommand(ctx context.Context, item conversion.Item, commandRef string, guard func() error, prepare func(context.Context, string, string) error) (LoginCommitResult, error) {
 	m.commitMu.Lock()
 	defer m.commitMu.Unlock()
-	result := LoginCommitResult{CommitID: "conversion:" + conversion.Identity(item), AuthID: item.Filename, Principal: conversion.Identity(item), State: "aborted"}
+	result := LoginCommitResult{CommandRef: commandRef, CommitID: "conversion:" + conversion.Identity(item), AuthID: item.Filename, Principal: conversion.Identity(item), State: "aborted"}
 	if item.Status != "ready" || item.Credential == nil || item.Filename == "" {
 		return result, errors.New("invalid_request")
 	}

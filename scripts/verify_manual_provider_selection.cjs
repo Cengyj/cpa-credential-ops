@@ -21,7 +21,7 @@ const northTwo = provider('north-route-two', 'north-02', 'north-executor', '北�
 const west = provider('west-route', 'west-03', 'west-executor', '西岭云', [shared, 'west-only']);
 const question = { id: 'logic-candy', title: '糖果逻辑题', kind: 'logic', prompt: '共有多少颗糖？', answer: '21' };
 const out = process.env.UI_OUTPUT;
-const assets = ['index.html','style.css','app.js','view.js','login.js','client.js'];
+const assets = require('../plugin/ui/public_assets.json');
 
 async function test() {
   const fixture = spawn(process.execPath,[path.join(__dirname,'login_ui_fixture.cjs')],{stdio:['ignore','pipe','inherit']});
@@ -35,6 +35,7 @@ async function test() {
     const context = await browser.newContext({viewport:{width:1440,height:900},timezoneId:'Asia/Shanghai',reducedMotion:'reduce'});
     const page = await context.newPage();
     page.setDefaultTimeout(6000);
+    let statusWaiting = true;
     let targets = [northOne,account,west,northTwo], settingsFail = false, targetReads = 0;
     const runs = [], receipts = [], posted = [], captures = [], errors = [], unexpected = [], hashes = [];
     const finish = run => {
@@ -54,6 +55,7 @@ async function test() {
       }
       if(!u.pathname.startsWith(prefix+'/')) return route.continue();
       assert.equal(r.headers().authorization,'Bearer '+info.management_key);
+      if(api==='/connection' && statusWaiting) return route.fulfill({json:{state:'waiting', revision:3, configured:true, can_migrate:false}});
       if(api==='/targets'){targetReads++;return route.fulfill({json:{items:targets,offset:0,total:targets.length}});}
       if(api==='/settings'){
         if(settingsFail)return route.fulfill({status:503,json:{error:{message:'模拟设置读取失败'}}});
@@ -62,6 +64,10 @@ async function test() {
       if(api==='/runs' && r.method()==='POST'){
         const config = r.postDataJSON(), target = targets.find(t=>t.auth_id===config.auth_id);
         posted.push(config);
+        if (target?.is_provider && statusWaiting) {
+          assert.equal(posted.filter(p => p.expected_object_type === 'provider').length, 1);
+          statusWaiting = false;
+        }
         const frozen = { ...config, question, provider_name: target?.provider_name, subject_auth_index: target?.is_provider ? target.auth_index : undefined };
         if (!runs.length && target?.is_provider) {
           // Earlier releases saved only the provider name and subject index for reruns.
@@ -296,6 +302,7 @@ async function test() {
         await snap(theme,width);
       }
     }
+    assert.equal(statusWaiting, false, 'An exact route is readmitted after a fresh directory despite a stale waiting status');
     assert.deepEqual(errors,[]);assert.deepEqual(unexpected,[]);assert.equal(posted.length,5);
     const ui_source_sha256=Object.fromEntries(await Promise.all(hashes));assert.deepEqual(Object.keys(ui_source_sha256).sort(),assets.sort());
     const version=JSON.parse(await el('#build-info').textContent()).ui_version;

@@ -7,7 +7,8 @@ const source = fs.readFileSync(path.join(__dirname, '../../plugin/ui/login.js'),
   .replace(/^import .*;$/gm, '').replace(/^export /gm, '');
 const context = vm.createContext({ URL, Set, Map, Error });
 const viewSource = fs.readFileSync(path.join(__dirname, '../../plugin/ui/view.js'), 'utf8');
-const viewHelpers = viewSource.slice(0, viewSource.indexOf('export const items'))
+const markup = fs.readFileSync(path.join(__dirname, '../../plugin/ui/markup.js'), 'utf8');
+const viewHelpers = markup.slice(0, markup.indexOf('export const previewLimit'))
   + viewSource.slice(viewSource.indexOf('export const date'), viewSource.indexOf('export const duration'));
 new vm.Script(viewHelpers.replace(/^export /gm, '') + source + '\nthis.logs = { logEntrySummary, filterLogEntries, logInterval, logTiming, logRetention, buildLogReport, logReportText, diagnosticAdvice, projectLogEntry, renderLogEntries, filterTaskJobs };').runInContext(context);
 const { logEntrySummary, filterLogEntries, logInterval, logTiming, logRetention, buildLogReport, logReportText, diagnosticAdvice, projectLogEntry, renderLogEntries, filterTaskJobs } = context.logs;

@@ -115,6 +115,7 @@
     </section>
     <section id="manual-history" class="hidden" aria-label="测试记录" tabindex="0">
       <h2 class="sr-only">测试记录</h2>
+      <div id="manual-command-note" class="field-note" role="status" hidden></div>
       <p id="history-read-note" class="quality-read-note" role="status" hidden>测试记录读取失败，以下为上次读取的页面。可再次翻页或刷新。</p>
       <div id="history-list" class="history-list"><p class="empty-line">连接管理接口后查看测试记录。</p></div>
     </section>
@@ -148,6 +149,7 @@
           <p id="rules-read-note" class="quality-read-note" role="status" hidden></p>
           <button id="ops-all-rules" class="quality-all-rules" type="button" aria-pressed="true"><svg class="control-icon" viewBox="0 0 20 20" aria-hidden="true"><rect x="3" y="3" width="5" height="5" rx="1"/><rect x="12" y="3" width="5" height="5" rx="1"/><rect x="3" y="12" width="5" height="5" rx="1"/><rect x="12" y="12" width="5" height="5" rx="1"/></svg>全部规则<span id="ops-all-count">—</span></button>
           <div id="rules-list" class="quality-rule-list" tabindex="0" role="region" aria-label="检测规则列表"></div>
+          <div id="rule-command-note" class="field-note" role="status" hidden></div>
           <footer class="quality-panel-footer"><span id="rule-summary" role="status">尚未读取检测规则</span><span id="rule-timed-count"></span></footer>
         </section>
         <section id="ops-activity" class="quality-panel" aria-labelledby="activity-title" tabindex="-1">
@@ -301,6 +303,8 @@
               </div>
             </div>
             <p id="account-action-error" class="field-error" role="alert" hidden></p>
+            <div id="account-batch-note" class="field-note" role="status" hidden></div>
+            <div id="account-command-note" class="field-note" role="status" hidden></div>
             <p id="account-list-summary" class="field-note" role="status" hidden></p>
             <div id="account-table-wrap" class="table-scroll account-table-wrap hidden"><table class="account-table" aria-label="OpenAI 账号"><thead><tr><th scope="col">账号</th><th scope="col">CPA 状态</th><th scope="col">最近操作</th><th scope="col" class="account-actions-heading">操作</th></tr></thead><tbody id="account-list"></tbody></table></div>
             <div id="account-empty" class="account-empty"><div class="account-empty-symbol" aria-hidden="true"><svg viewBox="0 0 48 48"><rect x="7" y="10" width="34" height="28" rx="4"/><circle cx="18" cy="21" r="4"/><path d="M11 32c1-6 13-6 14 0M29 19h7M29 25h7M29 31h4"/></svg></div><div><h3>添加你的 OpenAI 账号</h3><p>点击 2FA 登录，成功后自动保存并启用 CPA 凭证。</p><div class="account-format"><span>每行一个账号</span><code>邮箱----密码----2FA</code></div><button id="account-import-empty" type="button" class="subtle" disabled>开始导入</button><p class="field-note">导入只保存资料，不会自动登录。</p></div></div>
@@ -603,5 +607,5 @@
         referrerpolicy="no-referrer"
       ></iframe>
     </dialog>
-<script type="application/json" id="build-info">{"application":"model-quality","ui_version":"13.8.0"}</script>
+<script type="application/json" id="build-info">{"application":"model-quality","ui_version":"14.0.2"}</script>
 </body></html>
