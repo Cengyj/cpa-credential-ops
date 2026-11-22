@@ -154,7 +154,9 @@ const reasonLabels = {
   cancelled: '测试已取消',
   'context canceled': '测试已取消',
   queue_full: '队列容量不足，本轮未入队。',
-  budget_exhausted: '调用预算已用尽，本轮未执行。',
+  budget_exhausted: '当时的调用预算不足，记录未区分具体上限。',
+  token_budget_exhausted: '当日 token 预算不足，未发起这次模型调用。',
+  'storage_limit: retention or archival required': '插件存储达到容量上限，后续调用已停止。已记录的样本可在历史中查看，请清理或归档历史后再提交。',
   official_host_evidence_unavailable: '当前宿主未提供可验证的最终执行条件，本次结果仅供观察。',
   retained_pause_unverified: '历史暂停归属待核对',
   management_probe_not_business_payload: '本次使用 CPA 管理接口检测指定凭证。',
@@ -175,6 +177,7 @@ const reasonLabels = {
   'incomplete SSE frame': '流式响应在单帧接收完成前结束，回答可能不完整。',
   'premature stream EOF': '流式响应提前结束，未确认回答完整完成。',
   'judge budget exhausted': '独立判题预算不足，无法判定',
+  judge_token_budget_exhausted: '当日 token 预算不足，未发起独立判题调用。',
   'judge execution failed': '独立判题执行失败，无法判定',
   'invalid judge JSON': '独立判题未返回有效 JSON，无法判定',
   'judge must return an object': '独立判题未返回 JSON 对象，无法判定',
@@ -464,6 +467,8 @@ export function renderHistoryResult(run) {
   if (run.pruned_samples > 0) add(`已裁剪 ${run.pruned_samples}`);
   else if (!active(run) && !counts.size) add(run.answer_preview ? '有回答，判定未记录' : '未取得回答');
   else if (!active(run) && coverage.finished && coverage.planned > coverage.finished) add(`缺少 ${coverage.planned - coverage.finished} 份回答`);
+  const reason = run.error || run.block_reason;
+  if (['token_budget_exhausted', 'budget_exhausted', 'storage_limit: retention or archival required'].includes(reason)) add(reasonLabel(reason), 'warn');
   const outcome = `<span class="history-outcome" aria-label="答题结果">${facts.join('')}</span>`;
   const preview = run.answer_preview;
   if (!preview) return outcome;
@@ -822,7 +827,22 @@ function renderAbsentSample(model, ordinal, isActive, pruned, unlocated, { simpl
   return `<article class="sample sample-pending" data-key="slot:${ordinal}" data-model="${escapeHTML(model)}" data-sample="${ordinal}"><div class="sample-heading" data-part="heading"><span class="sample-model-label" title="${escapeHTML(model)}">${escapeHTML(model)}</span><h4 class="sample-title"><span class="sample-number" aria-hidden="true">${String(ordinal + 1).padStart(2, '0')}</span><span>${simple ? '回答' : '样本'} ${ordinal + 1}</span></h4>${tag(status, isActive || pruned || unlocated ? 'neutral' : 'warn')}</div><p class="empty-line" data-part="pending">${reason}</p></article>`;
 }
 
-export function renderRunEvidence(run = {}, { qualityDetail = false } = {}) {
+const samplesPerPage = 16;
+export function sampleWindow(count, offset = 0) {
+  count = Number.isSafeInteger(count) && count > 0 ? count : 1;
+  const ordinal = Number.isSafeInteger(offset) ? Math.max(0, Math.min(offset, count - 1)) : 0;
+  const start = ordinal - ordinal % samplesPerPage;
+  return { start, end: start + Math.min(count - start, samplesPerPage), count };
+}
+function sampleNavigation({ start, end, count }) {
+  if (count <= samplesPerPage) return '';
+  return `<nav class="sample-pages" aria-label="样本分页" data-key="sample-pages"><span>样本 ${start + 1}–${end} / ${count}</span>
+    <button type="button" class="subtle small" data-sample-offset="${Math.max(0, start - samplesPerPage)}" ${start === 0 ? 'disabled' : ''}>上一页</button>
+    <button type="button" class="subtle small" data-sample-offset="${end}" ${end === count ? 'disabled' : ''}>下一页</button>
+    <label>样本序号<input type="text" inputmode="numeric" data-sample-ordinal></label><button type="button" class="subtle small" data-sample-jump>跳转</button></nav>`;
+}
+
+export function renderRunEvidence(run = {}, { qualityDetail = false, sampleOffset = 0 } = {}) {
   const config = run.config || {};
   const skip = admissionEvidence(run);
   const identity = frozenRunIdentity(run);
@@ -834,7 +854,8 @@ export function renderRunEvidence(run = {}, { qualityDetail = false } = {}) {
   const isActive = active(run);
   const plannedModels = new Set(config.models?.length ? config.models : samples.map(sampleModel));
   const models = [...new Set([...plannedModels, ...samples.map(sampleModel)])];
-  const count = Number.isInteger(config.samples) && config.samples > 0 ? config.samples : 1;
+  const window = sampleWindow(config.samples, sampleOffset);
+  const count = window.count;
   const planned = plannedModels.size * count;
   const inPlan = sample => plannedModels.has(sampleModel(sample)) && Number.isInteger(sample.index) && sample.index >= 0 && sample.index < count;
   const completed = new Set(samples.filter(s => inPlan(s) && completedSample(s)).map(s => JSON.stringify([sampleModel(s), s.index]))).size;
@@ -845,7 +866,7 @@ export function renderRunEvidence(run = {}, { qualityDetail = false } = {}) {
   const verdictSummary = [correct && `正确 ${correct}`, incorrect && `答错 ${incorrect}`, unknown && `无法判断 ${unknown}`].filter(Boolean).join(' · ');
   const reference = config.judge?.mode === 'deterministic' && config.question?.answer;
   const issue = run.error || run.block_reason || (manual && skip?.reason);
-  const issueHTML = issue ? `<p class="notice${run.error || run.block_reason ? ' error' : ''}">${escapeHTML(manual ? manualIssueLabel(issue) : issue)}</p>` : '';
+  const issueHTML = issue ? `<p class="notice${run.error || run.block_reason ? ' error' : ''}">${escapeHTML(manual ? manualIssueLabel(issue) : reasonLabel(issue))}</p>` : '';
   const timestamp = date(run.created_at);
   const questionHeader = manual
     ? `<h3 class="answer-question">${escapeHTML(questionTitle(config.question, config.question_id))}</h3>
@@ -868,9 +889,19 @@ export function renderRunEvidence(run = {}, { qualityDetail = false } = {}) {
   const groups = models.map(model => {
     const entries = retained.filter(({ sample }) => sampleModel(sample) === model);
     const plannedCount = plannedModels.has(model) ? count : 0;
-    const slots = Array.from({ length: plannedCount }, (_, ordinal) => entries.filter(({ sample }) => sample.index === ordinal));
-    const content = slots.map((records, ordinal) => {
-      const removed = prunedSlots.some(s => s.model === model && s.index === ordinal);
+    // Index only recorded evidence. A large plan has at most one page of placeholder elements.
+    const occupied = new Set(), visible = new Map();
+    for (const entry of entries) {
+      const ordinal = entry.sample.index;
+      if (!inPlan(entry.sample)) continue;
+      occupied.add(ordinal);
+      if (ordinal < window.start || ordinal >= window.end) continue;
+      if (!visible.has(ordinal)) visible.set(ordinal, []);
+      visible.get(ordinal).push(entry);
+    }
+    const removedIndices = new Set(prunedSlots.filter(s => s.model === model && s.index >= window.start && s.index < window.end).map(s => s.index));
+    const content = Array.from({ length: plannedCount ? window.end - window.start : 0 }, (_, relative) => {
+      const ordinal = window.start + relative, records = visible.get(ordinal) || [], removed = removedIndices.has(ordinal);
       if (!records.length) return renderAbsentSample(model, ordinal, isActive, removed, unlocated, sampleOptions);
       return records.map(({ sample, recordIndex }) => renderAnswer(sample, recordIndex, ordinal, isActive, {
         ...sampleOptions, annotation: records.length > 1 || removed ? `序号重复 · 原记录 ${recordIndex + 1}` : '',
@@ -879,25 +910,29 @@ export function renderRunEvidence(run = {}, { qualityDetail = false } = {}) {
     const extras = entries.filter(({ sample }) => !inPlan(sample)).map(({ sample, recordIndex }) => renderAnswer(sample, recordIndex, sample.index, isActive, {
       ...sampleOptions, annotation: `计划外记录 · 原记录 ${recordIndex + 1}`,
     })).join('');
-    const occupied = slots.filter(records => records.length).length;
-    const summary = plannedCount ? `${occupied} / ${plannedCount} 份结果${occupied === entries.length ? '' : ` · 保留 ${entries.length} 条记录`}` : `计划外模型 · 保留 ${entries.length} 条记录`;
+    const summary = plannedCount ? `${occupied.size} / ${plannedCount} 份结果${occupied.size === entries.length ? '' : ` · 保留 ${entries.length} 条记录`}` : `计划外模型 · 保留 ${entries.length} 条记录`;
     return `<section class="model-result" data-key="${escapeHTML(`model:${model}`)}" data-model="${escapeHTML(model)}"><div class="model-heading" data-part="model-heading"><div class="model-identity"><h3 title="${escapeHTML(model)}">${escapeHTML(model)}</h3><span>${summary}</span></div><button type="button" class="text-button model-copy" data-copy-model="${escapeHTML(model)}" aria-label="复制模型 ID ${escapeHTML(model)}">复制 ID</button></div>${content}${extras}</section>`;
   }).join('');
-  const controlHTML = run.controls?.length ? `<details class="control-results" data-key="controls"><summary>同批对照 · ${run.controls.length} 份结果</summary><p class="field-note">只有身份不同、同题、同模型映射、同有效条件的通过样本才构成有效对照。</p><div class="comparison-grid">${run.controls.map((sample, index) => `<section class="model-result" data-key="${escapeHTML(`control-model:${index}:${sample.model || '模型未知'}`)}"><div class="model-heading" data-part="model-heading"><h3>${escapeHTML(sample.model || '模型未知')}</h3><span>对照凭证</span></div>${renderAnswer(sample, index, sample.index ?? index, isActive, { control: true, qualityDetail })}</section>`).join('')}</div></details>` : '';
+  const visibleControls = run.controls?.flatMap((sample, index) => {
+    const ordinal = sample.index ?? index;
+    if (ordinal >= 0 && ordinal < count ? ordinal < window.start || ordinal >= window.end : window.start !== 0) return [];
+    return [`<section class="model-result" data-key="${escapeHTML(`control-model:${index}:${sample.model || '模型未知'}`)}"><div class="model-heading" data-part="model-heading"><h3>${escapeHTML(sample.model || '模型未知')}</h3><span>对照凭证</span></div>${renderAnswer(sample, index, ordinal, isActive, { control: true, qualityDetail })}</section>`];
+  });
+  const controlHTML = run.controls?.length ? `<details class="control-results" data-key="controls"><summary>同批对照 · ${run.controls.length} 份结果</summary><p class="field-note">只有身份不同、同题、同模型映射、同有效条件的通过样本才构成有效对照。</p><div class="comparison-grid">${visibleControls.join('') || '<p class="field-note">本页没有留存的对照样本。</p>'}</div></details>` : '';
   return {
     metaHTML,
     conditionsHTML: renderFrozenConditions(run, credentialLabel),
-    samplesHTML: `<div class="comparison-grid${simple ? ` question-test-results${models.length === 1 ? ' single-question' : ''}` : ''}" data-key="models">${groups || '<p class="empty-line">本轮没有记录模型或样本。</p>'}</div>${controlHTML}`,
+    samplesHTML: `${sampleNavigation(window)}<div class="comparison-grid${simple ? ` question-test-results${models.length === 1 ? ' single-question' : ''}` : ''}" data-key="models">${groups || '<p class="empty-line">本轮没有记录模型或样本。</p>'}</div>${controlHTML}`,
     completed,
     planned,
   };
 }
 
-export function renderQualityDetail(run, rules) {
+export function renderQualityDetail(run, rules, { sampleOffset = 0 } = {}) {
   const config = run.config || {};
   const ruleID = run.rule_id || config.rule_id;
   const ruleName = rules.find(rule => rule.id === ruleID)?.name || ruleID || '规则检测';
-  const { conditionsHTML, samplesHTML, completed, planned } = renderRunEvidence(run, { qualityDetail: true });
+  const { conditionsHTML, samplesHTML, completed, planned } = renderRunEvidence(run, { qualityDetail: true, sampleOffset });
   const skip = admissionEvidence(run);
   const identity = frozenRunIdentity(run);
   const label = qualityIdentityLabel(identity);

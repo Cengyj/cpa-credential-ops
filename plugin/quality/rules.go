@@ -566,6 +566,7 @@ func (en *Engine) DeleteRule(ctx context.Context, id string, rev uint64) error {
 		}
 	}
 	drop := make(map[string]bool)
+	_, unresolvedEvidence := en.ruleHistoryEvidenceLocked()
 	for _, run := range en.runs {
 		if run.Config.RuleID != id {
 			continue
@@ -573,7 +574,9 @@ func (en *Engine) DeleteRule(ctx context.Context, id string, rev uint64) error {
 		if run.CompletedAt == nil || en.active[run.ID] != nil {
 			return fmt.Errorf("conflict: 规则还有未结束的检测，请等待或取消后再删除。")
 		}
-		if !retainedRuns[run.ID] {
+		if unresolvedEvidence[run.ID] {
+			retainedRuns[run.ID] = true
+		} else if !retainedRuns[run.ID] {
 			drop[run.ID] = true
 		}
 	}
@@ -653,7 +656,8 @@ func RoundVerdict(r *Run) string {
 
 func roundVerdict(r *Run, hasEvidence func(*Sample) bool) string {
 	if r.Status != "completed" || r.Error != "" || r.BlockReason != "" || r.CancelRequested || r.UpstreamCondition != "" ||
-		len(r.Config.Models) == 0 || r.Config.Samples < 1 || len(r.Samples) != len(r.Config.Models)*r.Config.Samples {
+		len(r.Config.Models) == 0 || r.Config.Samples < 1 ||
+		len(r.Samples)/len(r.Config.Models) != r.Config.Samples || len(r.Samples)%len(r.Config.Models) != 0 {
 		return "unknown"
 	}
 	seen := make(map[string][]bool, len(r.Config.Models))

@@ -40,14 +40,14 @@ func TestPartialCountPruningKeepsControlsForUnreachedSubjects(t *testing.T) {
 		}
 		return got
 	}
-	en.cfg.DailyCalls = 6 // All four controls and both model-a subjects can finish.
+	en.cfg.DailyTokens = int64(6 * cfg.Parameters.MaxTokens) // All four controls and both model-a subjects can finish.
 	partial := runRound()
-	if partial.Error != "budget_exhausted" || len(partial.Controls) != 4 || len(partial.Samples) != 2 {
+	if partial.Error != "token_budget_exhausted" || len(partial.Controls) != 4 || len(partial.Samples) != 2 {
 		t.Fatalf("unexpected partial round: %s, %d controls, %d subjects", partial.Error, len(partial.Controls), len(partial.Samples))
 	}
 	tomorrow := en.now().Add(24 * time.Hour)
 	en.now = func() time.Time { return tomorrow }
-	en.cfg.DailyCalls = 8
+	en.cfg.DailyTokens = int64(8 * cfg.Parameters.MaxTokens)
 	complete := runRound()
 	if len(complete.Samples) != 4 || complete.Status != "completed" {
 		t.Fatal("expected a complete second round", complete.Status, len(complete.Samples))
@@ -98,8 +98,13 @@ func TestUnresolvedCredentialEvidenceSurvivesHistoryCleanup(t *testing.T) {
 			f := managementTestFixture(t)
 			f.answers["b"], f.statusFailure = "5", true
 			rule := f.rule(t, disableCredential, true, true)
+			rule.MaxResults = 1
+			rule, err := f.engine.SaveRule(t.Context(), *rule, true)
+			if err != nil {
+				t.Fatal(err)
+			}
 			runs, err := f.round(t, rule)
-			if err != nil || len(runs) != 1 || runs[0].ActionStatus != "credential_action_uncertain" {
+			if err != nil || len(runs) != 1 || runs[0].ActionStatus != "credential_action_uncertain" || len(runs[0].Samples) != 2 || runs[0].PrunedSamples != 0 {
 				t.Fatal("expected unconfirmed status write", runs, err)
 			}
 			owned := runs[0]
@@ -159,7 +164,7 @@ func TestRuleResultPolicyAndLegacyEdits(t *testing.T) {
 	if r.MaxResults != 100 || r.RetentionDays != 0 || r.Parameters.ReasoningEffort != "high" {
 		t.Fatal("new rule defaults", r)
 	}
-	for _, count := range []int{-1, 1, 201} {
+	for _, count := range []int{-1, 201} {
 		in := *r
 		in.MaxResults = count
 		if _, err := en.SaveRule(ctx, in, true); err == nil {
@@ -194,6 +199,224 @@ func TestRuleResultPolicyAndLegacyEdits(t *testing.T) {
 		if _, err := decodeRuleWrite([]byte(raw), false); err == nil {
 			t.Fatal("accepted invalid JSON limit", raw)
 		}
+	}
+	for _, count := range []int{0, 1, 200} {
+		in := *r
+		in.ID, in.Revision, in.MaxResults, in.Samples = "", 0, count, 101
+		saved, err := en.SaveRule(ctx, in, false)
+		want := count
+		if want == 0 {
+			want = 100
+		}
+		if err != nil || saved.MaxResults != want {
+			t.Fatalf("202 planned with history limit %d: %+v, %v", count, saved, err)
+		}
+	}
+}
+
+func TestLargeRoundUsesEveryAnswerBeforeTrimmingHistory(t *testing.T) {
+	f := managementTestFixture(t)
+	en := f.engine
+	rule := f.rule(t, disableCredential, true, true)
+	rule.Samples, rule.MaxResults = 101, 3
+	rule, err := en.SaveRule(t.Context(), *rule, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rule.MaxResults != 3 {
+		t.Fatalf("history limit increased to %d", rule.MaxResults)
+	}
+	// Every incorrect answer precedes the retained suffix. The decision
+	// needs all 202 positions including both models, even with a tiny window.
+	f.answers["a"] = "5"
+	runs, err := f.round(t, rule)
+	if err != nil || len(runs) != 1 {
+		t.Fatalf("dispatch: %d runs, error %v", len(runs), err)
+	}
+	id := runs[0].ID
+	verify := func(engine *Engine) {
+		t.Helper()
+		got, err := engine.Run(id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.Status != "completed" || got.ActionStatus != "credential_suspended" || len(got.Samples) != 3 || got.PrunedSamples != 199 || len(got.PrunedSlots) != 199 {
+			t.Fatalf("result %s/%s: %d retained, %d pruned, %d known slots", got.Status, got.ActionStatus, len(got.Samples), got.PrunedSamples, len(got.PrunedSlots))
+		}
+		for i, s := range got.Samples {
+			if s.Model != "b" || s.Index != 98+i || s.QualityVerdict != "correct" {
+				t.Fatalf("wrong retained position %s[%d] or verdict %s", s.Model, s.Index, s.QualityVerdict)
+			}
+		}
+		stats, err := engine.Metrics()
+		if err != nil || stats["correct"] != 3 || stats["incorrect"] != 0 || stats["covered"] != 3 || stats["planned"] != 3 || stats["coverage"] != 1.0 {
+			t.Fatalf("retained evidence metrics: %v, %v", stats, err)
+		}
+	}
+	verify(en)
+	if f.probes != 202 || len(f.patches) != 1 || !f.patches[0] || !f.entries["one"].Disabled {
+		t.Fatalf("decision did not use full round: %d fake probes, writes %v", f.probes, f.patches)
+	}
+	cfg := en.cfg
+	if err := en.Close(); err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := New(cfg, f.host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restarted.Close()
+	verify(restarted)
+	if err := restarted.Review(id, 198, "incorrect", "removed"); err == nil {
+		t.Fatal("review for a trimmed answer accepted after restart")
+	}
+	if err := restarted.Review(id, 199, "correct", "retained"); err != nil {
+		t.Fatal(err)
+	}
+	if f.probes != 202 || len(f.patches) != 1 || f.deletes != 0 {
+		t.Fatal("restart or history review replayed an external call")
+	}
+	t.Logf("2 models × 101 answers: %d fake probes, %d status write, 3 retained, 199 trimmed, 0 replayed after restart", f.probes, len(f.patches))
+}
+
+func TestRestartAfterDecisionBeforeHistoryTrim(t *testing.T) {
+	en, host, r := scopeFixture(t)
+	r.MaxResults, r.Samples = 2, 4
+	r, err := en.SaveRule(t.Context(), *r, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// This is the durable state between the decision and retention transactions.
+	now := en.now()
+	round := &Run{ID: "finished-before-trim", Source: "scheduled_probe", Status: "completed", CreatedAt: now,
+		CompletedAt: &now, ActionStatus: "observe_only", Config: Frozen{RuleID: r.ID, RunConfig: r.RunConfig}}
+	round.Config.AuthID = "fixture"
+	for _, model := range r.Models {
+		for i := range r.Samples {
+			round.Samples = append(round.Samples, Sample{Model: model, Index: i, ExecutionStatus: "completed", QualityVerdict: "correct"})
+		}
+	}
+	state := changes()
+	r.LastRun = round.ID
+	state.rules[r.ID], state.runs[round.ID] = r, round
+	if err := en.commitLocked(state); err != nil {
+		t.Fatal(err)
+	}
+	if err := en.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := New(en.cfg, en.host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	for range 2 {
+		if err := reopened.Prune(now); err != nil {
+			t.Fatal(err)
+		}
+		var stored Run
+		if err := reopened.store.Get("runs", round.ID, &stored); err != nil || stored.PrunedSamples != 6 || len(stored.PrunedSlots) != 6 || len(stored.Samples) != 2 || stored.Samples[0].Index != 2 || stored.ActionStatus != "observe_only" {
+			t.Fatalf("maintenance did not finish the existing trim: %+v, %v", stored, err)
+		}
+	}
+	if host.executeCalls+host.pauseCalls+host.releaseCalls != 0 {
+		t.Fatal("restoring the display window replayed an external operation")
+	}
+}
+
+func TestResultLimitIncludesLastDecisionAfterClockChanges(t *testing.T) {
+	for _, rewind := range []time.Duration{0, -time.Hour} {
+		t.Run(rewind.String(), func(t *testing.T) {
+			en, _, rule := scopeFixture(t)
+			now := en.now()
+			last := now.Add(rewind)
+			rule.MaxResults, rule.LastRun = 1, "a-latest-decision"
+			state := changes()
+			state.rules[rule.ID] = rule
+			for id, tm := range map[string]time.Time{rule.LastRun: last, "z-prior-decision": now} {
+				state.runs[id] = &Run{ID: id, Status: "completed", Source: "scheduled_probe", CompletedAt: &tm,
+					Config:  Frozen{RuleID: rule.ID, RunConfig: RunConfig{AuthID: "fixture", Models: []string{"a"}, Samples: 2}},
+					Samples: []Sample{{Model: "a", Index: 0}, {Model: "a", Index: 1}}}
+			}
+			if err := en.commitLocked(state); err != nil {
+				t.Fatal(err)
+			}
+			if err := en.pruneResultCountsLocked(rule.ID, "fixture"); err != nil {
+				t.Fatal(err)
+			}
+			got, err := en.Run(rule.LastRun)
+			if err != nil || len(en.runs) != 1 || len(got.Samples) != 1 || got.Samples[0].Index != 1 || got.PrunedSamples != 1 {
+				t.Fatalf("last committed decision did not fit original window: %d runs, last %+v, %v", len(en.runs), got, err)
+			}
+		})
+	}
+}
+
+func TestGroupEvidenceLivesThroughDecisionAndHistoryCleanup(t *testing.T) {
+	for _, outcome := range []string{"confirmed", "unconfirmed"} {
+		t.Run(outcome, func(t *testing.T) {
+			en, host, rule := retainedProviderGroup(t)
+			rule.Samples, rule.MaxResults = 2, 1
+			first := providerGroupRun(en, rule, host.snapshots["a"], "correct", "batch")
+			second := providerGroupRun(en, rule, host.snapshots["b"], "correct", "batch")
+			for _, run := range []*Run{first, second} {
+				run.Config.Samples = 2
+				next := run.Samples[0]
+				next.Index = 1
+				run.Samples = append(run.Samples, next)
+				run.Status = "running"
+			}
+			if outcome == "unconfirmed" {
+				host.writeErr = errors.New("offline write confirmation lost")
+			}
+			en.finish(first.ID, nil)
+			assertComplete := func(id string) {
+				t.Helper()
+				run := en.runs[id]
+				if run == nil || len(run.Samples) != 2 || run.PrunedSamples != 0 {
+					t.Fatalf("incomplete group evidence for %s", id)
+				}
+			}
+			assertComplete(first.ID)
+			if _, err := en.clearRuleHistory(); err != nil {
+				t.Fatal(err)
+			}
+			if err := en.Prune(en.now().AddDate(0, 0, 365)); err != nil {
+				t.Fatal(err)
+			}
+			assertComplete(first.ID)
+			en.finish(second.ID, nil)
+			if outcome == "confirmed" {
+				if len(host.writes) != 1 || host.writes[0] || en.runs[second.ID].ActionStatus != "credential_restored" {
+					t.Fatal("group decision missing", host.writes, en.runs[second.ID].ActionStatus)
+				}
+				for _, run := range []*Run{first, second} {
+					if got := en.runs[run.ID]; len(got.Samples) != 1 || got.PrunedSamples != 1 {
+						t.Fatal("completed group exceeded history window")
+					}
+				}
+				return
+			}
+			if en.runs[second.ID].ActionStatus != "credential_action_uncertain" {
+				t.Fatal("expected unconfirmed group write")
+			}
+			if err := en.DeleteRule(t.Context(), rule.ID, rule.Revision); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := en.clearRuleHistory(); err != nil {
+				t.Fatal(err)
+			}
+			if err := en.Prune(en.now().AddDate(0, 0, 365)); err != nil {
+				t.Fatal(err)
+			}
+			for _, run := range []*Run{first, second} {
+				assertComplete(run.ID)
+				var stored Run
+				if err := en.store.Get("runs", run.ID, &stored); err != nil || len(stored.Samples) != 2 {
+					t.Fatalf("orphaned group lost its persisted evidence: %s %v", run.ID, err)
+				}
+			}
+		})
 	}
 }
 
@@ -410,5 +633,34 @@ func TestManualRetentionAndRuleDeletion(t *testing.T) {
 	other, err = en.SaveRule(ctx, *other, true)
 	if err != nil || other.MaxResults != 10 {
 		t.Fatal(other, err)
+	}
+}
+
+func BenchmarkPruneLargePairedRound(b *testing.B) {
+	cfg := DefaultConfig()
+	store, err := OpenStore(b.TempDir(), cfg.MaxStorageBytes)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { _ = store.Close() })
+	const count = 4096
+	tm := time.Now().UTC()
+	round := &Run{ID: "round", Source: "scheduled_probe", Status: "completed", CompletedAt: &tm,
+		Config: Frozen{RuleID: "rule", RunConfig: RunConfig{AuthID: "fixture", Samples: count, Models: []string{"m"}}}}
+	for i := range count {
+		s := Sample{Model: "m", Index: i, QualityVerdict: "correct", Output: "offline"}
+		round.Samples, round.Controls = append(round.Samples, s), append(round.Controls, s)
+	}
+	en := &Engine{store: store, runs: map[string]*Run{}, rules: map[string]*Rule{"rule": {ID: "rule", MaxResults: 3}}}
+	b.ReportAllocs()
+	for b.Loop() {
+		en.runs[round.ID] = round
+		if err := en.pruneResultCountsLocked("rule", "fixture"); err != nil {
+			b.Fatal(err)
+		}
+	}
+	got := en.runs[round.ID]
+	if len(got.Samples) != 3 || len(got.Controls) != 3 || got.PrunedSamples != count-3 {
+		b.Fatal("unexpected retained positions")
 	}
 }

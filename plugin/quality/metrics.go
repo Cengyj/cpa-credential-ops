@@ -3,6 +3,8 @@ package quality
 import (
 	"fmt"
 	"maps"
+	"math"
+	"math/big"
 	"sort"
 
 	bolt "go.etcd.io/bbolt"
@@ -39,7 +41,8 @@ func (en *Engine) metrics(summary bool) (map[string]any, error) {
 		}
 	}
 	correct, incorrect, unknown := 0, 0, 0
-	covered, planned, unlocatedPruned := 0, 0, 0
+	var covered int
+	var planned, unlocatedPruned big.Int
 	errors := map[string]int{}
 	latencies := []int64{}
 	ttfts := []int64{}
@@ -52,8 +55,10 @@ func (en *Engine) metrics(summary bool) (map[string]any, error) {
 		}
 		runCovered, runPlanned := retainedCoverage(r)
 		covered += runCovered
-		planned += runPlanned
-		unlocatedPruned += max(0, r.PrunedSamples-len(r.PrunedSlots))
+		planned.Add(&planned, &runPlanned)
+		if r.PrunedSamples > len(r.PrunedSlots) {
+			unlocatedPruned.Add(&unlocatedPruned, big.NewInt(int64(r.PrunedSamples-len(r.PrunedSlots))))
+		}
 		for _, s := range r.Controls {
 			if s.Usage != nil {
 				controlTokens += s.Usage.Total
@@ -108,14 +113,15 @@ func (en *Engine) metrics(summary bool) (map[string]any, error) {
 	if correct+incorrect > 0 {
 		rate = float64(correct) / float64(correct+incorrect)
 	}
-	if planned > 0 {
-		coverage = float64(covered) / float64(planned)
+	if planned.Sign() > 0 {
+		denominator, _ := planned.Float64()
+		coverage = float64(covered) / denominator
 	}
 	budget := en.budget
 	result := map[string]any{
-		"correct": correct, "incorrect": incorrect, "unknown": unknown, "planned": planned, "covered": covered,
+		"correct": correct, "incorrect": incorrect, "unknown": unknown, "planned": metricCount(&planned), "covered": covered,
 		"quality_pass_rate": rate, "coverage": coverage, "known_tokens": knownTokens + judgeTokens + controlTokens,
-		"unknown_usage": unknownUsage, "dropped_usage_events": en.dropped.Load(), "unlocated_pruned_samples": unlocatedPruned,
+		"unknown_usage": unknownUsage, "dropped_usage_events": en.dropped.Load(), "unlocated_pruned_samples": metricCount(&unlocatedPruned),
 	}
 	if summary {
 		en.summary = metricsProjection{revision: revision, values: maps.Clone(result)}
@@ -163,12 +169,25 @@ func (en *Engine) metrics(summary bool) (map[string]any, error) {
 	return result, nil
 }
 
+// One valid run fits a JSON-safe integer. A sum across runs can be larger,
+// including when reading interrupted or malformed legacy plans.
+func metricCount(count *big.Int) any {
+	if count.BitLen() > 53 {
+		return count.String()
+	}
+	value := count.Int64()
+	if value > math.MaxInt {
+		return value
+	}
+	return int(value)
+}
+
 // Coverage counts positions in the frozen plan. A retained duplicate can still
 // occupy a pruned position. Older count-only trims cannot identify a position
 // to remove from the denominator, so their coverage is a lower bound.
-func retainedCoverage(r *Run) (covered, planned int) {
+func retainedCoverage(r *Run) (covered int, planned big.Int) {
 	if r.Config.Samples <= 0 {
-		return 0, 0
+		return
 	}
 	models := map[string]bool{}
 	for _, model := range r.Config.Models {
@@ -176,7 +195,7 @@ func retainedCoverage(r *Run) (covered, planned int) {
 			models[model] = true
 		}
 	}
-	planned = len(models) * r.Config.Samples
+	planned.Mul(big.NewInt(int64(len(models))), big.NewInt(int64(r.Config.Samples)))
 	seen := map[SampleSlot]bool{}
 	for i := range r.Samples {
 		s := &r.Samples[i]
@@ -192,15 +211,17 @@ func retainedCoverage(r *Run) (covered, planned int) {
 			covered++
 		}
 	}
+	pruned := 0
 	for _, slot := range r.PrunedSlots {
 		if !models[slot.Model] || slot.Index < 0 || slot.Index >= r.Config.Samples {
 			continue
 		}
 		if _, occupied := seen[slot]; !occupied {
-			planned--
+			pruned++
 			seen[slot] = false
 		}
 	}
+	planned.Sub(&planned, big.NewInt(int64(pruned)))
 	return covered, planned
 }
 

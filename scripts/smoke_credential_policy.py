@@ -135,6 +135,9 @@ def main(package, output, interrupt_status=False, upstream_errors=False, scope_s
         for account, data in credentials.items():
             (root / 'auths' / (account + '.json')).write_text(json.dumps(data))
         config = {'config-version': 8, 'server': {'host': '127.0.0.1', 'port': 18379, 'discovery': {'enabled': False}, 'kv-store': {'path': '/probe/kv.db'}}, 'management': {'secret-key': key, 'disable-control-panel': True, 'disable-auto-update-panel': True}, 'oauth': {'auth-dir': '/probe/auths'}, 'plugins': {'enabled': True, 'dir': '/probe/plugins', 'configs': {'model-quality': {'enabled': True, 'data_dir': '/probe/data', 'scheduling_enabled': False}}}}
+        if manual_readmission:
+            # The second explicit test crosses a retired limit supplied by an older host config.
+            config['plugins']['configs']['model-quality'].update(daily_calls=1, max_samples=1)
         native_codex = runtime_policy or manual_readmission or quality_operations
         if native_codex:
             config['access'] = {'api-keys': [business_key]}

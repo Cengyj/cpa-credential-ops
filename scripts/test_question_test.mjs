@@ -234,6 +234,35 @@ for (const [execution_status, error, outcome, statusLabel, upstream_condition] o
   }
 }
 // A run-level issue invalidates the whole-round score, while a sound sample remains judged.
+for (const [error, explanation] of [
+  ['token_budget_exhausted', '当日 token 预算不足，未发起这次模型调用。'],
+  ['budget_exhausted', '当时的调用预算不足，记录未区分具体上限。'],
+  ['storage_limit: retention or archival required', '插件存储达到容量上限，后续调用已停止。已记录的样本可在历史中查看，请清理或归档历史后再提交。'],
+]) {
+  const partial = { ...managedProviderRun, status: 'failed', error, config: { ...managedProviderRun.config, samples: 2 } };
+  const manual = { ...partial, source: 'manual_test' };
+  const surfaces = [renderQualityRuns([partial], []), renderQualityDetail(partial, []), renderRunEvidence(partial).metaHTML,
+    renderRunEvidence(manual).metaHTML, renderHistoryResult(manual)];
+  for (const html of surfaces) {
+    assert(html.includes(explanation), error);
+    assert.doesNotMatch(html, /本轮未执行/);
+  }
+  assert.match(surfaces[0], /data-outcome="correct">答对 1/);
+  assert.match(surfaces[1], /data-outcome="correct"/);
+  assert.doesNotMatch(surfaces[0], /class="history-score"/);
+  assert.match(surfaces[4], /答对 1/);
+  assert.doesNotMatch(surfaces[4], /class="history-score"/);
+}
+for (const [reason, explanation] of [
+  ['judge_token_budget_exhausted', '当日 token 预算不足，未发起独立判题调用。'],
+  ['judge budget exhausted', '独立判题预算不足，无法判定'],
+]) {
+  const sample = { ...managedProviderRun.samples[0], quality_verdict: 'unknown', reason };
+  const rendered = renderSampleEvidence(sample).split('<details class="raw-evidence">')[0];
+  assert(rendered.includes(explanation));
+  assert.match(rendered, /已完成/);
+  assert.match(rendered, /无法判断/);
+}
 for (const issue of [{ error: 'round read failed' }, { block_reason: 'identity_conflict' },
   { cancel_requested: true }, { upstream_condition: 'unauthorized' }]) {
   const value = { ...managedProviderRun, ...issue };
@@ -450,6 +479,17 @@ assert.match(partiallyKnown.samplesHTML, /样本 1<\/span><\/h4><span class="tag
 assert.match(partiallyKnown.samplesHTML, /样本 3<\/span><\/h4><span class="tag neutral">历史已裁剪/);
 
 const failed = renderRunEvidence({ ...run, status: 'failed', error: 'network unavailable', samples: [{ ...run.samples[0], execution_status: 'failed', output: '', error: 'upstream disconnected' }] });
+for (const count of [65, Number.MAX_SAFE_INTEGER]) {
+  const last = { ...run.samples[0], index: count - 1, output: 'last synthetic answer' };
+  const large = { ...run, config: { ...run.config, models: [last.model], samples: count }, samples: [last] };
+  const first = renderRunEvidence(large);
+  assert.equal(first.planned, count);
+  assert((first.samplesHTML.match(/<article class="sample/g) || []).length <= 16, 'Render only the visible sample page');
+  assert(!first.samplesHTML.includes('last synthetic answer'));
+  const end = renderRunEvidence(large, { sampleOffset: count - 1 });
+  assert(end.samplesHTML.includes('last synthetic answer'));
+  assert(end.samplesHTML.includes('data-copy-sample="0"'), 'Display ordinals are independent of retained record indices');
+}
 assert.match(failed.metaHTML, /network unavailable/);
 assert.match(failed.samplesHTML, /upstream disconnected/);
 assert.match(failed.samplesHTML, /执行失败/);

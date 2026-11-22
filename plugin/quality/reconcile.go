@@ -252,7 +252,7 @@ func (en *Engine) Prune(now time.Time) error {
 			}
 			continue
 		}
-		if en.handlingEvidenceLocked(r) {
+		if unresolved[id] || en.handlingEvidenceLocked(r) {
 			// The zero cutoff protects both the run and its linked audit entries.
 			policy.cutoffs[id] = time.Time{}
 			continue

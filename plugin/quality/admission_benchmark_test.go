@@ -10,7 +10,6 @@ func benchmarkManualEngine(b *testing.B, host Host) *Engine {
 	b.Helper()
 	config := DefaultConfig()
 	config.DataDir = b.TempDir()
-	config.DailyCalls = 1_000_000
 	config.DailyTokens = 1_000_000_000
 	store, err := OpenStore(config.DataDir, config.MaxStorageBytes)
 	if err != nil {

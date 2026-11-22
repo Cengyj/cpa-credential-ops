@@ -182,7 +182,7 @@ func TestScopeLargeDirectoryAtomicQueueAndRestart(t *testing.T) {
 	}
 }
 
-func TestObservationModelLimitsDoNotExpandManualOrDefaultBudgets(t *testing.T) {
+func TestObservationModelLimitsAreIndependentOfSampleCounts(t *testing.T) {
 	ctx := context.Background()
 	en, host, rule := scopeFixture(t)
 	models := make([]string, 50)
@@ -192,10 +192,10 @@ func TestObservationModelLimitsDoNotExpandManualOrDefaultBudgets(t *testing.T) {
 	host.targets = []Target{scopedTarget("full", models...), scopedTarget("partial", models[0])}
 	rule.Models, rule.Samples, rule.Parameters.ReasoningEffort = models, 2, "high"
 	if _, err := en.SaveRule(ctx, *rule, true); err == nil {
-		t.Fatal("default budget expanded without an explicit setting")
+		t.Fatal("default model limit expanded without an explicit setting")
 	}
 	cfg := en.Config()
-	cfg.MaxModels, cfg.MaxSamples = 50, 100
+	cfg.MaxModels = 50
 	if err := en.UpdateConfig(cfg); err != nil {
 		t.Fatal(err)
 	}
@@ -204,10 +204,6 @@ func TestObservationModelLimitsDoNotExpandManualOrDefaultBudgets(t *testing.T) {
 		t.Fatal("accepted more than 50 models")
 	}
 	rule.Samples = 3
-	if _, err := en.SaveRule(ctx, *rule, true); err == nil {
-		t.Fatal("sample budget not enforced")
-	}
-	rule.Samples = 2
 	rule, err := en.SaveRule(ctx, *rule, true)
 	if err != nil {
 		t.Fatal(err)
@@ -218,7 +214,7 @@ func TestObservationModelLimitsDoNotExpandManualOrDefaultBudgets(t *testing.T) {
 	}
 	for _, r := range en.runs {
 		want := models
-		if !reflect.DeepEqual(r.Config.Models, want) || r.Config.Parameters.ReasoningEffort != "high" || r.Config.Samples != 2 {
+		if !reflect.DeepEqual(r.Config.Models, want) || r.Config.Parameters.ReasoningEffort != "high" || r.Config.Samples != 3 {
 			t.Fatal("incorrect frozen model set or parameters")
 		}
 	}
@@ -259,7 +255,7 @@ func TestScopeRechecksBeforeCallAndRespectsBudget(t *testing.T) {
 		})
 	}
 	en, h, r := scopeFixture(t, scopedTarget("one", "a", "b"), scopedTarget("two", "a"))
-	en.cfg.DailyCalls = 1
+	en.cfg.DailyTokens = int64(r.Parameters.MaxTokens)
 	if _, err := en.dispatchRule(context.Background(), r.ID, r.Revision, false); err != nil {
 		t.Fatal(err)
 	}

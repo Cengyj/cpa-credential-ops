@@ -51,20 +51,18 @@ type Config struct {
 	Workers                int    `json:"workers" yaml:"workers"`
 	Queue                  int    `json:"queue" yaml:"queue"`
 	MaxModels              int    `json:"max_models" yaml:"max_models"`
-	MaxSamples             int    `json:"max_samples" yaml:"max_samples"`
 	MaxOutputTokens        int    `json:"max_output_tokens" yaml:"max_output_tokens"`
 	MaxResponseBytes       int    `json:"max_response_bytes" yaml:"max_response_bytes"`
-	DailyCalls             int    `json:"daily_calls" yaml:"daily_calls"`
 	DailyTokens            int64  `json:"daily_tokens" yaml:"daily_tokens"`
 	RetentionDays          int    `json:"retention_days" yaml:"retention_days"`
 	MaxStorageBytes        int64  `json:"max_storage_bytes" yaml:"max_storage_bytes"`
 }
 
 func DefaultConfig() Config {
-	return Config{DataDir: "model-quality-data", Workers: 2, Queue: 32, MaxModels: 8, MaxSamples: 32, MaxOutputTokens: 4096, MaxResponseBytes: 262144, DailyCalls: 200, DailyTokens: 1000000, RetentionDays: 30, MaxStorageBytes: 128 << 20}
+	return Config{DataDir: "model-quality-data", Workers: 2, Queue: 32, MaxModels: 8, MaxOutputTokens: 4096, MaxResponseBytes: 262144, DailyTokens: 1000000, RetentionDays: 30, MaxStorageBytes: 128 << 20}
 }
 func (c Config) Validate() error {
-	if c.DataDir == "" || c.Workers < 1 || c.Workers > 16 || c.Queue < 1 || c.Queue > 1024 || c.MaxModels < 1 || c.MaxModels > maxRuleModels || c.MaxSamples < 1 || c.MaxSamples > 128 || c.MaxOutputTokens < 16 || c.MaxOutputTokens > 32768 || c.MaxResponseBytes < 1024 || c.MaxResponseBytes > 2<<20 || c.DailyCalls < 1 || c.DailyTokens < 1 || c.RetentionDays < 1 || c.RetentionDays > 365 || c.MaxStorageBytes < 1<<20 {
+	if c.DataDir == "" || c.Workers < 1 || c.Workers > 16 || c.Queue < 1 || c.Queue > 1024 || c.MaxModels < 1 || c.MaxModels > maxRuleModels || c.MaxOutputTokens < 16 || c.MaxOutputTokens > 32768 || c.MaxResponseBytes < 1024 || c.MaxResponseBytes > 2<<20 || c.DailyTokens < 1 || c.RetentionDays < 1 || c.RetentionDays > 365 || c.MaxStorageBytes < 1<<20 {
 		return fmt.Errorf("invalid resource limits")
 	}
 	return nil

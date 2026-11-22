@@ -2,13 +2,56 @@ package quality
 
 import (
 	"context"
+	"math"
+	"math/big"
 	"net/http"
 	"net/url"
+	"strconv"
 	"testing"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 	bolt "go.etcd.io/bbolt"
 )
+
+func TestCoverageKeepsExactTotalsForLargeFrozenPlans(t *testing.T) {
+	en, _ := lifeFixture(t)
+	for _, id := range []string{"one", "two"} {
+		en.runs[id] = &Run{
+			Config:        Frozen{RunConfig: RunConfig{Models: []string{"a", "b"}, Samples: math.MaxInt}},
+			PrunedSamples: math.MaxInt, PrunedSlots: []SampleSlot{{Model: "b", Index: 0}},
+			Samples: []Sample{{Model: "a", Index: 0, ExecutionStatus: "completed", QualityVerdict: "correct"}},
+		}
+	}
+	count := big.NewInt(int64(math.MaxInt))
+	planned := new(big.Int).Mul(count, big.NewInt(4))
+	planned.Sub(planned, big.NewInt(2))
+	unlocated := new(big.Int).Sub(count, big.NewInt(1))
+	unlocated.Mul(unlocated, big.NewInt(2))
+	denominator, _ := planned.Float64()
+	for _, view := range []string{"", "summary"} {
+		req := pluginapi.ManagementRequest{Method: http.MethodGet, Path: "/v0/management/plugins/model-quality/metrics", Query: url.Values{"view": {view}}}
+		response := en.Handle(t.Context(), req)
+		var data map[string]any
+		if response.StatusCode != http.StatusOK || decode(response.Body, &data) != nil {
+			t.Fatal("metrics unavailable")
+		}
+		checkCount := func(key string, want *big.Int) {
+			t.Helper()
+			if strconv.IntSize == 64 {
+				if data[key] != want.String() {
+					t.Fatalf("%s: %v, want exact decimal %s", key, data[key], want)
+				}
+			} else if data[key] != float64(want.Int64()) {
+				t.Fatalf("%s: %v, want %s", key, data[key], want)
+			}
+		}
+		checkCount("planned", planned)
+		checkCount("unlocated_pruned_samples", unlocated)
+		if data["covered"] != 2.0 || data["coverage"] != 2/denominator {
+			t.Fatalf("incorrect large-plan coverage: %v / %v = %v", data["covered"], data["planned"], data["coverage"])
+		}
+	}
+}
 
 func TestMetricsCountDistinctPlannedSlots(t *testing.T) {
 	for _, tc := range []struct {

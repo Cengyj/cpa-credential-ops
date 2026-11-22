@@ -532,7 +532,7 @@ func TestQualityReloadKeepsPanelBudgetAndTimerGrant(t *testing.T) {
 		t.Fatal(err)
 	}
 	panel := en.Config()
-	panel.DailyCalls = 42
+	panel.DailyTokens = 4200
 	if err := en.UpdateConfig(panel); err != nil {
 		t.Fatal(err)
 	}
@@ -540,14 +540,14 @@ func TestQualityReloadKeepsPanelBudgetAndTimerGrant(t *testing.T) {
 	if err := en.ReconfigureQuality(input); err != nil {
 		t.Fatal(err)
 	}
-	if current := en.Config(); current.DailyCalls != 42 || current.RetentionDays != input.RetentionDays || !en.timerAllowed(armed) || current.SchedulingEnabled {
+	if current := en.Config(); current.DailyTokens != 4200 || current.RetentionDays != input.RetentionDays || !en.timerAllowed(armed) || current.SchedulingEnabled {
 		t.Fatal("live reload changed unrelated quality permissions")
 	}
 	en.cfg = input
 	if err := en.load(); err != nil {
 		t.Fatal(err)
 	}
-	if current := en.Config(); current.DailyCalls != 42 || current.RetentionDays != input.RetentionDays || !en.timerAllowed(en.rules[rule.ID]) {
+	if current := en.Config(); current.DailyTokens != 4200 || current.RetentionDays != input.RetentionDays || !en.timerAllowed(en.rules[rule.ID]) {
 		t.Fatal("reopen lost merged config")
 	}
 }

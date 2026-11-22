@@ -154,7 +154,7 @@ func TestOrdinaryQualityReloadReusesBackgroundServices(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer r.close()
-	settings.settings.DailyCalls++
+	settings.settings.DailyTokens++
 	if err := r.configure(settings, true, create); err != nil {
 		t.Fatal(err)
 	}

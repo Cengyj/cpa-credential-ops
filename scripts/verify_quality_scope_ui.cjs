@@ -21,7 +21,7 @@ async function main() {
     const directory = Array.from({length:123},(_,i) => ({auth_id:`fixture-${i}`,auth_index:`index-${i}`,provider:i%2?'codex':'offline',object_type:'oauth',models:[i===122?'new-only':'shared'],runtime_status:'active',effective_available:true}));
     const rules = [], children = [], writes = [], unexpected = [], errors = [], readOffsets = new Set();
     directory[122].email = 'scope@example.test';
-    let uncertain = false, failActivity = false, previewReads = 0, dispatchPreviews = 0, detailGate, failDetail = false;
+    let uncertain = false, failActivity = false, previewReads = 0, dispatchPreviews = 0, previewCount, detailGate, failDetail = false;
     const reads = [];
     await context.route('**/*', async route => {
       const req=route.request(), u=new URL(req.url()), p=u.pathname.slice(prefix.length);
@@ -38,15 +38,16 @@ async function main() {
         if(p==='/rules/question-preview') previewReads++;
         if(p==='/targets'){readOffsets.add(Number(u.searchParams.get('offset')));return range(directory);}
         if(p==='/rules') return range(rules);
-        if(p==='/settings') return route.fulfill({json:{scheduling_enabled:false,retention_days:30,max_models:8,max_samples:32,capabilities:{mode:'official_observation',credential_management:true,management_session:true}}});
+        if(p==='/settings') return route.fulfill({json:{scheduling_enabled:false,retention_days:30,max_models:8,capabilities:{mode:'official_observation',credential_management:true,management_session:true}}});
         if(p==='/runs' && u.searchParams.get('source')==='scheduled_probe') { if(failActivity) return route.fulfill({status:503,json:{error:{message:'synthetic read failure'}}}); return range(children.filter(r=>!u.searchParams.has('scope_batch_id')||u.searchParams.get('scope_batch_id')===r.config.scope_batch_id).filter(r=>!u.searchParams.has('rule_id')||u.searchParams.get('rule_id')===r.config.rule_id)); }
         return route.continue();
       }
       const b=req.postDataJSON();
       if(p==='/rules/scope-preview' && req.method()==='POST') {
         dispatchPreviews++;
+        if (b.id === 'rule-1') assert.equal(b.samples, 257);
         const oauth=b.target_scope==='single'?directory.filter(t=>t.auth_id===b.auth_id).length:directory.length;
-        return route.fulfill({json:{verified:true,candidates:{oauth,provider:0},count:oauth,skipped:0,recovery_count:0,skip_details:[]}});
+        return route.fulfill({json:{verified:true,candidates:{oauth:previewCount ?? oauth,provider:0},count:previewCount ?? oauth,skipped:0,recovery_count:0,skip_details:[]}});
       }
       writes.push({p,method:req.method(),b});
       if(p==='/rules/run-history' && req.method()==='DELETE') {
@@ -63,8 +64,13 @@ async function main() {
       if(p==='/rules' && req.method()==='POST') {const r={...b,id:`rule-${rules.length+1}`,revision:1,status:'detecting',enabled:true,timer_active:b.activation==='start'};rules.push(r);return route.fulfill({json:r});}
       if(p==='/rules' && req.method()==='PUT') {const old=rules.find(r=>r.id===b.id);assert.equal(old.revision,b.revision);if(b.cron==='65 * * * *')return route.fulfill({status:400,json:{error:{code:'invalid_cron'}}});if(b.cron){delete old.interval_seconds;delete old.timezone;}if(b.activation!=='keep')old.timer_active=b.activation==='start';Object.assign(old,b,{revision:b.revision+1});return route.fulfill({json:old});}
       if(p==='/rules/run' && req.method()==='POST') {
+        assert.deepEqual(Object.keys(b).sort(), ['id', 'idempotency_key', 'revision']);
+        assert.equal(b.id, 'rule-1');
+        assert.equal(b.revision, 1);
+        assert.match(b.idempotency_key, /^\S{1,128}$/u);
+        const runKeys = writes.filter(write => write.p === '/rules/run').map(write => write.b.idempotency_key);
+        assert.equal(new Set(runKeys).size, runKeys.length);
         if(uncertain) return route.abort('connectionfailed');
-        assert.deepEqual(b,{id:'rule-1',revision:1});
         for(let i=0;i<23;i++) children.push({id:`run-${i}`,source:'scheduled_probe',status:'completed',created_at:'2026-11-18T00:00:00Z',config:{rule_id:b.id,auth_id:`result-${i}`,models:['shared'],parameters:{reasoning_effort:'low'},scope_batch_id:'test-batch'}});
         children[0].credential_email = 'snapshot@example.test';
         Object.assign(children[0].config, {samples:1, question:{id:'logic-candy',kind:'logic', answer:'21'}, judge:{mode:'deterministic'}});
@@ -76,7 +82,11 @@ async function main() {
         children[2].samples = [correctSample, { ...correctSample }];
         children[3].config.samples = 1;
         children[3].samples = [{ ...correctSample, error: 'fixture request failed', quality_verdict: 'incorrect' }];
-        rules[0].last_scope_batch='test-batch';return route.fulfill({status:202,json:{count:23,skipped:100,scope_batch_id:'test-batch'}});
+        children[21].config.samples = Number.MAX_SAFE_INTEGER;
+        children[21].samples = [{...correctSample, index: Number.MAX_SAFE_INTEGER - 1, output:'last rule sample'}];
+        rules[0].last_scope_batch='test-batch';
+        return route.fulfill({status:202,json:{idempotency_key:b.idempotency_key,kind:'run',rule_id:b.id,revision:b.revision,
+          state:'completed',result:{count:23,skipped:100,scope_batch_id:'test-batch'}}});
       }
       unexpected.push(p);return route.abort();
     });
@@ -189,7 +199,7 @@ async function main() {
     assert(await el('.deck-empty').isVisible()); await focused('rule-models');
     await el('#rule-model-catalog').selectOption('new-only');assert.doesNotMatch(await el('#rule-scope-note').innerText(),/暂无匹配/);
     await el('#rule-models').fill('shared\nnew-only，shared;shared');await el('#rule-models').press('Enter');assert.deepEqual(await selected(),['new-only','shared']);
-    await el('#rule-name').fill('日常观察');await el('#rule-samples').fill('2');await pick('max').check();await configOnly();await text('#rule-model-count','已选 2');
+    await el('#rule-name').fill('日常观察');await el('#rule-samples').fill('256');await click('[data-sample-step="1"]');assert.equal(await el('#rule-samples').inputValue(),'257');await pick('max').check();await configOnly();await text('#rule-model-count','已选 2');
     for (const select of await el('#rule-upstream-options select').all()) await select.selectOption('observe_only');
     await el('#rule-timer').check();await text('#rule-schedule-note','仅运行本条规则');await el('#rule-timer').uncheck();
     await el('#rule-cron').fill('');assert(await el('#rule-cron').evaluate(n=>n.validity.valueMissing));await click('#rule-form button[type=submit]');await focused('rule-cron');assert(await el('#rule-plan-title').isVisible());assert.equal(writes.length,0);
@@ -217,6 +227,7 @@ async function main() {
     }
     await click('#rule-form button[type=submit]'); await el('[data-rule-run="rule-1"]').waitFor();assert.equal(writes.length,1);
     assert.equal(rules[0].target_scope,'all_enabled');assert(!rules[0].auth_id && !rules[0].provider);assert.equal(rules[0].parameters.max_tokens,undefined);assert.deepEqual(rules[0].models,['new-only','shared']);assert.equal(rules[0].parameters.reasoning_effort,'max');
+    assert.equal(writes[0].b.samples, 257);assert.equal(writes[0].b.max_results, 100);
     assert.equal(await el('#rules-list summary').count(),0);await click('[data-rule-edit="rule-1"]');assert(await pick('max').isChecked());assert(await el('#rule-legacy-effort').isHidden());await click('#rule-form .editor-footer [data-close]');
     assert.equal(rules[0].cron,defaultCron);assert.equal(rules[0].max_results,100);assert.equal(rules[0].timer_active,false);assert(!['interval_seconds','timezone','retention_days','auth_id','provider'].some(k=>k in writes[0].b));assert(!('temperature' in writes[0].b.parameters));
     await click('#rule-new');await el('#rule-scope-single').check();await el('#rule-target').selectOption('fixture-122');await text('#rule-scope-note','OAuth 账户 1 个');await click('[data-remove-model="gpt-6.2-sol"]');await el('#rule-models').fill('new-only');await el('#rule-name').fill('指定凭证');await click('#rule-form button[type=submit]');await el('[data-rule-run="rule-2"]').waitFor();assert.equal(writes.length,2);assert.equal(rules[1].target_scope,'single');assert.equal(rules[1].auth_id,'fixture-122');assert.deepEqual(rules[1].models,['new-only']);assert.equal(rules[1].parameters.reasoning_effort,'high');
@@ -237,7 +248,10 @@ async function main() {
       await click('#rule-form .editor-footer [data-close]');
     }
     assert.equal(dispatchPreviews,0);
-    await click('[data-rule-run="rule-1"]');await text('#action-description','最多计划 492 份目标回答'); await click('#action-cancel');assert(!writes.some(w=>w.p==='/rules/run'));assert.equal(dispatchPreviews,1);
+    await click('[data-rule-run="rule-1"]');await text('#action-description','最多计划 63222 份目标回答'); await click('#action-cancel');assert(!writes.some(w=>w.p==='/rules/run'));assert.equal(dispatchPreviews,1);
+    previewCount = Number.MAX_SAFE_INTEGER;
+    await click('[data-rule-run="rule-1"]');await text('#action-description',`最多计划 ${BigInt(previewCount) * 514n} 份目标回答`);
+    await click('#action-cancel');previewCount = undefined;
     await click('[data-rule-run="rule-1"]');await click('#action-confirm');await text('#ops-batch-summary','1–20 / 23');assert.equal(await el('#operations-history [data-run]').count(),20);
     await text('#operations-history','请求强度 low');
     await text('#operations-history','snapshot@example.test');
@@ -258,6 +272,12 @@ async function main() {
     assert.deepEqual(reads.slice(beforePage), ['/runs']);
     await click('#operations-history [data-run="run-21"]');
     await text('#quality-detail-content','result-21');
+    assert.equal(await el('#quality-detail .sample').count(), 16);
+    const detailReads = reads.filter(path => path === '/runs/detail').length;
+    const jump = el('#quality-detail [data-sample-ordinal]');
+    await jump.fill(String(Number.MAX_SAFE_INTEGER));await jump.press('Enter');
+    await text('#quality-detail .answer-text','last rule sample');
+    assert.equal(reads.filter(path => path === '/runs/detail').length, detailReads, 'Local sample paging must reuse the current run');
     await page.keyboard.press('Escape');
     await text('#ops-batch-summary','本批次 21–23 / 23');
     assert(await el('#operations-history [data-run="run-21"]').evaluate(node => node === document.activeElement));
@@ -309,8 +329,8 @@ async function main() {
       const submitted=writes.at(-1).b;assert.deepEqual(submitted.models,originalModels);assert.equal(submitted.parameters.reasoning_effort,undefined);assert.equal(submitted.parameters.stream,false);assert(!('max_tokens' in submitted.parameters || 'temperature' in submitted.parameters));assert(!['interval_seconds','timezone','cron','retention_days','max_results'].some(k=>k in submitted));
     }
     await click('[data-rule-edit="old-auto"]');await el('#rule-convert-cron').check();assert.equal(await el('#rule-cron').inputValue(),'0 9 * * *');await el('#rule-cron').fill('65 * * * *');await click('#rule-form button[type=submit]');await text('#rule-cron-error','无效');await focused('rule-cron');
-    await el('#rule-cron').fill('15 10 * * *');await el('#rule-timer').check();await el('#rule-retention-mode').selectOption('count');await el('#rule-max-results').fill('1');await text('#rule-retention-note','至少保留 2 条');await pick('medium').check();
-    await click('#rule-form button[type=submit]');await el('#rule-dialog').waitFor({state:'hidden'});assert.equal(writes.at(-1).b.cron,'15 10 * * *');assert.equal(writes.at(-1).b.max_results,2);
+    await el('#rule-cron').fill('15 10 * * *');await el('#rule-timer').check();await el('#rule-retention-mode').selectOption('count');await el('#rule-max-results').fill('1');await text('#rule-retention-note','最近 1 份结果');await pick('medium').check();
+    await click('#rule-form button[type=submit]');await el('#rule-dialog').waitFor({state:'hidden'});assert.equal(writes.at(-1).b.cron,'15 10 * * *');assert.equal(writes.at(-1).b.max_results,1);
     const changed=rules.find(r=>r.id==='old-auto');changed.next_run='2026-11-19T04:30:00Z';changed.next_run_local='2026-11-19T10:15:00+05:45';await click('#refresh');await text('#rules-list','10:15:00 · UTC+05:45');await click('[data-rule-edit="old-auto"]');assert.equal(await el('#rule-cron').inputValue(),'15 10 * * *');assert(await el('#rule-legacy-schedule').isHidden());await click('#rule-form .editor-footer [data-close]');
     const held={...rules[1],id:'held-rule',revision:1,status:'awaiting_release',enabled:false,question_id:'random-linear',judge:{mode:'llm',auth_id:'fixture-1',model:'shared'},control_auth_id:'fixture-2'};
     rules.push(held);await click('#refresh');await click('[data-rule-edit="held-rule"]');assert(await el('#rule-hold-note').isVisible());
@@ -319,7 +339,10 @@ async function main() {
     directory.length=0;await page.reload();await el('body.connected').waitFor();await click('[data-page=operations]');await click('#rule-new');
     assert(await el('#rule-model-catalog').isDisabled());assert(await quick('local-one').isEnabled());assert.equal(await quick('local-two').count(),0);assert.deepEqual(await selected(),[defaults[0]]);
     const safeWrites=writes.length;await el('#rule-name').fill('空目录测试');await el('#rule-models').fill('a b c d e f g h');await click('#rule-form button[type=submit]');await text('#rule-models-error','1–8');assert.equal(writes.length,safeWrites);
-    await el('#rule-models').fill('a b c d');await el('#rule-samples').fill('8');await click('#rule-form button[type=submit]');await text('#rule-samples-error','限额 32');assert.equal(writes.length,safeWrites);
+    await el('#rule-models').fill('a b c d');await el('#rule-samples').fill(String(Number.MAX_SAFE_INTEGER));await click('#rule-form button[type=submit]');await text('#rule-samples-error','单对象样本总数超过');assert.equal(writes.length,safeWrites);
+    for (const invalid of ['0','-1','1.5','9007199254740992','9007199254740990.1']) {
+      await el('#rule-samples').fill(invalid);await click('#rule-form button[type=submit]');await text('#rule-samples-error','正整数');assert.equal(writes.length,safeWrites);
+    }
     await el('#rule-models').fill('');await el('#rule-samples').fill('1');await quick(defaults[1]).click();await click('#rule-form button[type=submit]');await el('#rule-dialog').waitFor({state:'hidden'});assert.deepEqual(writes.at(-1).b.models,defaults.slice(0,2));
     await click('#rule-new');await el('#rule-name').fill('答错后暂停');await handling('disable_credential').check();await el('#rule-auto-restore').check();
     await click('#rule-form button[type=submit]');await el('#rule-dialog').waitFor({state:'hidden'});
@@ -392,7 +415,7 @@ async function main() {
     assert.deepEqual(errors,[]);assert.deepEqual(unexpected,[]);
     fs.writeFileSync(path.join(out,'quality-workspace.json'),JSON.stringify({ui_version,checks:workspaceChecks,sticky_table_header:true,fixed_pagination:true,all_rules_selection:true,real_writes:0},null,2)+'\n');
     fs.writeFileSync(path.join(out,'quality-scope.json'),JSON.stringify({ui_version,widths,reference_defaults:true,persistent_shortcuts:true,multi_model:true,empty_directory:true,legacy_round_trip:true,keyboard_scope:true,limit_validation:true,uncertain_no_retry:true,paged_batch:true,no_global_write:true,single_server_cron:true,explicit_conversion:true,zoned_list:true,rule_efforts:efforts,per_account_result_limit:true,effort_keyboard_and_roundtrip:true,requested_effort_in_history:true,intersection_estimate_at_execution:true,no_editor_estimate:true,exact_cron_label:true,layout_checks:layouts,lazy_question_reference:true,continuous_sheet:true,modal:true,rule_filter:true,server_history_filter:true,all_history_pagination:true,read_error_preserves_rows:true,escape_discard_focus:true,single_timer:true,inline_validation:true,layouts:layouts.length,fixture_writes:writes.length,real_writes:0},null,2)+'\n');
-    assert.equal(dispatchPreviews,3);
+    assert.equal(dispatchPreviews,4);
     console.log('Quality rule editor: reference defaults, keyboard, custom shortcuts, batch input, multi-model payloads, original rules, empty catalog, budgets, scheduling and paged results passed.');
   } finally { if(browser) await browser.close();child.kill();await exit; }
 }

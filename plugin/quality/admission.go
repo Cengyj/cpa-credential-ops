@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 
 	bolt "go.etcd.io/bbolt"
@@ -101,8 +102,17 @@ func (en *Engine) validateConfig(c *RunConfig, scoped bool) error {
 	if c.Samples == 0 {
 		c.Samples = 1
 	}
-	if c.Samples < 1 || c.Samples > 8 || c.Samples*len(c.Models) > en.cfg.MaxSamples {
-		return fmt.Errorf("samples must be 1..8 and within total budget")
+	if c.Samples < 1 {
+		return fmt.Errorf("invalid_request: samples must be positive")
+	}
+	modelPasses := len(c.Models)
+	if c.ControlAuthID != "" {
+		modelPasses *= 2
+	}
+	// Counts in frozen plans must round-trip through both Go and JSON clients.
+	const maxPlanCount = min(int64(math.MaxInt), (1<<53)-1)
+	if int64(c.Samples) > maxPlanCount/int64(modelPasses) {
+		return fmt.Errorf("invalid_request: total sample count exceeds the exact integer range")
 	}
 	if c.Parameters.MaxTokens == 0 {
 		c.Parameters.MaxTokens = min(1024, en.cfg.MaxOutputTokens)
@@ -133,9 +143,6 @@ func (en *Engine) validateConfig(c *RunConfig, scoped bool) error {
 	}
 	if c.ControlAuthID != "" && (c.ControlAuthID == c.AuthID || c.ControlAuthID == c.Judge.AuthID || c.ControlProvider == "") {
 		return fmt.Errorf("control requires a distinct credential and provider")
-	}
-	if c.ControlAuthID != "" && c.Samples*len(c.Models)*2 > en.cfg.MaxSamples {
-		return fmt.Errorf("control and subject exceed total sample limit")
 	}
 	if len(c.IdempotencyKey) > 128 {
 		return fmt.Errorf("idempotency key too long")

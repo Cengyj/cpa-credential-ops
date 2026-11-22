@@ -2,11 +2,84 @@ package quality
 
 import (
 	"errors"
+	"fmt"
 	"math"
 	"os"
 	"testing"
+	"testing/synctest"
 	"time"
 )
+
+func TestLegacyDailyCallsDoNotCapExecutionAfterRestart(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.DataDir = t.TempDir()
+		cfg.DailyTokens = 201 * 64
+		store, err := OpenStore(cfg.DataDir, cfg.MaxStorageBytes)
+		if err != nil {
+			t.Fatal(err)
+		}
+		budget := Budget{Day: time.Now().UTC().Format("2006-01-02"), Calls: 200, ReservedTokens: 200 * 64}
+		legacy := legacySettingsFixture(t, cfg, 200, 32)
+		for key, value := range map[string]any{"settings": legacy, "quality_host_input": legacy, "budget": budget, "budget:" + budget.Day: budget} {
+			if err := store.Put("meta", key, value); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := store.Close(); err != nil {
+			t.Fatal(err)
+		}
+		host := &lifecycleHost{target: Target{AuthID: "auth-a", AuthIndex: "fixture", Provider: "offline", Models: []string{"a"}, EffectiveAvailable: true}}
+		for attempt := 0; attempt < 2; attempt++ {
+			func() {
+				en, err := New(cfg, host)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer en.Close()
+				run, err := en.Submit(t.Context(), lifeConfig())
+				if err != nil {
+					t.Fatal(err)
+				}
+				synctest.Wait()
+				result, err := en.Run(run.ID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if attempt == 0 && (result.Status != "completed" || len(result.Samples) != 1) {
+					t.Fatalf("legacy cap blocked the 201st model call: status=%s err=%s", result.Status, result.Error)
+				}
+				if attempt == 1 && (result.Error != "token_budget_exhausted" || len(result.Samples) != 0) {
+					t.Fatalf("persisted token ceiling was lost: status=%s err=%s", result.Status, result.Error)
+				}
+				if len(host.calls) != 1 || en.budget.Calls != 201 || en.budget.ReservedTokens != cfg.DailyTokens {
+					t.Fatal("model attempts and budget ledger disagree", len(host.calls), en.budget)
+				}
+			}()
+		}
+	})
+}
+
+func TestJudgeExhaustsOnlyTokenBudget(t *testing.T) {
+	en, host, _ := manualOnlyFixture(t)
+	en.host = &controlAnswerHost{host}
+	cfg := lifeConfig()
+	cfg.Judge = Judge{Mode: "llm", AuthID: "auth-c", Provider: "offline", Model: "a"}
+	en.cfg.DailyTokens = int64(cfg.Parameters.MaxTokens) + 511
+	run, err := en.Submit(t.Context(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	en.executeTask(en.nextRunnableLocked())
+	result, err := en.Run(run.ID)
+	if err != nil || len(result.Samples) != 1 || result.Samples[0].Reason != "judge_token_budget_exhausted" || result.Samples[0].QualityVerdict != "unknown" || host.executeCalls != 1 {
+		t.Fatal("an unfunded judge call must preserve the unjudged subject answer", result, err)
+	}
+	f := fmt.Errorf("Bearer fake-private-text: %w", errTokenBudgetExhausted)
+	if scrubError(f) != "token_budget_exhausted" || scrubError(errors.New("Bearer fake-private-text")) == "Bearer fake-private-text" {
+		t.Fatal("return only the verified budget code when a wrapper contains sensitive data")
+	}
+}
 
 func TestBudgetLateUsageRemainsOnAdmissionDay(t *testing.T) {
 	en, _ := lifeFixture(t)
@@ -63,7 +136,7 @@ func TestBudgetLedgerRetentionProtectsUnfinishedCalls(t *testing.T) {
 
 func TestLegacyBudgetAndClockRollbackCannotResetDailyLimit(t *testing.T) {
 	en, _ := lifeFixture(t)
-	en.cfg.DailyCalls = 1
+	en.cfg.DailyTokens = 128
 	oldDay := en.now().Format("2006-01-02")
 	en.budget = Budget{Day: oldDay, Calls: 1, KnownTokens: 123, ReservedTokens: 64}
 	if err := en.store.Put("meta", "budget", en.budget); err != nil {

@@ -237,6 +237,8 @@ func (en *Engine) Handle(ctx context.Context, req pluginapi.ManagementRequest) p
 	case "PUT /settings":
 		var body struct {
 			Config
+			LegacyDailyCalls       *int  `json:"daily_calls"` // Ignored for old clients submitting a full configuration.
+			LegacyMaxSamples       *int  `json:"max_samples"`
 			IncludeProviderTargets *bool `json:"include_provider_targets"`
 		}
 		if err = DecodeStrict(req.Body, &body); err == nil {

@@ -1,6 +1,10 @@
 # 官方 CPA 插件管理接口
 
-以下 0.32.2 接口使用已鉴权前缀 `/v0/management/plugins/model-quality`。
+以下接口使用已鉴权前缀 `/v0/management/plugins/model-quality`。
+
+规则的 `max_results` 单独控制每个对象的历史窗口，默认 100，显式接受 1 至 200。单轮计划可大于窗口。终态与处置保存后裁剪主测样本，`pruned_samples` 为已裁剪条数，`pruned_sample_slots` 提供可核实的原模型与序号。人工复核继续提交原始记录序号。后台保护在途和未决证据。[规则保留与兼容用例](../plugin/quality/result_limit_test.go)
+
+普通及 `view=summary` 的 `GET /metrics` 使用相同的保留样本计算通过率和覆盖率。覆盖率分母按冻结计划扣除已知、且没有保留重复记录的被裁剪位置。旧历史只有裁剪条数时，`unlocated_pruned_samples` 说明有多少位置无法确定，此时覆盖率为下限。`planned` 与 `unlocated_pruned_samples` 通常返回 JSON 整数，累计超过 9007199254740991 时返回精确十进制字符串。`coverage` 为数值，没有计划位置时为 `null`。[统计实现](../plugin/quality/metrics.go) · [大计划和旧数据回归](../plugin/quality/metrics_test.go)
 
 `GET /login/logs?id=任务ID` 可带 `cursor` 和 `limit`（1 至 200）。服务从同一条持久化记录核对任务 ID、删除标记和日志。返回的事件序号大于游标。整段保留窗口的范围由 `first_id`、`last_id`、`retained_count`、`truncated` 描述，本页由 `has_more`、`next_cursor` 描述。早期日志可省略 `event` 和部分字段，原记录的级别和 `legacy` 标志照常返回。[日志实现](../plugin/login/logs.go) · [分页兼容测试](../plugin/login/logs_test.go)
 
@@ -80,7 +84,7 @@
 }
 ```
 
-每模型 samples为1..8，总数还受 max_samples 限制；模型数、temperature、reasoning_effort、输出预算均服务端检查。custom 题可提供 prompt、review_standard，二者共同冻结；不得改内建题面后继承原答案。视觉/自定义题默认没有确定性 oracle。
+`samples` 指每模型的份数，默认 1。手动测试、定时和立即执行的规则均可指定正整数。每个对象计划的份数（模型数 × 每模型份数，带对照时再乘 2）须能在 Go 和 JSON 客户端精确表示。模型数、temperature、reasoning_effort、输出预算均由服务端检查。custom 题可提供 prompt、review_standard，二者共同冻结；不得改内建题面后继承原答案。视觉/自定义题默认没有确定性 oracle。
 
 直接提交人工评阅任务（`judge.mode=manual` 或不指定 `judge.mode`）时，若 `parameters.max_tokens` 缺省或为零，服务端冻结 `min(2048, max_output_tokens)`；非手动模式原有默认值 1024 不变。省略 `temperature` 不等于传入 0。显式 token 预算超出上限仍会被拒绝；规则、旧记录和显式同配置重跑不改写已有参数。
 
@@ -106,7 +110,9 @@ schema1升级保留历史与动作，不删除数据库，不发起复测，不�
 
 审计或被动指标数据损坏/读取失败时返回503，不再伪装成空历史或零指标。缺失或非法的历史流量来源归入unknown，不能自动归入production。
 
-每日预算按调用准入时的UTC日期记账，跨日完成仍更新原日，meta内budget:YYYY-MM-DD保留配置天数并保护在途日期。主动任务缺usage仍显示未知；被动ABI缺少零用量存在性标记，因此无法证实的0和旧事件未标记tokens_known时按unknown_usage统计，不伪造零成本。
+每日预算按调用准入时的 UTC 日期记账，跨日完成仍更新原日。`meta` 内的 `budget:YYYY-MM-DD` 按配置天数保留，在途日期受保护。`GET /metrics` 的 `budget.calls` 是当日已预留调用的累计统计。手动智商测试、规则立即执行、定时检测、恢复复检以及对照和判题均可继续累计。设置接口已移除 `daily_calls` 和 `max_samples`。旧客户端在 `PUT /settings` 中附带这些字段时，服务端接受旧格式并忽略旧限额。
+
+每次模型调用前，插件取预留总量与已知用量的较大值，加上本次请求的输出预留。超过 `daily_tokens` 时，任务记录 `token_budget_exhausted`。独立判题的预留不足时，已取得的样本保留，判题原因记为 `judge_token_budget_exhausted`。两者都在发送对应请求前判定。旧记录中的 `budget_exhausted` 可能来自次数或 token 预算。主动任务缺少 usage 时仍显示未知，被动 ABI 无法证实的零用量和未标记 `tokens_known` 的旧事件按 `unknown_usage` 统计。
 
 
 ## OpenAI 登录（0.4.0）

@@ -97,7 +97,7 @@ async function test() {
     await page.selectOption('#models', 'fixture-reasoner');
     await page.locator('#reasoning').selectOption('max');
     await page.selectOption('#question', 'logic-candy');
-    await page.selectOption('#samples', '2');
+    await page.fill('#samples', '2');
     const button = page.locator('#run-submit');
     const label = button.locator('#run-submit-label');
     const spinner = button.locator('#run-submit-spinner');
@@ -136,7 +136,9 @@ async function test() {
     assert(!/答错|答对/.test(await activeRow.innerText()));
     await page.click('[data-run=fixture-run-complete]');
     await page.waitForFunction(() => document.querySelector('#run-frozen-data').textContent.includes('fixture-run-complete'));
-    assert((await page.locator('#run-frozen-data').textContent()).includes('current@example.test'));
+    const frozenIdentity = await page.locator('#run-frozen-data .answer-test-config').innerText();
+    assert(frozenIdentity.includes('fixture-quality-primary'), 'A legacy run without a saved email retains its original credential ID');
+    assert(!frozenIdentity.includes('current@example.test'), 'A present-day catalog label must not rename a saved run');
     assert(await button.isDisabled());
     assert(await page.locator('#run-rerun').isDisabled());
     await page.locator('#run-form').evaluate(node => node.requestSubmit());
@@ -418,6 +420,65 @@ async function test() {
       assert(deleted.has(id));
     }
     assert.equal(await page.locator('#history-page').textContent(), '第 1 页');
+    // The second call was never admitted. The first sample and the original reason survive both views.
+    let verifiedBudgets = 0;
+    for (const [error, message] of [
+      ['budget_exhausted', '当时的调用预算不足，记录未区分具体上限。'],
+      ['token_budget_exhausted', '当日 token 预算不足，未发起这次模型调用。'],
+    ]) {
+      run = { ...run, id: 'budget-' + ++verifiedBudgets, status: 'failed', error, config: { ...run.config, samples: 2 },
+        samples: [{ model: run.config.models[0], index: 0, output: answers[0], execution_status: 'completed', quality_verdict: 'unknown', answer_match: 'correct' }] };
+      await page.click('#refresh');
+      const budgetRow = page.locator('tr[data-history-id="' + run.id + '"]');
+      await budgetRow.getByText(message, { exact: true }).waitFor();
+      assert.match(await budgetRow.innerText(), /答对 1/);
+      assert.equal(await budgetRow.locator('.history-score').count(), 0);
+      await budgetRow.locator('[data-run]').click();
+      await page.locator('#run-meta').getByText(message, { exact: true }).waitFor();
+      assert.equal(await page.locator('#sample-list .answer-text').first().textContent(), answers[0]);
+      await page.click('#history-return');
+    }
+    assert.equal(posts, 2, 'Viewing a budget refusal must not resubmit either model call');
+    await page.click('[data-manual-view=results]');
+    const quantity = page.locator('#samples');
+    for (const invalid of ['0','-1','1.5','9007199254740992','9007199254740990.1']) {
+      await quantity.fill(invalid);
+      assert(await button.isDisabled());
+      assert.match(await page.locator('#samples-error').textContent(), /正整数/);
+    }
+    for (const count of [257, Number.MAX_SAFE_INTEGER]) {
+      const before = posts;
+      await quantity.fill(String(count));
+      assert.equal(await quantity.getAttribute('aria-invalid'), null);
+      const submit = page.waitForRequest(r => r.method() === 'POST' && r.url().endsWith('/runs'));
+      await button.click();
+      assert.equal((await submit).postDataJSON().samples, count);
+      await checkBusy('排队中');
+      run.samples = [{ model: run.config.models[0], index: count - 1, output: 'last synthetic answer', execution_status: 'completed', quality_verdict: 'unknown' }];
+      run.status = 'completed';
+      await page.locator('#run-submit:enabled').waitFor();
+      const pages = page.locator('#sample-list .sample-pages');
+      await pages.getByText(`样本 1–16 / ${count}`, {exact:true}).waitFor();
+      assert.equal(await page.locator('#sample-list .sample').count(), 16);
+      assert.equal(await page.locator('#sample-filter option').count(), 17);
+      await pages.getByRole('button', {name:'下一页'}).click();
+      await pages.getByText(`样本 17–32 / ${count}`, {exact:true}).waitFor();
+      await pages.locator('[data-sample-ordinal]').fill(String(count));
+      await pages.getByRole('button', {name:'跳转'}).click();
+      await page.locator('#sample-list .answer-text').filter({hasText:'last synthetic answer'}).waitFor();
+      assert(await pages.getByRole('button', {name:'下一页'}).isDisabled());
+      assert.equal(posts, before + 1);
+    }
+    for (const width of [390, 320]) {
+      await page.setViewportSize({width, height: 800});
+      await page.click('[data-manual-pane=setup]');
+      assert.equal(await quantity.inputValue(), String(Number.MAX_SAFE_INTEGER));
+      assert.equal(await quantity.getAttribute('inputmode'), 'numeric');
+      assert(await page.locator('#manual-setup').evaluate(n => n.scrollWidth <= n.clientWidth + 1));
+      await page.click('[data-manual-pane=results]');
+      assert(await page.locator('#sample-list .sample-pages').evaluate(n => n.scrollWidth <= n.clientWidth + 1));
+      assert(await page.locator('#sample-list .answer-text').filter({hasText:'last synthetic answer'}).isVisible());
+    }
     assert.deepEqual(errors, []);
     console.log('Manual history outcomes, bounded excerpts, full answer details, same-page return, responsive and keyboard controls, deletion, and complete run lifecycle passed.');
   } finally {

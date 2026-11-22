@@ -87,6 +87,11 @@ async function finish(id) {
     timezoneId: 'Asia/Shanghai',
   });
   const errors = [];
+  async function setSamples(count) {
+    const field = page.locator('#samples');
+    if (await field.evaluate(node => node.tagName === 'SELECT')) await field.selectOption(count);
+    else await field.fill(count);
+  }
   page.on('pageerror', (error) => errors.push(error.message));
   await page.goto(demo.page_url);
   await page.locator('#run-form').waitFor();
@@ -109,7 +114,7 @@ async function finish(id) {
   assert.equal((await stats()).calls.length, initialCalls, 'Credential, model and refresh choices do not call the native upstream');
   checks.push('native credential models and PascalCase reasoning capabilities populate selectors without typed IDs or model calls');
   await page.locator('#question').selectOption('logic-candy');
-  await page.locator('#samples').selectOption('2');
+  await setSamples('2');
   await page.locator('#reasoning').selectOption('medium');
   assert.equal(await page.locator('#run-form').locator('#max-tokens, #temperature, .output-options').count(), 0);
   const runReply = page.waitForResponse(
@@ -181,7 +186,7 @@ async function finish(id) {
   const originalPrompt = await page.locator('#prompt').inputValue();
   const changedPrompt = originalPrompt + '\n补充条件：解释你的推理。';
   await page.locator('#prompt').fill(changedPrompt);
-  await page.locator('#samples').selectOption('1');
+  await setSamples('1');
   assert.match(await page.locator('#prompt-note').textContent(), /自定义/);
   const initialSettings = await api('/settings');
   await api('/settings', 'PUT', { ...initialSettings, max_output_tokens: 512 });

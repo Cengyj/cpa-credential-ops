@@ -10,6 +10,8 @@ import (
 	bolt "go.etcd.io/bbolt"
 )
 
+var errTokenBudgetExhausted = errors.New("token_budget_exhausted")
+
 // reserve binds accounting to the UTC admission date, including calls that finish after midnight.
 func (en *Engine) reserve(maxTokens int) (string, error) {
 	en.mu.Lock()
@@ -27,8 +29,13 @@ func (en *Engine) reserve(maxTokens int) (string, error) {
 		}
 	}
 	used := max(next.ReservedTokens, next.KnownTokens)
-	if maxTokens < 1 || next.Calls >= en.cfg.DailyCalls || used > en.cfg.DailyTokens || int64(maxTokens) > en.cfg.DailyTokens-used {
-		return "", fmt.Errorf("budget_exhausted")
+	if maxTokens < 1 || used > en.cfg.DailyTokens || int64(maxTokens) > en.cfg.DailyTokens-used {
+		return "", errTokenBudgetExhausted
+	}
+	// Long rounds can reach the configured storage threshold after acceptance.
+	// Leave completed samples and final bookkeeping writable at that point.
+	if err := en.storageAdmission(); err != nil {
+		return "", err
 	}
 	next.Calls++
 	next.ReservedTokens += int64(maxTokens)

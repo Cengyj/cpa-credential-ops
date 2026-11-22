@@ -71,6 +71,7 @@ func classifyError(err error) (string, int) {
 		"blocked":                             http.StatusConflict,
 		"queue_full":                          http.StatusTooManyRequests,
 		"budget_exhausted":                    http.StatusTooManyRequests,
+		"token_budget_exhausted":              http.StatusTooManyRequests,
 		"storage_limit":                       http.StatusInsufficientStorage,
 		"unsupported":                         http.StatusUnprocessableEntity,
 		"unavailable":                         http.StatusServiceUnavailable,

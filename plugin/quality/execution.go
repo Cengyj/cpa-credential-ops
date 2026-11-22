@@ -163,14 +163,16 @@ func (en *Engine) executeTask(task *executionTask) {
 				}
 				if sample.ExecutionStatus != "" {
 					en.mu.Lock()
-					current := cloneRun(en.runs[id])
+					// Append under the engine lock. Older samples are immutable here;
+					// the longer slice becomes visible only after its transaction commits.
+					current := *en.runs[id]
 					if control {
 						current.Controls = append(current.Controls, sample)
 					} else {
 						current.Samples = append(current.Samples, sample)
 					}
 					change := changes()
-					change.runs[id] = current
+					change.runs[id] = &current
 					saveErr := en.commitLocked(change)
 					en.mu.Unlock()
 					if saveErr != nil {
@@ -228,7 +230,10 @@ func (en *Engine) evaluate(ctx context.Context, runID string, f Frozen, authID, 
 				return s, err
 			}
 			if judgeDay, err := en.reserve(512); err != nil {
-				s.Reason = "judge budget exhausted"
+				if !errors.Is(err, errTokenBudgetExhausted) {
+					return s, err
+				}
+				s.Reason = "judge_token_budget_exhausted"
 			} else {
 				j := en.host.Execute(ctx, Execution{ResponseLimit: min(responseLimit, 8192), AuthID: f.Judge.AuthID, Provider: f.Judge.Provider, Model: f.Judge.Model, Prompt: JudgePrompt(f.Question, s.Output), System: JudgeInstructions, Source: "judge", Parameters: Parameters{MaxTokens: 512}, Judge: true})
 				s.JudgeUsage = j.Usage
@@ -250,8 +255,26 @@ func (en *Engine) evaluate(ctx context.Context, runID string, f Frozen, authID, 
 func (en *Engine) finish(id string, err error) {
 	en.mu.Lock()
 	defer en.mu.Unlock()
+	en.finishRunLocked(id, err)
+	delete(en.active, id)
+	r := en.runs[id]
+	if en.fault != nil || r == nil || r.CompletedAt == nil {
+		return
+	}
+	if rule := en.rules[r.Config.RuleID]; rule != nil && rule.MaxResults > 0 {
+		members := []string{r.Config.AuthID}
+		if r.providerRound().batch != "" {
+			// Completing this route can release the other members' history windows.
+			members = r.Config.ManagedProbe.ProviderMembers
+		}
+		en.persistFailure(en.pruneResultCountsLocked(rule.ID, members...))
+	}
+}
+
+// Keep all evidence protected as in flight until the outcome and any
+// disposition receipt have been committed.
+func (en *Engine) finishRunLocked(id string, err error) {
 	r := cloneRun(en.runs[id])
-	defer delete(en.active, id)
 	if r == nil {
 		return
 	}
@@ -286,15 +309,13 @@ func (en *Engine) finish(id string, err error) {
 		return
 	}
 	en.decideLocked(en.runs[id])
-	if rule := en.rules[r.Config.RuleID]; rule != nil && rule.MaxResults > 0 {
-		if err := en.pruneResultCountsLocked(rule.ID, r.Config.AuthID); err != nil {
-			en.persistFailure(err)
-		}
-	}
 }
 func scrubError(e error) string {
 	if e == nil {
 		return ""
+	}
+	if errors.Is(e, errTokenBudgetExhausted) {
+		return errTokenBudgetExhausted.Error()
 	}
 	s := e.Error()
 	for _, word := range []string{"token", "api_key", "Authorization", "Bearer ", "cookie"} {

@@ -6,6 +6,7 @@ import { createLoginWorkbench } from './login.js';
 import {
   active,
   availableModels,
+  sampleWindow,
   copyRunConfig,
   credentialBlock,
   manualIssueLabel,
@@ -85,6 +86,7 @@ const state = {
   releaseBlocked: true,
   releaseAction: null,
   compareRun: null,
+  sampleOffset: 0,
   reads: { questions: 0, run: 0, history: 0, activity: 0, operations: 0, targets: 0, settings: 0, refresh: 0, preview: 0, editor: 0 },
   busy: new Set(),
   editor: null,
@@ -92,6 +94,16 @@ const state = {
 };
 const value = (id) => $(id).value.trim();
 const number = (id) => Number($(id).value);
+function sampleCount(text) {
+  const count = Number(text);
+  return /^\d+$/.test(text) && Number.isSafeInteger(count) && count > 0 ? count : null;
+}
+const sampleCountError = '请输入可精确表示的正整数（最多 9007199254740991）。';
+function readSampleCount(id) {
+  const count = sampleCount(value(id));
+  if (count === null) fieldError(id, sampleCountError);
+  return count;
+}
 const checked = (id) => $(id).checked;
 const findTarget = (id) => state.targets.find((target) => targetID(target) === id);
 const ruleHeld = (rule) => holdsPause(rule, state.targets);
@@ -1181,8 +1193,7 @@ function manualRunConfig() {
   const refreshable = canRefreshManualState({ auth_id: targetID(target), provider: target.provider, models: [model] });
   if (!model || (!availableModels(target).includes(model) && !refreshable)) fieldError('models', '请选择此凭证目录中的可用模型。');
   if ($('reasoning').dataset.unavailable === 'true' && !refreshable) fieldError('reasoning', '请重新选择可用的思考强度。');
-  const samples = number('samples');
-  if (!Number.isInteger(samples) || samples < 1 || samples > 8) fieldError('samples', '回答数量须为 1–8 的整数。');
+  const samples = readSampleCount('samples');
   const question = state.questions.find((entry) => entry.id === value('question'));
   const selection = questionTestSelection(question, $('prompt').value);
   if (selection.question_id === 'custom') readCustomQuestionText('prompt');
@@ -1209,8 +1220,7 @@ function runConfig(prefix = '') {
   const models = draftRuleModels();
   const problem = ruleModelsProblem(models);
   if (problem) fieldError(`${prefix}models`, problem);
-  const plan = ruleSampling(models);
-  if (plan.over) fieldError(`${prefix}samples`, `超过每凭证样本限额 ${plan.limit}。请减少模型或样本数。`);
+  const samples = readSampleCount(`${prefix}samples`);
   const judge = { mode: get('judge-mode') };
   if (judge.mode === 'llm') {
     const selected = findTarget(get('judge-target'));
@@ -1227,7 +1237,7 @@ function runConfig(prefix = '') {
     ...scope,
     models,
     question_id: get('question'),
-    samples: number(`${prefix}samples`),
+    samples,
     parameters: {
       stream: state.rules.find(r => r.id === value('rule-id'))?.parameters?.stream ?? true,
     },
@@ -1239,6 +1249,9 @@ function runConfig(prefix = '') {
       fieldError(`${prefix}control-target`, '随机题通过对照必须选择另一个凭证。');
     config.control_auth_id = targetID(control);
     config.control_provider = control.provider;
+  }
+  if (!Number.isSafeInteger(models.length * samples * (config.control_auth_id ? 2 : 1))) {
+    fieldError(`${prefix}samples`, '模型与对照的单对象样本总数超过可精确表示的整数范围。');
   }
   const effort = $('rule-reasoning').querySelector('input:checked')?.value;
   if (effort) config.parameters.reasoning_effort = effort;
@@ -1307,12 +1320,13 @@ function renderAdmission() {
   const retrySubmission = state.connected && !testing && !!manualReceiptKey;
   const summary = $('manual-config-summary');
   const phaseText = { queued: '排队中', running: '测试中', cancelling: '停止中', checking_receipt: '正在核对上次提交' }[phase] || '提交中';
-  const summaryText = testing ? phaseText : retrySubmission ? '未查到上次任务' : `${value('samples')} 份回答`;
+  const count = sampleCount(value('samples'));
+  const summaryText = testing ? phaseText : retrySubmission ? '未查到上次任务' : count ? `${count} 份回答` : '请输入回答数量';
   if (summary.textContent !== summaryText) summary.textContent = summaryText;
   if (!state.run) $('run-empty-title').textContent = testing ? '等待测试结果' : '暂无回答';
   if (!testing) $('run-submit-label').textContent = retrySubmission ? '重新提交' : '开始测试';
   $('run-submit').setAttribute('aria-busy', String(testing));
-  $('run-submit').disabled = testing || !config.auth_id || (!!blocked && !refreshable) || !$('prompt').validity.valid;
+  $('run-submit').disabled = testing || !count || !config.auth_id || (!!blocked && !refreshable) || !$('prompt').validity.valid;
   $('run-submit').title = state.connected ? refreshable ? '提交时读取 CPA 当前状态；仍停用时不会调用模型。' : blocked || $('prompt').validationMessage : '';
   $('release-confirm').disabled = state.releaseBlocked || state.busy.has('release') || !state.connected;
   const ruleSave = $('rule-form').querySelector('button[type="submit"]');
@@ -1605,7 +1619,7 @@ async function readQualityDetail(detail) {
     const reply = await api(`/runs/detail?id=${encodeURIComponent(detail.id)}`);
     if (!current()) return;
     const run = reply.run || reply;
-    patchView($('quality-detail-content'), renderQualityDetail(run, state.rules));
+    patchView($('quality-detail-content'), renderQualityDetail(run, state.rules, { sampleOffset: detail.sampleOffset }));
     detail.run = run;
     $('quality-detail-message').textContent = '';
     $('quality-detail-retry').hidden = true;
@@ -1671,7 +1685,10 @@ function renderRun() {
   $('run-rerun').classList.toggle('hidden', isActive || !repeatable);
   $('run-export').classList.remove('hidden');
   $('run-cancel').classList.toggle('hidden', !isActive);
-  const rendered = renderRunEvidence(run);
+  const id = run.id || run.run_id;
+  const sameRun = state.compareRun === id;
+  if (!sameRun) state.sampleOffset = 0;
+  const rendered = renderRunEvidence(run, { sampleOffset: state.sampleOffset });
   patchView($('run-meta'), rendered.metaHTML);
   patchView($('run-frozen-data'), `${rendered.conditionsHTML}<div class="run-identifier">任务 ${escapeHTML(run.id || run.run_id)}</div>`);
   const progress = Math.min(100, Math.round(rendered.completed / Math.max(1, rendered.planned) * 100));
@@ -1689,8 +1706,6 @@ function renderRun() {
   }
   const resultSummary = $('manual-result-summary');
   if (resultSummary.textContent !== summary) resultSummary.textContent = summary;
-  const id = run.id || run.run_id;
-  const sameRun = state.compareRun === id;
   if (sameRun) patchView($('sample-list'), rendered.samplesHTML);
   else $('sample-list').innerHTML = rendered.samplesHTML;
   hydrateInlinePreviews($('sample-list'), run);
@@ -1700,13 +1715,18 @@ function renderRun() {
     $('compare-model-a').innerHTML = options;
     $('compare-model-b').innerHTML = '<option value="">不对比</option>' + options;
     $('compare-model-b').value = models[1] || '';
-    $('sample-filter').innerHTML = '<option value="all">全部样本</option>' + Array.from({length: run.config?.samples || 1}, (_, index) => `<option value="${index}">样本 ${index + 1}</option>`).join('');
     document.querySelector('.model-selectors').classList.toggle('hidden', models.length < 2);
     document.querySelector('.comparison-toolbar').classList.toggle('hidden', models.length < 2 && ((run.source === 'manual_test' && run.config?.judge?.mode === 'manual') || (run.config?.samples || 1) < 2));
     state.compareRun = id;
     setRunDetails(false);
     $('run-feedback').classList.add('hidden');
   }
+  const range = sampleWindow(run.config?.samples, state.sampleOffset);
+  const filter = $('sample-filter'), previous = sameRun ? filter.value : 'all';
+  const options = Array.from({ length: range.end - range.start }, (_, i) =>
+    `<option value="${range.start + i}">样本 ${range.start + i + 1}</option>`).join('');
+  patchView(filter, '<option value="all">全部样本</option>' + options);
+  filter.value = previous !== 'all' && previous !== '' && Number(previous) >= range.start && Number(previous) < range.end ? previous : 'all';
   applyComparison();
   renderAdmission();
 }
@@ -2312,12 +2332,6 @@ function ruleModelsProblem(models) {
   if (!models.length || models.length > ruleModelLimit()) return `请指定 1–${ruleModelLimit()} 个检测模型。`;
   return models.some(id => idByteLength(id) > 256) ? '单个模型 ID 不能超过 256 字节。' : '';
 }
-function ruleSampling(models) {
-  const samples = number('rule-samples');
-  const control = checked('rule-scope-single') && !selectedRuleGroup() && value('rule-question') === 'random-linear' && !!value('rule-control-target');
-  const limit = state.settings.max_samples || 32;
-  return { limit, over: models.length * samples * (control ? 2 : 1) > limit };
-}
 
 function loadRuleShortcuts() {
   if (shortcutsLoaded) return;
@@ -2377,7 +2391,7 @@ const keepingLegacySchedule = () => !$('rule-legacy-schedule').hidden && !checke
 // Validate before locking the form so the first invalid control can receive focus.
 function validateRuleForm(form) {
   const messages = { 'rule-name': '请填写规则名称。', 'rule-target': '请选择要检测的对象。',
-    'rule-samples': '每模型样本数须为 1–8 的整数。', 'rule-cron': '请填写五段 Cron 检测周期。',
+    'rule-samples': sampleCountError, 'rule-cron': '请填写五段 Cron 检测周期。',
     'rule-max-results': '保留检测结果数须为 1–200 的整数。' };
   for (const field of form.elements) {
     if (!field.willValidate || (field.validity.valid && (field.id !== 'rule-name' || field.value.trim()))) continue;
@@ -2565,17 +2579,17 @@ function updateRuleFields() {
   picker.disabled = !models.length || selected.length >= ruleModelLimit();
   picker.title = !models.length ? '凭证目录暂无模型' : picker.disabled ? '已达检测模型上限' : '从凭证目录添加模型';
   renderRuleModelControls();
-  const samples = number('rule-samples');
-  const validSamples = Number.isInteger(samples) && samples >= 1 && samples <= 8;
+  const samples = sampleCount(value('rule-samples'));
   for (const button of $('rule-form').querySelectorAll('[data-sample-step]')) {
-    button.disabled = validSamples && (button.dataset.sampleStep === '1' ? samples === 8 : samples === 1);
+    button.disabled = button.dataset.sampleStep === '1' ? samples === Number.MAX_SAFE_INTEGER : samples === 1;
   }
   const byCount = value('rule-retention-mode') === 'count';
   const countField = $('rule-max-results');
   countField.hidden = countField.disabled = !byCount;
   countField.required = byCount;
-  const limit = number('rule-max-results'), round = selected.length * samples, retention = $('rule-retention-note');
-  retention.textContent = byCount && validSamples && limit > 0 && limit < round ? `为保留一整轮结果，保存时至少保留 ${round} 条。` : '';
+  const limit = number('rule-max-results'), retention = $('rule-retention-note');
+  retention.textContent = byCount && samples && limit > 0 && limit <= 200 && limit < selected.length * samples
+    ? `判定后按每个对象最近 ${limit} 份结果保留，受保护的处置证据另行保留。` : '';
   retention.hidden = !retention.textContent;
   updateRuleSchedule();
   updateRuleHandling();
@@ -2725,7 +2739,7 @@ async function saveRule(editor) {
   if (retentionMode === 'count') {
     const requested = number('rule-max-results');
     if (!Number.isInteger(requested) || requested < 1 || requested > 200) fieldError('rule-max-results', '保留检测结果数须为 1–200 的整数。');
-    body.max_results = Math.max(requested, config.models.length * config.samples);
+    body.max_results = requested;
   }
   if (!keepingLegacySchedule()) {
     const cron = value('rule-cron').split(/\s+/);
@@ -2928,6 +2942,25 @@ async function dispatchClick(event) {
   }
   const detail = button.closest('#quality-detail') ? qualityDetail : null;
   const sourceRun = detail ? detail.run : state.run;
+  if (button.hasAttribute('data-sample-offset') || button.hasAttribute('data-sample-jump')) {
+    const field = button.closest('.sample-pages').querySelector('[data-sample-ordinal]');
+    let offset = Number(button.dataset.sampleOffset);
+    if (button.hasAttribute('data-sample-jump')) {
+      const ordinal = sampleCount(field.value);
+      field.setCustomValidity(ordinal && ordinal <= sourceRun.config.samples ? '' : `请输入 1 至 ${sourceRun.config.samples} 的样本序号。`);
+      if (!field.reportValidity()) return;
+      offset = ordinal - 1;
+    }
+    if (detail) {
+      detail.sampleOffset = offset;
+      patchView($('quality-detail-content'), renderQualityDetail(sourceRun, state.rules, { sampleOffset: offset }));
+    } else {
+      state.sampleOffset = offset;
+      $('sample-filter').value = 'all';
+      renderRun();
+    }
+    return;
+  }
   const retainedSample = index => sourceRun.samples[Number(index) - (sourceRun.pruned_samples || 0)];
   if (button.dataset.copySample != null) {
     await navigator.clipboard.writeText(retainedSample(button.dataset.copySample).output);
@@ -3018,7 +3051,8 @@ async function dispatchClick(event) {
         ...(handlesCredential(rule.action) ? [`整轮可判且有答错时${credentialActions[rule.action]}`] : []),
         ...upstream.map(([condition, action]) => `${condition}时${action}`),
       ];
-      const samples = preview?.verified && scopeNumber(preview.count) ? preview.count * (config.models || []).length * config.samples : null;
+      const samples = preview?.verified && scopeNumber(preview.count) && Number.isSafeInteger(config.samples) && config.samples > 0
+        ? BigInt(preview.count) * BigInt((config.models || []).length) * BigInt(config.samples) : null;
       const summary = managed ? `本规则已配置${configured.join('，')}。` : samples == null ? '' : `最多计划 ${samples} 份目标回答。`;
       actionDialog({ title: '执行范围检测？', description: directory + summary + '开始时将按当前目录重新匹配。', confirm: '开始检测', submit: async () => {
         let receipt;
@@ -3146,7 +3180,7 @@ $('reasoning').addEventListener('change', event => {
   clearFieldError($('reasoning'));
   renderReasoning(true); renderAdmission();
 });
-$('samples').addEventListener('change', renderAdmission);
+$('samples').addEventListener('input', renderAdmission);
 $('question').addEventListener('change', renderQuestion);
 for (const input of $('rule-form').querySelectorAll('[name="rule-object"]')) input.addEventListener('change', () => {
   const kinds = selectedObjectTypes(), option = $('rule-target').selectedOptions[0];
@@ -3181,8 +3215,8 @@ for (const id of ['rule-target','rule-question','rule-scope-all','rule-scope-dir
 for (const id of ['rule-timer','rule-convert-cron','rule-cron']) $(id).addEventListener('input', updateRuleSchedule);
 for (const button of $('rule-form').querySelectorAll('[data-sample-step]')) {
   button.addEventListener('click', () => {
-    const field = $('rule-samples'), value = field.valueAsNumber;
-    field.value = Number.isFinite(value) ? Math.min(8, Math.max(1, Math.trunc(value) + Number(button.dataset.sampleStep))) : 1;
+    const field = $('rule-samples'), count = sampleCount(field.value);
+    field.value = count === null ? 1 : Math.min(Number.MAX_SAFE_INTEGER, Math.max(1, count + Number(button.dataset.sampleStep)));
     field.dispatchEvent(new Event('input', { bubbles: true }));
     if (button.disabled) field.focus({ preventScroll: true });
   });
@@ -3494,10 +3528,20 @@ function clearFieldError(field) {
 }
 document.addEventListener('input', (event) => {
   const field = event.target;
-  if (field.id === 'prompt') updateQuestionNote();
+  if (field.hasAttribute('data-sample-ordinal')) field.setCustomValidity('');
+  if (field.id === 'samples' || field.id === 'rule-samples') {
+    if (sampleCount(field.value) === null) markFieldError(field.id, sampleCountError, false);
+    else clearFieldError(field);
+  } else if (field.id === 'prompt') updateQuestionNote();
   else if (field.id === 'rule-prompt' || field.id === 'rule-review-standard') updateQuestionTextValidity(field, value('rule-question') === 'custom');
   else clearFieldError(field);
   if (event.target.closest('#rule-dialog')) updateEditorDirty();
+});
+document.addEventListener('keydown', event => {
+  if (event.key === 'Enter' && event.target.matches?.('[data-sample-ordinal]')) {
+    event.preventDefault();
+    event.target.closest('.sample-pages').querySelector('[data-sample-jump]').click();
+  }
 });
 document.addEventListener('change', (event) => { if (event.target.closest('#rule-dialog')) updateEditorDirty(); });
 for (const id of ['compare-model-a', 'compare-model-b', 'sample-filter']) $(id).addEventListener('change', () => {

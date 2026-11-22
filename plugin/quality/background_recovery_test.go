@@ -257,7 +257,7 @@ func TestQualityConfigChangePreservesIndependentTimerAndPanelSettings(t *testing
 		t.Fatal(err)
 	}
 	saved := en.Config()
-	saved.DailyCalls = 58
+	saved.DailyTokens = 5800
 	if err := en.UpdateConfig(saved); err != nil {
 		t.Fatal(err)
 	}
@@ -267,8 +267,8 @@ func TestQualityConfigChangePreservesIndependentTimerAndPanelSettings(t *testing
 	if err = en.load(); err != nil {
 		t.Fatal(err)
 	}
-	if !en.timerAllowed(en.rules[r.ID]) || en.cfg.SchedulingEnabled || en.cfg.DailyCalls != 58 || en.cfg.RetentionDays != hostConfig.RetentionDays {
-		t.Fatalf("unrelated host edit changed panel intent: timer=%v global=%v calls=%d retention=%d", en.timers[r.ID], en.cfg.SchedulingEnabled, en.cfg.DailyCalls, en.cfg.RetentionDays)
+	if !en.timerAllowed(en.rules[r.ID]) || en.cfg.SchedulingEnabled || en.cfg.DailyTokens != 5800 || en.cfg.RetentionDays != hostConfig.RetentionDays {
+		t.Fatalf("unrelated host edit changed panel intent: timer=%v global=%v tokens=%d retention=%d", en.timers[r.ID], en.cfg.SchedulingEnabled, en.cfg.DailyTokens, en.cfg.RetentionDays)
 	}
 }
 

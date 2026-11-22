@@ -4,8 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-
-	bolt "go.etcd.io/bbolt"
 )
 
 // Only quality.Config participates in this comparison. Connection settings and
@@ -55,13 +53,6 @@ func (en *Engine) loadQualitySettings() error {
 	return nil
 }
 
-func putQualityHostInput(tx *bolt.Tx, input Config) error {
-	if err := put(tx, "meta", "quality_host_input", input); err != nil {
-		return err
-	}
-	return put(tx, "meta", "config_input", fingerprint(input))
-}
-
 // ReconfigureQuality applies the changed host fields without interrupting
 // login tasks or replacing the verified connection and its transport.
 func (en *Engine) ReconfigureQuality(input Config) error {
@@ -109,10 +100,8 @@ func mergeQualityInput(saved, prior, input Config) Config {
 	saved.SchedulingEnabled = hostSetting(saved.SchedulingEnabled, prior.SchedulingEnabled, input.SchedulingEnabled)
 	saved.AutomaticPause = hostSetting(saved.AutomaticPause, prior.AutomaticPause, input.AutomaticPause)
 	saved.MaxModels = hostSetting(saved.MaxModels, prior.MaxModels, input.MaxModels)
-	saved.MaxSamples = hostSetting(saved.MaxSamples, prior.MaxSamples, input.MaxSamples)
 	saved.MaxOutputTokens = hostSetting(saved.MaxOutputTokens, prior.MaxOutputTokens, input.MaxOutputTokens)
 	saved.MaxResponseBytes = hostSetting(saved.MaxResponseBytes, prior.MaxResponseBytes, input.MaxResponseBytes)
-	saved.DailyCalls = hostSetting(saved.DailyCalls, prior.DailyCalls, input.DailyCalls)
 	saved.DailyTokens = hostSetting(saved.DailyTokens, prior.DailyTokens, input.DailyTokens)
 	saved.RetentionDays = hostSetting(saved.RetentionDays, prior.RetentionDays, input.RetentionDays)
 	saved.MaxStorageBytes = hostSetting(saved.MaxStorageBytes, prior.MaxStorageBytes, input.MaxStorageBytes)

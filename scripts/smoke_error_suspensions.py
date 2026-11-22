@@ -16,6 +16,13 @@ ACCOUNTS = [*FAULTS, 'catalog', 'healthy']
 
 def verify_manual_readmission(prefix, request, restart, root, target, recorded_calls, mutation_log):
     """Check the manual entry point with a real CPA state transition and an offline Codex upstream."""
+    settings = request(prefix + '/settings')
+    assert 'daily_calls' not in settings and 'max_samples' not in settings
+    # Old management clients can still submit a complete settings document.
+    legacy = {**settings, 'daily_calls': 1, 'max_samples': 1}
+    del legacy['capabilities']
+    assert request(prefix + '/settings', legacy, 'PUT') == settings
+    assert request(prefix + '/settings') == settings
     auth_id, index = target['auth_id'], target['auth_index']
     assert auth_id == 'one.json' and target['provider'] == 'codex' and target['effective_available']
     model = target['models'][0]
@@ -32,9 +39,9 @@ def verify_manual_readmission(prefix, request, restart, root, target, recorded_c
             time.sleep(.15)
         raise AssertionError(('fixture state did not converge', value))
 
-    def manual(key, allowed=(202,)):
+    def manual(key, allowed=(202,), samples=1):
         return request(prefix + '/runs', {'auth_id': auth_id, 'provider': 'codex', 'models': [model],
-                                         'samples': 1, 'question_id': 'logic-boxes', 'judge': {'mode': 'manual'},
+                                         'samples': samples, 'question_id': 'logic-boxes', 'judge': {'mode': 'manual'},
                                          'parameters': {'stream': True}, 'idempotency_key': key}, allowed=allowed)
 
     def completed(receipt):
@@ -113,6 +120,10 @@ def verify_manual_readmission(prefix, request, restart, root, target, recorded_c
                 raise
             time.sleep(.2)
     assert not listing['items']
+    restored = request(prefix + '/settings')
+    # The loopback connection recovers asynchronously; compare persisted settings.
+    assert {k: v for k, v in restored.items() if k != 'capabilities'} == {
+        k: v for k, v in settings.items() if k != 'capabilities'}
     assert command(create['idempotency_key'])['rule_id'] == rule['id']
     assert command(run_key)['result']['scope_batch_id'] == readmitted['scope_batch_id']
     assert request(prefix + '/rules/run', run_input, allowed=(202,))['result']['scope_batch_id'] == readmitted['scope_batch_id']
@@ -133,7 +144,30 @@ def verify_manual_readmission(prefix, request, restart, root, target, recorded_c
     enabled_after_delete = current()
     assert not enabled_after_delete['manual_disabled'] and not enabled_after_delete.get('error_policy_block')
     assert mutation_log() == [('PATCH', '/v8/management/credentials/status')] * 4 and len(recorded_calls()) == 2
+    samples = 33
+    start = len(recorded_calls())
+    (root / 'round.json').write_text(json.dumps({'start': start, 'outcomes': ['4'] * samples, 'emit_text_delta': True}))
+    large = manual('after-restart-large-round', samples=samples)
+    result = await_value(lambda: request(prefix + '/runs/detail?id=' + large['run_id']), lambda r: r.get('completed_at'))
+    assert result['status'] == 'completed' and result['config']['samples'] == samples
+    assert [(s['index'], s['output']) for s in result['samples']] == [(i, '4') for i in range(samples)]
+    assert len(recorded_calls()) == start + samples
+    # The history window trims only after all selected samples have executed.
+    start = len(recorded_calls())
+    (root / 'round.json').write_text(json.dumps({'start': start, 'outcomes': ['4'] * samples, 'emit_text_delta': True}))
+    large_rule = request(prefix + '/rules', {'name': 'Large observation round', 'models': [model],
+                         'target_scope': 'all_enabled', 'samples': samples, 'question_id': 'logic-boxes',
+                         'enabled': True, 'action': 'observe_only', 'max_results': 2})
+    receipt = request(prefix + '/rules/run', {'id': large_rule['id'], 'revision': large_rule['revision']})
+    large_rows = await_value(lambda: request(prefix + '/runs?scope_batch_id=' + receipt['scope_batch_id'])['items'],
+                             lambda items: len(items) == 1 and items[0].get('pruned_samples') == samples - 2)
+    large_result = request(prefix + '/runs/detail?id=' + large_rows[0]['id'])
+    assert large_result['status'] == 'completed' and large_result['config']['samples'] == samples
+    assert [s['index'] for s in large_result['samples']] == [samples-2, samples-1]
+    assert len(recorded_calls()) == start + samples
     return {'model': model, 'missing_rule_model': missing, 'manual_before_suspension': baseline,
+            'large_manual_samples_after_restart': samples,
+            'large_rule_samples_after_restart': samples, 'rule_history_window': 2,
             'create_and_run_receipts_survived_rule_delete_and_restart': True,
             'blocked_while_disabled': blocked, 'manual_after_cpa_enablement': after,
             'original_error_run': rows[0]['id'], 'rule_after_enablement': readmitted,

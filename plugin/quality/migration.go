@@ -46,7 +46,7 @@ func migrateManualOnly(tx *bolt.Tx) error {
 		if err := json.Unmarshal(raw, &c); err != nil {
 			return err
 		}
-		if err := put(tx, "meta", "settings", c); err != nil {
+		if err := putQualityConfig(tx, "settings", c); err != nil {
 			return err
 		}
 	}

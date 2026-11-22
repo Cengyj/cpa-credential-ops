@@ -2,6 +2,7 @@ package quality
 
 import (
 	"fmt"
+	"math"
 	"slices"
 	"sort"
 
@@ -16,6 +17,30 @@ type historyClearResult struct {
 	Kept            int `json:"kept"`
 	Archived        int `json:"archived,omitempty"`
 	KeptForHandling int `json:"kept_for_handling,omitempty"`
+}
+
+type providerEvidenceRound struct{ rule, batch, group string }
+
+func (r *Run) providerRound() providerEvidenceRound {
+	s := r.Config.ManagedProbe
+	if s == nil || s.ProviderMechanism != "group_disabled" || len(s.ProviderMembers) < 2 || r.Config.ScopeBatchID == "" || s.ProviderGroupID == "" {
+		return providerEvidenceRound{}
+	}
+	return providerEvidenceRound{r.Config.RuleID, r.Config.ScopeBatchID, s.ProviderGroupID}
+}
+
+// A sibling may still need every answer after this worker has finished.
+// Pending group intents point to the triggering run across restart and rule deletion.
+func (en *Engine) protectProviderRoundLocked(held map[providerEvidenceRound]bool, r *Run) {
+	key := r.providerRound()
+	if key.batch == "" {
+		return
+	}
+	d := en.managed[r.Config.AuthID]
+	if r.CompletedAt == nil || en.active[r.ID] != nil ||
+		d != nil && (d.RunID == r.ID || d.TriggerRunID == r.ID) && (d.State == "attention" || pendingCredentialAction(d.State) != "") {
+		held[key] = true
+	}
 }
 
 func (en *Engine) ruleHistoryEvidenceLocked() (confirmed, unresolved map[string]bool) {
@@ -33,6 +58,17 @@ func (en *Engine) ruleHistoryEvidenceLocked() (confirmed, unresolved map[string]
 		for _, id := range []string{d.RunID, d.TriggerRunID} {
 			if id != "" {
 				runs[id] = true
+			}
+		}
+	}
+	held := make(map[providerEvidenceRound]bool)
+	for _, r := range en.runs {
+		en.protectProviderRoundLocked(held, r)
+	}
+	if len(held) != 0 {
+		for id, r := range en.runs {
+			if held[r.providerRound()] {
+				unresolved[id] = true
 			}
 		}
 	}
@@ -199,11 +235,11 @@ func prepareResultLimit(in, old *Rule) error {
 			in.RetentionDays = old.RetentionDays
 			return nil
 		default:
-			in.MaxResults = max(defaultMaxResults, len(in.Models)*in.Samples)
+			in.MaxResults = defaultMaxResults
 		}
 	}
-	if in.MaxResults < 1 || in.MaxResults > 200 || in.MaxResults < len(in.Models)*in.Samples {
-		return fmt.Errorf("invalid_request: max_results must be 1..200 and fit one complete round")
+	if in.MaxResults < 1 || in.MaxResults > 200 {
+		return fmt.Errorf("invalid_request: max_results must be 1..200")
 	}
 	in.RetentionDays = 0
 	return nil
@@ -211,11 +247,19 @@ func prepareResultLimit(in, old *Rule) error {
 
 // Each account in a dynamic rule has its own result window. Keep sample ordinals
 // stable across a partially retained round so a stale review cannot hit another sample.
-func (en *Engine) pruneResultCountsLocked(ruleID, authID string) error {
+func (en *Engine) pruneResultCountsLocked(ruleID string, authIDs ...string) error {
 	type key struct{ rule, auth string }
 	groups := make(map[key][]*Run)
+	held := make(map[providerEvidenceRound]bool)
+	wanted := make(map[string]bool, len(authIDs))
+	for _, id := range authIDs {
+		if id != "" {
+			wanted[id] = true
+		}
+	}
 	for _, r := range en.runs {
-		if r.Source != "scheduled_probe" || r.HistoryCleared || r.CompletedAt == nil || r.Status == "running" || r.Status == "queued" || (ruleID != "" && r.Config.RuleID != ruleID) || (authID != "" && r.Config.AuthID != authID) {
+		en.protectProviderRoundLocked(held, r)
+		if r.Source != "scheduled_probe" || r.HistoryCleared || r.CompletedAt == nil || r.Status == "running" || r.Status == "queued" || (ruleID != "" && r.Config.RuleID != ruleID) || (len(wanted) != 0 && !wanted[r.Config.AuthID]) {
 			continue
 		}
 		rule := en.rules[r.Config.RuleID]
@@ -231,6 +275,12 @@ func (en *Engine) pruneResultCountsLocked(ruleID, authID string) error {
 		rule := en.rules[k.rule]
 		remaining := rule.MaxResults
 		sort.Slice(list, func(i, j int) bool {
+			// The committed last-run link establishes completion order even
+			// when the clock repeats or moves backwards.
+			iLast, jLast := list[i].ID == rule.LastRun, list[j].ID == rule.LastRun
+			if iLast != jLast {
+				return iLast
+			}
 			if list[i].CompletedAt.Equal(*list[j].CompletedAt) {
 				return list[i].ID > list[j].ID
 			}
@@ -241,26 +291,15 @@ func (en *Engine) pruneResultCountsLocked(ruleID, authID string) error {
 			switch {
 			case remaining >= weight:
 				remaining -= weight
-			case en.handlingEvidenceLocked(r):
+			case en.handlingEvidenceLocked(r) || held[r.providerRound()]:
 				remaining = 0
 			case remaining == 0:
-				if rule.LastRun != r.ID {
-					drops = append(drops, r.ID)
-				}
+				drops = append(drops, r.ID)
 			default:
-				n := cloneRun(r)
-				removed := weight - remaining
-				removedSamples := n.Samples[:removed]
-				for _, sample := range removedSamples {
-					n.PrunedSlots = append(n.PrunedSlots, SampleSlot{Model: sample.Model, Index: sample.Index})
+				n, err := trimResultWindow(r, remaining)
+				if err != nil {
+					return err
 				}
-				n.PrunedSamples += removed
-				n.Samples = slices.Clone(n.Samples[removed:])
-				// Controls run first. An unreached subject can still have a diagnostic control answer.
-				n.Controls = slices.DeleteFunc(n.Controls, func(c Sample) bool {
-					sameSlot := func(s Sample) bool { return s.Model == c.Model && s.Index == c.Index }
-					return slices.ContainsFunc(removedSamples, sameSlot) && !slices.ContainsFunc(n.Samples, sameSlot)
-				})
 				trims = append(trims, n)
 				remaining = 0
 			}
@@ -291,4 +330,41 @@ func (en *Engine) pruneResultCountsLocked(ruleID, authID string) error {
 		delete(en.runs, id)
 	}
 	return nil
+}
+
+// Copy the retained answers and their original review positions. Controls run
+// first, so controls for unreached subjects and surviving duplicate slots stay.
+func trimResultWindow(r *Run, keep int) (*Run, error) {
+	removed := len(r.Samples) - keep
+	if r.PrunedSamples < 0 || r.PrunedSamples > math.MaxInt-removed {
+		return nil, fmt.Errorf("unavailable: stored sample ordinals exceed the supported range")
+	}
+	next := *r
+	next.Samples = slices.Clone(r.Samples[removed:])
+	next.Controls = nil
+	next.PrunedSamples += removed
+	next.PrunedSlots = make([]SampleSlot, len(r.PrunedSlots), len(r.PrunedSlots)+removed)
+	copy(next.PrunedSlots, r.PrunedSlots)
+	var removedControls map[SampleSlot]struct{}
+	if len(r.Controls) != 0 {
+		removedControls = make(map[SampleSlot]struct{}, removed)
+	}
+	for _, s := range r.Samples[:removed] {
+		slot := SampleSlot{Model: s.Model, Index: s.Index}
+		next.PrunedSlots = append(next.PrunedSlots, slot)
+		if removedControls != nil {
+			removedControls[slot] = struct{}{}
+		}
+	}
+	if removedControls != nil {
+		for _, s := range next.Samples {
+			delete(removedControls, SampleSlot{Model: s.Model, Index: s.Index})
+		}
+		for _, s := range r.Controls {
+			if _, removed := removedControls[SampleSlot{Model: s.Model, Index: s.Index}]; !removed {
+				next.Controls = append(next.Controls, s)
+			}
+		}
+	}
+	return &next, nil
 }

@@ -311,7 +311,7 @@ func TestIntentReconciliationNeverReplaysReleasedAction(t *testing.T) {
 }
 func TestDailyBudgetPersistsAndUsageUnknown(t *testing.T) {
 	en, _ := lifeFixture(t)
-	en.cfg.DailyCalls = 1
+	en.cfg.DailyTokens = 64
 	if _, e := en.reserve(64); e != nil {
 		t.Fatal(e)
 	}
@@ -319,7 +319,7 @@ func TestDailyBudgetPersistsAndUsageUnknown(t *testing.T) {
 		t.Fatal(e)
 	}
 	if _, e := en.reserve(64); e == nil {
-		t.Fatal("call budget exceeded")
+		t.Fatal("unknown usage released the reserved token budget")
 	}
 	var b Budget
 	if e := en.store.Get("meta", "budget", &b); e != nil {

@@ -452,6 +452,10 @@ dialog .button-row.end { margin-top: 22px; padding-top: 18px; border-top: 1px so
 .comparison-toolbar select { min-height: 32px; font-size: 12px; }
 .model-selectors { flex: 1; min-width: 0; display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 12px; }
 .comparison-grid { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 20px; min-width: 0; align-items: start; }
+.sample-pages { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; font-size: 12px; }
+.sample-pages > span { font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.sample-pages label { display: inline-flex; gap: 4px; align-items: center; }
+.sample-pages input { width: 7em; min-height: 30px; margin: 0; padding: 4px 6px; }
 .comparison-grid:has(> .model-result:only-child) { grid-template-columns: minmax(0,1fr); }
 .model-result { min-width: 0; display: grid; gap: 16px; align-content: start; }
 .model-heading { display: flex; justify-content: space-between; align-items: center; gap: 8px; min-width: 0; padding: 0 0 12px; border-bottom: 1px solid var(--border); }
@@ -1105,7 +1109,7 @@ body:has(#rule-dialog[open]) { overflow: hidden; }
   .test-model-config :is(.credential-strip, .model-field), .test-model-config .option-row label {
     display: grid; grid-template-columns: 5rem minmax(0,1fr); align-items: center; gap: 5px 10px;
   }
-  .test-model-config select { margin: 0; }
+  .test-model-config :is(select,input) { margin: 0; }
   .test-model-config :is(.field-note,.target-summary) { grid-column: 1/-1; margin: 0; }
   .credential-strip:has(.field-state) { row-gap: 0; }
   .credential-strip:has(.field-state) > label { grid-column: 1; grid-row: 1; align-self: end; }

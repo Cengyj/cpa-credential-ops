@@ -40,7 +40,8 @@ async function main() {
     const legacy = (id, change) => ({ ...base, id, status: 'skipped', config: legacyConfig, skip_detail: { ...catalog, run_id: id }, ...change });
     const oldCases = [
       { row: legacy('old-queue-full', { block_reason: 'queue_full' }), state: '未执行', explanation: '队列容量不足，本轮未入队。' },
-      { row: legacy('old-budget', { block_reason: 'budget_exhausted' }), state: '未执行', explanation: '调用预算已用尽，本轮未执行。' },
+      { row: legacy('old-budget', { block_reason: 'budget_exhausted' }), state: '未执行', explanation: '当时的调用预算不足，记录未区分具体上限。' },
+      { row: legacy('token-budget', { block_reason: 'token_budget_exhausted' }), state: '未执行', explanation: '当日 token 预算不足，未发起这次模型调用。' },
       { row: legacy('old-cancelled', { status: 'cancelled', cancel_requested: true, error: 'context canceled' }), state: '已取消', explanation: '测试已取消' },
       { row: legacy('old-action', { action_status: 'credential_suspended', credential_action: 'disable_credential' }), state: '已检测', explanation: catalog.reason },
     ];

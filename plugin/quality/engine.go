@@ -234,6 +234,9 @@ func (en *Engine) updateConfig(c Config, keepProviderTargets bool) error {
 	if keepProviderTargets {
 		c.IncludeProviderTargets = en.cfg.IncludeProviderTargets
 	}
+	if c == en.cfg {
+		return nil
+	}
 	if e := en.writeScheduleSettings(c, en.cfg.SchedulingEnabled && !c.SchedulingEnabled); e != nil {
 		return e
 	}

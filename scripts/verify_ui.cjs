@@ -424,7 +424,7 @@ const server = http.createServer(async (req, res) => {
   };
   const selectSamples = async (count) => {
     const field = page.locator('#samples');
-    if (process.env.BASELINE_CAPTURE && await field.evaluate(node => node.tagName) !== 'SELECT') await field.fill(count);
+    if (await field.evaluate(node => node.tagName) !== 'SELECT') await field.fill(count);
     else await field.selectOption(count);
   };
   const verifyModelDiscovery = async () => {

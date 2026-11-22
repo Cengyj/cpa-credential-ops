@@ -105,7 +105,7 @@ async function main() {
     await page.click('#connection-form button[type=submit]'); await page.waitForSelector('body.connected');
     await page.click('[data-page=manual]'); await page.selectOption('#target', 'fixture-quality-primary');
     await page.selectOption('#models', 'fixture-visual'); await page.selectOption('#question', 'visual-pelican-html');
-    await page.selectOption('#samples', '1'); await page.click('#run-submit');
+    await page.fill('#samples', '1'); await page.click('#run-submit');
     await page.locator('#run-meta').getByText('执行中', { exact: true }).waitFor();
     assert.equal(posts.length, 1); assert.equal(posts[0].question_id, 'visual-pelican-html');
     assert.deepEqual(posts[0].parameters, { stream: true }); assert.deepEqual(posts[0].judge, { mode: 'manual' }); assert(!Object.hasOwn(posts[0], 'prompt'));

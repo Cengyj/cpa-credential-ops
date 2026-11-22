@@ -65,7 +65,7 @@
             </div>
             <div class="option-row">
               <label>思考强度<select id="reasoning" disabled aria-describedby="reasoning-note"><option value="">默认</option></select></label>
-              <label>回答数量<select id="samples"><option value="1">1 份</option><option value="2">2 份</option><option value="3">3 份</option><option value="4">4 份</option><option value="5">5 份</option><option value="6">6 份</option><option value="7">7 份</option><option value="8">8 份</option></select></label>
+              <label>回答数量<input id="samples" type="number" inputmode="numeric" min="1" step="1" value="1" required></label>
             </div>
             <p id="reasoning-note" class="field-note" hidden></p>
           </fieldset>
@@ -223,7 +223,7 @@
               <label id="rule-legacy-effort" hidden><input type="radio" name="rule-effort" value="">沿用原设置<span></span></label>
               <p id="rule-effort-note" class="sr-only">所有已选模型共用此档位。</p>
             </fieldset>
-            <fieldset class="parameter-frame sample-quantity"><legend><label for="rule-samples">每模型样本数</label></legend><div class="rule-stepper"><button type="button" data-sample-step="-1" aria-label="减少样本数" title="减少样本数"><svg class="control-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14"/></svg></button><input id="rule-samples" type="number" min="1" max="8" value="1" required><button type="button" data-sample-step="1" aria-label="增加样本数" title="增加样本数"><svg class="control-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg></button></div></fieldset>
+            <fieldset class="parameter-frame sample-quantity"><legend><label for="rule-samples">每模型样本数</label></legend><div class="rule-stepper"><button type="button" data-sample-step="-1" aria-label="减少样本数" title="减少样本数"><svg class="control-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14"/></svg></button><input id="rule-samples" type="number" inputmode="numeric" min="1" step="1" value="1" required><button type="button" data-sample-step="1" aria-label="增加样本数" title="增加样本数"><svg class="control-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg></button></div></fieldset>
           </div>
         </section>
         <div class="rule-settings">

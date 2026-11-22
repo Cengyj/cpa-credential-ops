@@ -41,12 +41,12 @@ func (en *Engine) commitLocked(c *changeSet) error {
 			}
 		}
 		if c.hostInput != nil {
-			if err := putQualityHostInput(tx, *c.hostInput); err != nil {
+			if err := putQualityConfig(tx, "quality_host_input", *c.hostInput); err != nil {
 				return err
 			}
 		}
 		if c.settings != nil {
-			if err := put(tx, "meta", "settings", c.settings); err != nil {
+			if err := putQualityConfig(tx, "settings", *c.settings); err != nil {
 				return err
 			}
 		}
