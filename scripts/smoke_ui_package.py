@@ -5,6 +5,7 @@ import hashlib
 from http.client import parse_headers
 from io import BytesIO
 import json
+import os
 import secrets
 import subprocess
 import tempfile
@@ -123,7 +124,9 @@ def check(package, output, quality_scope=False, provider_targets=False, provider
             for synthetic in ('fixture-one', 'fixture-two'):
                 (root / 'auths' / (synthetic + '.json')).write_text(json.dumps({'type':'kimi', 'access_token':synthetic, 'base_url':'http://127.0.0.1:18887'}))
         (root / 'config.yaml').write_text(json.dumps(config))
-        docker('run', '-d', '--pull=never', '--network', 'none', '--name', name, '-e', 'TZ=Asia/Kathmandu', '-e', ('MODEL_QUALITY_CPA_URL=http://127.0.0.1:18888' if provider_targets else 'MODEL_QUALITY_CPA_URL=http://127.0.0.1:18379'), '--mount', f'type=bind,source={root},target=/probe', HOST, './CLIProxyAPI', '--config', '/probe/config.yaml', '--standalone', '--local-model')
+        docker('run', '-d', '--pull=never', '--network', 'none', '--name', name,
+               '--user', f'{os.getuid()}:{os.getgid()}',
+               '-e', 'TZ=Asia/Kathmandu', '-e', ('MODEL_QUALITY_CPA_URL=http://127.0.0.1:18888' if provider_targets else 'MODEL_QUALITY_CPA_URL=http://127.0.0.1:18379'), '--mount', f'type=bind,source={root},target=/probe', HOST, './CLIProxyAPI', '--config', '/probe/config.yaml', '--standalone', '--local-model')
         try:
             phases = []
             for phase in ['load', 'restart']:
