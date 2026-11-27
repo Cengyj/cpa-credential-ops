@@ -36,7 +36,7 @@ No account action or scheduled test is enabled merely by installing the plugin. 
 
 ## Development
 
-The plugin is an independent Go module under `plugin/`. The embedded login runtime is under `login-runtime-go/`. Host source is kept in a separate, verified checkout and is not modified. See [build and installation instructions](docs/INSTALL_CN.md) and [the CPA 8.0.76 build notes](docs/DOCKER_8_0_76_CN.md).
+The plugin is an independent Go module under `plugin/`. The embedded login runtime is under `login-runtime-go/`. Host source is kept in a separate, verified checkout and is not modified. Pushes to `main` build and verify the full Linux amd64 plugin in [GitHub Actions](https://github.com/Cengyj/cpa-credential-ops/actions/workflows/build.yml); download the package from the successful run's artifacts. See [GitHub build details](docs/GITHUB_BUILD_CN.md), [build and installation instructions](docs/INSTALL_CN.md), and [the CPA 8.0.76 build notes](docs/DOCKER_8_0_76_CN.md).
 
 Development verification uses synthetic credentials and fake upstreams. Local runtime data, credentials, databases, and generated artifacts are excluded from Git.
 

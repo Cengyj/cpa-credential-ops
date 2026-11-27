@@ -1,0 +1,100 @@
+name: Build full Linux amd64 plugin
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-amd64-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Check build helpers and frontend
+        run: |
+          python3 -m unittest discover -s scripts/tests -p 'test_*.py'
+          sh scripts/build_ui.sh
+          node --test scripts/tests/*.test.cjs
+          node scripts/test_question_test.mjs
+
+      - name: Retrieve and verify unchanged official CPA source
+        run: python3 scripts/fetch_official_source.py
+
+      - name: Prepare source-only build context
+        run: python3 scripts/prepare_official_context.py artifacts/github-build/context
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Test and build full native plugin
+        uses: docker/build-push-action@v6
+        with:
+          context: artifacts/github-build/context
+          file: deploy/docker/Dockerfile
+          platforms: linux/amd64
+          target: plugin-artifacts
+          outputs: type=local,dest=artifacts/github-build/package
+          cache-from: type=gha,scope=full-plugin-linux-amd64
+          cache-to: type=gha,mode=max,scope=full-plugin-linux-amd64
+          provenance: false
+
+      - name: Build unchanged official CPA for isolated lifecycle check
+        uses: docker/build-push-action@v6
+        with:
+          context: artifacts/github-build/context
+          file: deploy/docker/Dockerfile
+          platforms: linux/amd64
+          target: runtime
+          load: true
+          tags: cliproxyapi:8.0.76-local
+          cache-from: type=gha,scope=full-plugin-linux-amd64
+          provenance: false
+
+      - name: Verify package, embedded assets, login runtime, and restart offline
+        run: |
+          cd artifacts/github-build/package
+          sha256sum --check SHA256SUMS
+          cd "$GITHUB_WORKSPACE"
+          docker pull --platform linux/amd64 golang:1.26-bookworm@sha256:dc40a13b61304647ed7e5d581d246b86413dfc29d63c6d018310feb93cd98fc0
+          python3 scripts/smoke_ui_package.py artifacts/github-build/package artifacts/github-build/lifecycle.json
+
+      - name: Upload full plugin and build evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: credential-ops-linux-amd64-${{ github.sha }}
+          path: |
+            artifacts/github-build/package/model-quality-v*-linux-amd64.zip
+            artifacts/github-build/package/SHA256SUMS
+            artifacts/github-build/package/build-manifest.json
+            artifacts/github-build/context-manifest.json
+            artifacts/github-build/lifecycle.json
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload isolated failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: credential-ops-build-diagnostics-${{ github.sha }}
+          path: artifacts/github-build/*.diagnostics.log
+          if-no-files-found: ignore
+          retention-days: 7

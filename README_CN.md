@@ -70,6 +70,8 @@ UI 13.6.47 将智商测试的设置与回答放进同一个双栏工作区，窄
 
 ## 安装与构建
 
+推送 `main` 后，[GitHub Actions](https://github.com/Cengyj/cpa-credential-ops/actions/workflows/build.yml) 自动编译并验证 Linux amd64 完整插件，成功运行的 Artifacts 中可下载安装包。[构建流程与产物说明](docs/GITHUB_BUILD_CN.md)。
+
 本次 CPA 8.0.76 容器安装与重建见 [Docker 部署](docs/DOCKER_8_0_76_CN.md)。其他既有官方 CPA 的原生构建流程见 [安装说明](docs/INSTALL_CN.md)：
 
 ```sh

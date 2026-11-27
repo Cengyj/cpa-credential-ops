@@ -17,7 +17,7 @@ from release_support import validate_package_ui, verify_public_assets
 
 ROOT = Path(__file__).resolve().parents[1]
 HOST = 'cliproxyapi:8.0.76-local'
-CURL = 'golang:1.26-bookworm'
+CURL = 'golang:1.26-bookworm@sha256:dc40a13b61304647ed7e5d581d246b86413dfc29d63c6d018310feb93cd98fc0'
 PREFIX = '/v0/management/plugins/model-quality'
 
 
@@ -51,7 +51,9 @@ def check_backend_connection(phase, get, fetch, prefix):
 def check(package, output, quality_scope=False, provider_targets=False, provider_fixture=None):
     manifest = json.loads((package / 'build-manifest.json').read_bytes())
     revalidates = validate_package_ui(manifest, ROOT)
-    archive = package / f'model-quality-v{manifest["plugin_version"]}-linux-arm64.zip'
+    if manifest['platform'] != 'linux' or manifest['arch'] not in ('amd64', 'arm64'):
+        raise ValueError('offline package check requires a supported Linux native build')
+    archive = package / f'model-quality-v{manifest["plugin_version"]}-linux-{manifest["arch"]}.zip'
     assert digest(archive.read_bytes()) == manifest['checksums'][archive.name]
     name = 'mq-ui-check-' + uuid.uuid4().hex[:12]
     key = secrets.token_urlsafe(32)
